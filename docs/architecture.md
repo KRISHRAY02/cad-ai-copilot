@@ -37,6 +37,71 @@ this same interface using whatever platform-specific mechanism is
 required — COM automation for SolidWorks, a REST API for a cloud CAD
 tool, or hardcoded values for the mock adapter used in testing.
 
+## The MCP server
+
+`mcp_server.py` wraps a single `CadAdapter` instance and publishes its
+capabilities as MCP tools — the standard mechanism an LLM uses to call
+out to external functions. It selects which adapter to wrap via a
+`CAD_ADAPTER` environment variable (defaulting to `MockAdapter` so the
+server runs without any CAD software), then registers seven tools built
+on top of the adapter's five methods:
+
+- `get_part_info`, `get_mass`, `get_material`, `get_features` — direct
+  pass-throughs to the corresponding `CadAdapter` methods.
+- `estimate_cost` — a simple heuristic (material $/kg, keyed by material
+  category, times mass, plus a flat machining fee) built from
+  `get_mass()` and `get_material()`.
+- `estimate_carbon` — the same pattern, using published average
+  cradle-to-gate emission factors (kg CO2e per kg of material) instead of
+  cost figures.
+- `run_dfm_checks` — lightweight, rule-of-thumb design-for-manufacturing
+  checks over the feature tree (e.g. fillet radii below a machinable
+  minimum, suppressed features left in the tree, missing fillets/chamfers
+  on sharp edges).
+
+Every tool function calls only `adapter.get_...()` methods — never a
+concrete adapter class — so this file is identical regardless of which
+CAD platform is behind it. The derived tools (cost, carbon, DFM) are
+themselves adapter-agnostic: they're just arithmetic and rule checks over
+the data the adapter already returns.
+
+## The AI orchestrator
+
+`ai_orchestrator.py` implements `AiOrchestrator`, which is the only piece
+of the system that talks to both the LLM and MCP. It:
+
+1. Launches `mcp_server.py` as a subprocess and opens an MCP client
+   session over stdio.
+2. Fetches the server's tool definitions and converts each one into the
+   JSON-schema function-calling format Ollama expects.
+3. On each user question, sends the running conversation history plus the
+   tool definitions to a local model (via `ollama.AsyncClient`, default
+   `llama3.2`, chosen for its combination of tool-calling support and a
+   small enough footprint to run comfortably on a laptop CPU).
+4. If the model responds with one or more tool calls, executes them
+   against the live MCP session, appends the results to the conversation
+   as `tool` messages, and asks the model again — repeating up to a fixed
+   number of rounds until it returns a plain-text answer instead of
+   another tool call.
+
+The orchestrator never imports a `CadAdapter` subclass, and never even
+imports `cad_adapters` directly — its only CAD-related dependency is the
+MCP tool schema it fetches at startup. Everything it knows about "the
+current part" comes from tool results returned during the conversation.
+
+## The UI
+
+`app.py` is a Streamlit chat interface. It holds one `AiOrchestrator`
+instance per user session (`st.session_state`), together with the
+`asyncio` event loop used to drive it — necessary because Streamlit
+reruns the whole script on every interaction, so the orchestrator (and
+the MCP subprocess connection it owns) has to be created once and kept
+alive across reruns rather than recreated each time. The UI layer's only
+responsibilities are: render chat history, take a new question via
+`st.chat_input`, hand it to `orchestrator.ask()`, and display the answer
+(or a readable error if the backend or the LLM isn't reachable). It
+contains no CAD logic and no LLM prompt logic of its own.
+
 ## Why this exists: extensibility
 
 The motivation is straightforward: **CAD platforms are interchangeable
