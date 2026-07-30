@@ -18,7 +18,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.types import CallToolResult
 from ollama import AsyncClient
 
-DEFAULT_MODEL = "llama3.1"
+DEFAULT_MODEL = "llama3.2"
 MAX_TOOL_CALL_ROUNDS = 5
 
 SYSTEM_PROMPT = (
