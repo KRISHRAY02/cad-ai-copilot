@@ -114,6 +114,31 @@ class SolidWorksAdapter(CadAdapter):
         mass_property.UseSystemUnits = True  # forces SI units: kg, m
         return mass_property.Mass
 
+    def get_mass_properties(self) -> dict:
+        """Return mass, volume, and surface area, in SI units.
+
+        SolidWorks can't compute mass properties on a part with no solid
+        bodies (e.g. a sketch-only or surface-only part) — CreateMassProperty
+        raises a COM error in that case, so each property is read
+        defensively and reported as None rather than crashing.
+        """
+        model = self._get_active_doc()
+        mass_property = model.Extension.CreateMassProperty
+        mass_property.UseSystemUnits = True  # forces SI units: kg, m, m^2
+
+        properties = {}
+        for key, attr in (
+            ("mass_kg", "Mass"),
+            ("volume_m3", "Volume"),
+            ("surface_area_m2", "SurfaceArea"),
+        ):
+            try:
+                properties[key] = getattr(mass_property, attr)
+            except pythoncom.com_error:
+                properties[key] = None
+
+        return properties
+
     def get_material(self) -> MaterialInfo:
         model = self._get_active_doc()
 

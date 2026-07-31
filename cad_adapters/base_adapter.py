@@ -72,6 +72,16 @@ class CadAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def get_mass_properties(self) -> dict:
+        """Return mass, volume, and surface area of the current part.
+
+        Keys: "mass_kg", "volume_m3", "surface_area_m2". Any property
+        that can't be computed (e.g. an empty part) is returned as None
+        rather than raising.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def get_material(self) -> MaterialInfo:
         """Return the material assigned to the current part."""
         raise NotImplementedError

@@ -94,6 +94,13 @@ class MockAdapter(CadAdapter):
     def get_mass(self) -> float:
         return self._mass_kg
 
+    def get_mass_properties(self) -> dict:
+        return {
+            "mass_kg": self._mass_kg,
+            "volume_m3": 3.12e-4,
+            "surface_area_m2": 0.0421,
+        }
+
     def get_material(self) -> MaterialInfo:
         return self._material
 

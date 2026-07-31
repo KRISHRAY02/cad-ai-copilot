@@ -41,6 +41,15 @@ def main() -> None:
         print(f"\nFAILED to get mass: {e}")
 
     try:
+        mass_properties = adapter.get_mass_properties()
+        print("\nMass properties:")
+        print(f"  mass_kg:         {mass_properties['mass_kg']}")
+        print(f"  volume_m3:       {mass_properties['volume_m3']}")
+        print(f"  surface_area_m2: {mass_properties['surface_area_m2']}")
+    except Exception as e:
+        print(f"\nFAILED to get mass properties: {e}")
+
+    try:
         material = adapter.get_material()
         print("\nMaterial:")
         print(f"  name:          {material.name}")
