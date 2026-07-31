@@ -55,8 +55,14 @@ def _build_adapter() -> CadAdapter:
     return SolidWorksAdapter()
 
 
+# Deliberately not calling adapter.connect() here: this line runs once at
+# import time in the server subprocess, so raising here (e.g. SolidWorks not
+# running, or no document open yet) would crash the whole subprocess before
+# a single tool could be called. Every CadAdapter method already establishes
+# its own connection on each call, so it's safer to defer that check to each
+# individual tool invocation — a bad connection then surfaces as one failed
+# tool call with a clear message, not a dead server.
 adapter = _build_adapter()
-adapter.connect()
 
 mcp = MCPServer(
     name="cad-copilot",
