@@ -42,12 +42,13 @@ tool, or hardcoded values for the mock adapter used in testing.
 `mcp_server.py` wraps a single `CadAdapter` instance and publishes its
 capabilities as MCP tools — the standard mechanism an LLM uses to call
 out to external functions. It selects which adapter to wrap via a
-`CAD_ADAPTER` environment variable (defaulting to `MockAdapter` so the
-server runs without any CAD software), then registers seven tools built
-on top of the adapter's five methods:
+`CAD_ADAPTER` environment variable (defaulting to `SolidWorksAdapter`;
+set `CAD_ADAPTER=mock` to use `MockAdapter` instead, with no CAD
+software required), then registers seven tools built on top of the
+adapter's methods:
 
-- `get_part_info`, `get_mass`, `get_material`, `get_features` — direct
-  pass-throughs to the corresponding `CadAdapter` methods.
+- `get_current_part_info`, `get_mass`, `get_material`, `get_features` —
+  direct pass-throughs to the corresponding `CadAdapter` methods.
 - `estimate_cost` — a simple heuristic (material $/kg, keyed by material
   category, times mass, plus a flat machining fee) built from
   `get_mass()` and `get_material()`.

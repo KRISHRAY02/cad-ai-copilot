@@ -40,15 +40,19 @@ _MIN_FILLET_RADIUS_MM = 1.0
 def _build_adapter() -> CadAdapter:
     """Construct the CadAdapter to use, based on the CAD_ADAPTER env var.
 
-    Defaults to MockAdapter so the server runs without any CAD software.
-    Set CAD_ADAPTER=solidworks to target a running SolidWorks instance.
+    Defaults to SolidWorksAdapter, targeting a running SolidWorks instance.
+    Set CAD_ADAPTER=mock to use MockAdapter instead — synthetic aluminum
+    bracket data, no CAD software required. This is the only place that
+    needs to change to swap CAD platforms; every tool below is written
+    purely against the CadAdapter interface.
     """
-    backend = os.environ.get("CAD_ADAPTER", "mock").lower()
-    if backend == "solidworks":
-        from cad_adapters.solidworks_adapter import SolidWorksAdapter
+    backend = os.environ.get("CAD_ADAPTER", "solidworks").lower()
+    if backend == "mock":
+        return MockAdapter()
 
-        return SolidWorksAdapter()
-    return MockAdapter()
+    from cad_adapters.solidworks_adapter import SolidWorksAdapter
+
+    return SolidWorksAdapter()
 
 
 adapter = _build_adapter()
@@ -64,26 +68,50 @@ mcp = MCPServer(
 
 
 @mcp.tool()
-def get_part_info() -> dict:
-    """Get the name, file path, type, and units of the currently open part."""
+def get_current_part_info() -> dict:
+    """Identify the CAD part currently open in the active document.
+
+    Returns the part's name, its full file path on disk, its document
+    type ("part", "assembly", or "drawing"), and its linear unit system
+    (e.g. "mm", "in"). Call this first when the user asks about "this
+    part" or "the current model" and you don't already know what it is.
+    """
     return dataclasses.asdict(adapter.get_current_part_info())
 
 
 @mcp.tool()
 def get_mass() -> dict:
-    """Get the mass of the currently open part, in kilograms."""
+    """Get the mass of the currently open part, in kilograms.
+
+    Returns {"mass_kg": <float>}. Use this for any question about how
+    heavy, light, or massive the current part is, or as an input to
+    cost/weight calculations.
+    """
     return {"mass_kg": adapter.get_mass()}
 
 
 @mcp.tool()
 def get_material() -> dict:
-    """Get the material assigned to the currently open part."""
+    """Get the material assigned to the currently open part.
+
+    Returns the material's name, density in kg/m^3, and category (e.g.
+    "Aluminum", "Steel", "Plastic") if known. If no material has been
+    assigned in the CAD software, the name field will indicate that
+    rather than the call failing.
+    """
     return dataclasses.asdict(adapter.get_material())
 
 
 @mcp.tool()
 def get_features() -> list[dict]:
-    """Get the feature tree of the currently open part."""
+    """Get the feature tree of the currently open part.
+
+    Returns a list of features in modeling order, each with a name, a
+    feature type (e.g. "Extrude", "Fillet", "Chamfer", "Sketch"), and
+    whether it is currently suppressed. Use this to answer questions
+    about how the part was built, what operations it contains, or to
+    check for specific feature types (e.g. "does it have a fillet?").
+    """
     return [dataclasses.asdict(f) for f in adapter.get_features()]
 
 
