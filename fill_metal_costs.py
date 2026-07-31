@@ -6,6 +6,12 @@ used in coursework). Non-metal materials (plastics, rubber, wood, glass
 fibers, etc.) are left blank, same as extract_materials_library.py left
 them.
 
+cost_per_kg is in INR. The source figures were researched in USD and
+converted at a fixed approximate rate (_USD_TO_INR_RATE below) -- not a
+live/current exchange rate, just enough to get INR-scale numbers.
+carbon_factor_kg_co2_per_kg needs no currency conversion (kg CO2e/kg is
+unit-independent of currency).
+
 These are rough order-of-magnitude estimates, not live market quotes or a
 supplier-specific LCA -- consistent with how mcp_server.py already
 describes its cost/carbon heuristics. Sanity-check before relying on them
@@ -26,9 +32,13 @@ import win32com.client
 
 _CSV_PATH = Path(__file__).parent / "materials.csv"
 
+# Fixed approximate conversion, not a live rate -- see module docstring.
+_USD_TO_INR_RATE = 86.0
+
 # category -> (cost_usd_per_kg, carbon_kg_co2e_per_kg)
-# Representative published averages for primary/typical-mix production.
-_METAL_CATEGORY_VALUES = {
+# Representative published averages for primary/typical-mix production,
+# cost still in USD here -- converted to INR down in main().
+_METAL_CATEGORY_VALUES_USD = {
     "Steel": (0.85, 1.9),
     "DIN Steel (Alloyed)": (1.20, 2.0),
     "DIN Steel (Free Cutting)": (0.95, 1.9),
@@ -50,8 +60,8 @@ _METAL_CATEGORY_VALUES = {
 
 # Individual overrides for materials in the "Other Metals" / "Other
 # Alloys" catch-all categories, where a single category-wide average
-# would be wildly wrong (e.g. gold vs. lead).
-_METAL_NAME_OVERRIDES = {
+# would be wildly wrong (e.g. gold vs. lead). Cost still in USD here.
+_METAL_NAME_OVERRIDES_USD = {
     "Beryllium": (850.0, 325.0),
     "Cobalt": (33.0, 8.0),
     "Molybdenum": (45.0, 19.0),
@@ -67,6 +77,18 @@ _METAL_NAME_OVERRIDES = {
     "Magnesium Alloy": (5.00, 24.9),
     "Monel(R) 400": (18.0, 11.0),
 }
+
+
+def _to_inr(usd_and_carbon_table: dict) -> dict:
+    """Convert a {name: (cost_usd, carbon)} table to {name: (cost_inr, carbon)}."""
+    return {
+        name: (round(cost_usd * _USD_TO_INR_RATE, 2), carbon)
+        for name, (cost_usd, carbon) in usd_and_carbon_table.items()
+    }
+
+
+_METAL_CATEGORY_VALUES = _to_inr(_METAL_CATEGORY_VALUES_USD)
+_METAL_NAME_OVERRIDES = _to_inr(_METAL_NAME_OVERRIDES_USD)
 
 _OTHER_METAL_CATEGORIES = {"Other Metals", "Other Alloys"}
 

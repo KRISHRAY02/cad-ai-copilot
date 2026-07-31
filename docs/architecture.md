@@ -49,9 +49,9 @@ adapter's methods:
 
 - `get_current_part_info`, `get_mass`, `get_material`, `get_features` —
   direct pass-throughs to the corresponding `CadAdapter` methods.
-- `estimate_cost` — a simple heuristic (material $/kg, keyed by material
-  category, times mass, plus a flat machining fee) built from
-  `get_mass()` and `get_material()`.
+- `estimate_cost` — a simple heuristic (material Rs/kg, looked up from
+  materials.csv by material name or a per-category fallback, times mass,
+  plus a flat machining fee) built from `get_mass()` and `get_material()`.
 - `estimate_carbon` — the same pattern, using published average
   cradle-to-gate emission factors (kg CO2e per kg of material) instead of
   cost figures.

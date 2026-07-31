@@ -21,14 +21,16 @@ from materials_db import get_material_cost_and_carbon, load_materials
 # Rough, illustrative per-category fallbacks, used only when materials.csv
 # has no usable entry for the current material (missing file, name not
 # found, or a blank cost/carbon cell). Not authoritative — good enough for
-# a project demo, not for real quoting.
-_MATERIAL_COST_PER_KG_USD = {
-    "Aluminum": 4.50,
-    "Steel": 2.00,
-    "Plastic": 3.00,
+# a project demo, not for real quoting. Cost is in INR (roughly converted
+# from the original USD estimates at ~86 INR/USD, same fixed rate used in
+# fill_metal_costs.py -- not a live exchange rate).
+_MATERIAL_COST_PER_KG_INR = {
+    "Aluminum": 387.0,
+    "Steel": 172.0,
+    "Plastic": 258.0,
 }
-_DEFAULT_COST_PER_KG_USD = 5.00
-_MACHINING_BASE_FEE_USD = 25.00
+_DEFAULT_COST_PER_KG_INR = 430.0
+_MACHINING_BASE_FEE_INR = 2150.0
 
 _MATERIAL_CARBON_PER_KG_CO2E = {
     "Aluminum": 11.5,
@@ -142,10 +144,12 @@ def _resolve_cost_and_carbon(material: MaterialInfo) -> dict:
     materials_db's exact-then-fuzzy matching), since it can hold
     per-material figures Krish has specifically researched rather than a
     generic per-category average. Falls back to the rough
-    _MATERIAL_COST_PER_KG_USD / _MATERIAL_CARBON_PER_KG_CO2E category
+    _MATERIAL_COST_PER_KG_INR / _MATERIAL_CARBON_PER_KG_CO2E category
     defaults when materials.csv is unavailable, the name isn't found, or
     the matched row's cost/carbon cell is blank -- cost and carbon fall
     back independently, since one could be filled in without the other.
+    Cost is in INR throughout (materials.csv's cost_per_kg column and the
+    fallback dict both are).
     """
     cost_per_kg = None
     carbon_factor = None
@@ -166,8 +170,8 @@ def _resolve_cost_and_carbon(material: MaterialInfo) -> dict:
                 carbon_source = f"materials.csv: {match_note}"
 
     if cost_per_kg is None:
-        cost_per_kg = _MATERIAL_COST_PER_KG_USD.get(
-            material.category, _DEFAULT_COST_PER_KG_USD
+        cost_per_kg = _MATERIAL_COST_PER_KG_INR.get(
+            material.category, _DEFAULT_COST_PER_KG_INR
         )
         cost_source = f"category default ({material.category or 'unknown material'})"
 
@@ -187,10 +191,10 @@ def _resolve_cost_and_carbon(material: MaterialInfo) -> dict:
 
 @mcp.tool()
 def estimate_cost() -> dict:
-    """Estimate the raw material + machining cost of the current part, in USD.
+    """Estimate the raw material + machining cost of the current part, in INR.
 
-    A simple heuristic: (material $/kg * mass) + a flat machining base fee.
-    The $/kg figure comes from materials.csv when the current material is
+    A simple heuristic: (material Rs/kg * mass) + a flat machining base fee.
+    The Rs/kg figure comes from materials.csv when the current material is
     found there, otherwise a rough per-category default. Intended as a
     rough, explainable estimate for a student project, not a real
     manufacturing quote.
@@ -201,15 +205,15 @@ def estimate_cost() -> dict:
     resolved = _resolve_cost_and_carbon(material)
     cost_per_kg = resolved["cost_per_kg"]
     material_cost = mass_kg * cost_per_kg
-    total_cost = material_cost + _MACHINING_BASE_FEE_USD
+    total_cost = material_cost + _MACHINING_BASE_FEE_INR
 
     return {
-        "material_cost_usd": round(material_cost, 2),
-        "machining_fee_usd": _MACHINING_BASE_FEE_USD,
-        "estimated_total_usd": round(total_cost, 2),
+        "material_cost_inr": round(material_cost, 2),
+        "machining_fee_inr": _MACHINING_BASE_FEE_INR,
+        "estimated_total_inr": round(total_cost, 2),
         "assumptions": (
-            f"${cost_per_kg}/kg for '{material.name}' ({resolved['cost_source']}) "
-            f"+ ${_MACHINING_BASE_FEE_USD} flat machining fee"
+            f"Rs {cost_per_kg}/kg for '{material.name}' ({resolved['cost_source']}) "
+            f"+ Rs {_MACHINING_BASE_FEE_INR} flat machining fee"
         ),
     }
 
