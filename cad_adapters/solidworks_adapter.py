@@ -204,12 +204,15 @@ class SolidWorksAdapter(CadAdapter):
     def _is_suppressed(feat) -> bool:
         """Best-effort read of a feature's suppression state.
 
-        GetSuppression2 returns a swFeatureSuppressionState_e code; any
-        value other than "unsuppressed" is treated as suppressed. Falls
-        back to False if the active document type doesn't support this
-        query (e.g. some drawing view features).
+        GetSuppression2 turned out not to be exposed on IFeature's default
+        dispatch interface in this environment (every feature, including a
+        verified-suppressed one, raised on access). IFeature::IsSuppressed
+        is the one that actually works: verified live against a part with
+        "Fillet1" suppressed — it returned True only for that feature and
+        False for the other 23. Falls back to False if a feature type
+        doesn't support the query at all.
         """
         try:
-            return feat.GetSuppression2 not in (1, 3)
+            return bool(feat.IsSuppressed)
         except Exception:
             return False
