@@ -65,31 +65,41 @@ class SolidWorksAdapter(CadAdapter):
             SolidWorksNotRunningError: SolidWorks isn't running/reachable via COM.
             NoDocumentOpenError: SolidWorks is running but has no document open.
         """
+        self._get_active_doc()
+        return True
+
+    def _connect_com(self):
+        """Initialize COM for the calling thread and attach to SolidWorks.
+
+        pywin32 COM proxies are apartment-threaded: a proxy created on one
+        thread can't be used from another. An MCP server dispatches each
+        synchronous tool call onto a worker thread pool, so every call
+        re-initializes COM and re-dispatches SldWorks.Application fresh
+        for whichever thread is actually running, instead of reusing a
+        proxy cached from a different thread. Dispatch to an
+        already-running instance is cheap, so this adds negligible
+        overhead per call.
+        """
+        pythoncom.CoInitialize()
         try:
-            self._sw_app = win32com.client.Dispatch("SldWorks.Application")
+            sw_app = win32com.client.Dispatch("SldWorks.Application")
         except pythoncom.com_error as e:
-            self._sw_app = None
             raise SolidWorksNotRunningError(
                 "Could not connect to SolidWorks via COM. Make sure "
                 "SolidWorks is installed and running, then try again."
             ) from e
+        self._sw_app = sw_app
+        return sw_app
 
-        active_doc = self._sw_app.ActiveDoc
+    def _get_active_doc(self):
+        sw_app = self._connect_com()
+        active_doc = sw_app.ActiveDoc
         if active_doc is None:
             raise NoDocumentOpenError(
                 "Connected to SolidWorks, but no part, assembly, or drawing "
                 "is currently open. Open a document in SolidWorks and try "
                 "again."
             )
-
-        return True
-
-    def _get_active_doc(self):
-        if self._sw_app is None:
-            raise RuntimeError("Not connected to SolidWorks. Call connect() first.")
-        active_doc = self._sw_app.ActiveDoc
-        if active_doc is None:
-            raise RuntimeError("No part or assembly is currently open in SolidWorks.")
         return active_doc
 
     def get_current_part_info(self) -> PartInfo:
