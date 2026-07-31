@@ -8,7 +8,6 @@ or assembly open; this module only runs on Windows.
 
 import pythoncom
 import win32com.client
-from win32com.client import CastTo
 
 from cad_adapters.base_adapter import CadAdapter, Feature, MaterialInfo, PartInfo
 
@@ -37,28 +36,52 @@ _LENGTH_UNIT_NAMES = {
 _SW_UNITS_LINEAR = 1
 
 
+class SolidWorksConnectionError(RuntimeError):
+    """Base class for failures connecting to SolidWorks."""
+
+
+class SolidWorksNotRunningError(SolidWorksConnectionError):
+    """Raised when SolidWorks could not be reached via COM at all."""
+
+
+class NoDocumentOpenError(SolidWorksConnectionError):
+    """Raised when SolidWorks is reachable but has no document open."""
+
+
 class SolidWorksAdapter(CadAdapter):
     """CadAdapter implementation backed by a running SolidWorks instance.
 
-    Connects to an already-running copy of SolidWorks (starting a new one
-    if none is found) and reads data from whichever document is currently
-    active in the session.
+    Connects to an already-running copy of SolidWorks and reads data from
+    whichever document is currently active in the session.
     """
 
     def __init__(self) -> None:
         self._sw_app = None
 
     def connect(self) -> bool:
-        """Attach to a running SolidWorks instance, launching one if needed."""
+        """Attach to the running SolidWorks instance and verify a document is open.
+
+        Raises:
+            SolidWorksNotRunningError: SolidWorks isn't running/reachable via COM.
+            NoDocumentOpenError: SolidWorks is running but has no document open.
+        """
         try:
-            self._sw_app = win32com.client.GetActiveObject("SldWorks.Application")
-        except pythoncom.com_error:
-            try:
-                self._sw_app = win32com.client.Dispatch("SldWorks.Application")
-                self._sw_app.Visible = True
-            except pythoncom.com_error:
-                self._sw_app = None
-                return False
+            self._sw_app = win32com.client.Dispatch("SldWorks.Application")
+        except pythoncom.com_error as e:
+            self._sw_app = None
+            raise SolidWorksNotRunningError(
+                "Could not connect to SolidWorks via COM. Make sure "
+                "SolidWorks is installed and running, then try again."
+            ) from e
+
+        active_doc = self._sw_app.ActiveDoc
+        if active_doc is None:
+            raise NoDocumentOpenError(
+                "Connected to SolidWorks, but no part, assembly, or drawing "
+                "is currently open. Open a document in SolidWorks and try "
+                "again."
+            )
+
         return True
 
     def _get_active_doc(self):
@@ -71,41 +94,52 @@ class SolidWorksAdapter(CadAdapter):
 
     def get_current_part_info(self) -> PartInfo:
         model = self._get_active_doc()
-        ext = model.Extension
 
-        doc_type = _DOC_TYPE_NAMES.get(model.GetType(), "unknown")
-        units_code = ext.GetUserPreferenceIntegerValue(_SW_UNITS_LINEAR)
+        doc_type = _DOC_TYPE_NAMES.get(model.GetType, "unknown")
+        # GetUserPreferenceIntegerValue lives on the application object
+        # (ISldWorks), not on the document's Extension.
+        units_code = self._sw_app.GetUserPreferenceIntegerValue(_SW_UNITS_LINEAR)
         units = _LENGTH_UNIT_NAMES.get(units_code, "unknown")
 
         return PartInfo(
-            name=model.GetTitle(),
-            file_path=model.GetPathName(),
+            name=model.GetTitle,
+            file_path=model.GetPathName,
             part_type=doc_type,
             units=units,
         )
 
     def get_mass(self) -> float:
         model = self._get_active_doc()
-        mass_property = model.Extension.CreateMassProperty()
+        mass_property = model.Extension.CreateMassProperty
         mass_property.UseSystemUnits = True  # forces SI units: kg, m
         return mass_property.Mass
 
     def get_material(self) -> MaterialInfo:
         model = self._get_active_doc()
 
-        part_doc = CastTo(model, "IPartDoc")
-        if part_doc is None:
+        if _DOC_TYPE_NAMES.get(model.GetType) != "part":
             raise RuntimeError(
                 "Material lookup is only supported for parts, not assemblies "
                 "or drawings."
             )
 
+        # GetMaterialPropertyName2 belongs to IPartDoc, but dynamic COM
+        # dispatch resolves members by name against the underlying object
+        # regardless of interface, so it can be called directly on `model`
+        # without an explicit CastTo (which requires makepy/gencache
+        # type-library binding that isn't set up in this environment).
+        #
+        # Its second argument is a ByRef output (database path). Without
+        # gencache/makepy, dynamic dispatch has no type-library info to
+        # marshal a plain str as byref, so it must be wrapped explicitly
+        # as a byref VARIANT or the call fails with "Type mismatch".
         config_name = model.ConfigurationManager.ActiveConfiguration.Name
-        material_name, _database_path = part_doc.GetMaterialPropertyName2(
-            config_name, None
+        database_path = win32com.client.VARIANT(
+            pythoncom.VT_BYREF | pythoncom.VT_BSTR, ""
         )
+        material_name = model.GetMaterialPropertyName2(config_name, database_path)
 
-        mass_property = model.Extension.CreateMassProperty()
+        mass_property = model.Extension.CreateMassProperty
         mass_property.UseSystemUnits = True  # kg/m^3
         density = mass_property.Density
 
@@ -118,16 +152,16 @@ class SolidWorksAdapter(CadAdapter):
         model = self._get_active_doc()
         features: list[Feature] = []
 
-        feat = model.FirstFeature()
+        feat = model.FirstFeature
         while feat is not None:
             features.append(
                 Feature(
                     name=feat.Name,
-                    feature_type=feat.GetTypeName2(),
+                    feature_type=feat.GetTypeName2,
                     suppressed=self._is_suppressed(feat),
                 )
             )
-            feat = feat.GetNextFeature()
+            feat = feat.GetNextFeature
 
         return features
 
@@ -141,6 +175,6 @@ class SolidWorksAdapter(CadAdapter):
         query (e.g. some drawing view features).
         """
         try:
-            return feat.GetSuppression2() not in (1, 3)
+            return feat.GetSuppression2 not in (1, 3)
         except Exception:
             return False
