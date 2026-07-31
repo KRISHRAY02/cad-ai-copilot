@@ -11,6 +11,7 @@ never imports a CadAdapter subclass directly.
 
 import asyncio
 import json
+import os
 import sys
 from contextlib import AsyncExitStack
 
@@ -57,8 +58,19 @@ class AiOrchestrator:
         mcp_server_path: str = "mcp_server.py",
     ) -> None:
         self._model = model
+        # mcp's stdio_client only forwards a small, fixed allowlist of
+        # environment variables to the subprocess by default (a security
+        # measure against leaking secrets) -- CAD_ADAPTER isn't in that
+        # allowlist, so it has to be passed through explicitly here or
+        # mcp_server.py always falls back to its own default (SolidWorks),
+        # ignoring CAD_ADAPTER=mock set on the parent process.
+        server_env = (
+            {"CAD_ADAPTER": os.environ["CAD_ADAPTER"]}
+            if "CAD_ADAPTER" in os.environ
+            else None
+        )
         self._server_params = StdioServerParameters(
-            command=sys.executable, args=[mcp_server_path]
+            command=sys.executable, args=[mcp_server_path], env=server_env
         )
         self._exit_stack = AsyncExitStack()
         self._session: ClientSession | None = None

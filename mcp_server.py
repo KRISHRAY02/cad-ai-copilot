@@ -14,41 +14,8 @@ import os
 
 from mcp.server.mcpserver import MCPServer
 
-from cad_adapters.base_adapter import CadAdapter, MaterialInfo
+from cad_adapters.base_adapter import CadAdapter
 from cad_adapters.mock_adapter import MockAdapter
-from materials_db import get_material_cost_and_carbon, load_materials
-
-# Rough, illustrative per-category fallbacks, used only when materials.csv
-# has no usable entry for the current material (missing file, name not
-# found, or a blank cost/carbon cell). Not authoritative — good enough for
-# a project demo, not for real quoting. Cost is in INR (roughly converted
-# from the original USD estimates at ~86 INR/USD, same fixed rate used in
-# fill_metal_costs.py -- not a live exchange rate).
-_MATERIAL_COST_PER_KG_INR = {
-    "Aluminum": 387.0,
-    "Steel": 172.0,
-    "Plastic": 258.0,
-}
-_DEFAULT_COST_PER_KG_INR = 430.0
-_MACHINING_BASE_FEE_INR = 2150.0
-
-_MATERIAL_CARBON_PER_KG_CO2E = {
-    "Aluminum": 11.5,
-    "Steel": 2.0,
-    "Plastic": 3.5,
-}
-_DEFAULT_CARBON_PER_KG_CO2E = 4.0
-
-# Loaded once at import time, same reasoning as _build_adapter() below:
-# materials.csv is a static file checked into the repo, so failing fast
-# here is fine, but a missing/broken file shouldn't crash the whole
-# server -- estimate_cost/estimate_carbon just fall back to the category
-# defaults above if this is None.
-try:
-    _materials = load_materials()
-except (FileNotFoundError, ValueError) as e:
-    print(f"materials.csv unavailable, falling back to category defaults: {e}")
-    _materials = None
 
 _MIN_FILLET_RADIUS_MM = 1.0
 
@@ -137,112 +104,36 @@ def get_features() -> list[dict]:
     return [dataclasses.asdict(f) for f in adapter.get_features()]
 
 
-def _resolve_cost_and_carbon(material: MaterialInfo) -> dict:
-    """Resolve a cost_per_kg and carbon_factor for a material, with sources.
-
-    Prefers materials.csv, looked up by the material's actual name (via
-    materials_db's exact-then-fuzzy matching), since it can hold
-    per-material figures Krish has specifically researched rather than a
-    generic per-category average. Falls back to the rough
-    _MATERIAL_COST_PER_KG_INR / _MATERIAL_CARBON_PER_KG_CO2E category
-    defaults when materials.csv is unavailable, the name isn't found, or
-    the matched row's cost/carbon cell is blank -- cost and carbon fall
-    back independently, since one could be filled in without the other.
-    Cost is in INR throughout (materials.csv's cost_per_kg column and the
-    fallback dict both are).
-    """
-    cost_per_kg = None
-    carbon_factor = None
-    cost_source = None
-    carbon_source = None
-
-    if _materials is not None:
-        lookup = get_material_cost_and_carbon(material.name, _materials)
-        if lookup["found"]:
-            match_note = lookup["matched_from"]
-            if lookup["is_fuzzy_match"]:
-                match_note += " (fuzzy match)"
-            if lookup["cost_per_kg"] is not None:
-                cost_per_kg = lookup["cost_per_kg"]
-                cost_source = f"materials.csv: {match_note}"
-            if lookup["carbon_factor_kg_co2_per_kg"] is not None:
-                carbon_factor = lookup["carbon_factor_kg_co2_per_kg"]
-                carbon_source = f"materials.csv: {match_note}"
-
-    if cost_per_kg is None:
-        cost_per_kg = _MATERIAL_COST_PER_KG_INR.get(
-            material.category, _DEFAULT_COST_PER_KG_INR
-        )
-        cost_source = f"category default ({material.category or 'unknown material'})"
-
-    if carbon_factor is None:
-        carbon_factor = _MATERIAL_CARBON_PER_KG_CO2E.get(
-            material.category, _DEFAULT_CARBON_PER_KG_CO2E
-        )
-        carbon_source = f"category default ({material.category or 'unknown material'})"
-
-    return {
-        "cost_per_kg": cost_per_kg,
-        "cost_source": cost_source,
-        "carbon_factor": carbon_factor,
-        "carbon_source": carbon_source,
-    }
-
-
 @mcp.tool()
-def estimate_cost() -> dict:
-    """Estimate the raw material + machining cost of the current part, in INR.
+def estimate_cost(quantity: int = 1) -> dict:
+    """Estimate the material + machining cost to produce `quantity` units
+    of the current part, in INR.
 
-    A simple heuristic: (material Rs/kg * mass) + a flat machining base fee.
-    The Rs/kg figure comes from materials.csv when the current material is
-    found there, otherwise a rough per-category default. Intended as a
-    rough, explainable estimate for a student project, not a real
-    manufacturing quote.
+    Looks up the current material's cost_per_kg in materials.csv (exact
+    name match, falling back to a fuzzy match), then applies:
+    (mass * cost_per_kg + a flat machining fee) * a quantity discount
+    multiplier, times quantity. See CadAdapter.estimate_cost() for the
+    full formula. Returns found=False with an explanatory message
+    instead of guessing if the material isn't in materials.csv. Not a
+    real manufacturing quote -- a rough, explainable estimate for a
+    student project.
     """
-    mass_kg = adapter.get_mass()
-    material = adapter.get_material()
-
-    resolved = _resolve_cost_and_carbon(material)
-    cost_per_kg = resolved["cost_per_kg"]
-    material_cost = mass_kg * cost_per_kg
-    total_cost = material_cost + _MACHINING_BASE_FEE_INR
-
-    return {
-        "material_cost_inr": round(material_cost, 2),
-        "machining_fee_inr": _MACHINING_BASE_FEE_INR,
-        "estimated_total_inr": round(total_cost, 2),
-        "assumptions": (
-            f"Rs {cost_per_kg}/kg for '{material.name}' ({resolved['cost_source']}) "
-            f"+ Rs {_MACHINING_BASE_FEE_INR} flat machining fee"
-        ),
-    }
+    return adapter.estimate_cost(quantity)
 
 
 @mcp.tool()
 def estimate_carbon() -> dict:
-    """Estimate the embodied carbon (cradle-to-gate) of the current part, in kg CO2e.
+    """Estimate the embodied carbon (cradle-to-gate) of the current part,
+    in kg CO2e.
 
-    A simple heuristic: material emission factor (kg CO2e per kg of
-    material) multiplied by part mass. The factor comes from materials.csv
-    when the current material is found there, otherwise a rough
-    per-category default -- either way, a generic published average, not
-    a supplier-specific lifecycle assessment.
+    Looks up the current material's carbon_factor_kg_co2_per_kg in
+    materials.csv the same way estimate_cost() looks up cost_per_kg, then
+    returns mass * factor. Returns found=False with an explanatory
+    message instead of guessing if the material isn't in materials.csv.
+    A generic published average, not a supplier-specific lifecycle
+    assessment.
     """
-    mass_kg = adapter.get_mass()
-    material = adapter.get_material()
-
-    resolved = _resolve_cost_and_carbon(material)
-    factor = resolved["carbon_factor"]
-    total_co2e = mass_kg * factor
-
-    return {
-        "estimated_kg_co2e": round(total_co2e, 3),
-        "emission_factor_kg_co2e_per_kg": factor,
-        "assumptions": (
-            f"{factor} kg CO2e/kg for '{material.name}' ({resolved['carbon_source']}), "
-            "cradle-to-gate only (excludes machining energy and transport)"
-        ),
-    }
+    return adapter.estimate_carbon()
 
 
 @mcp.tool()
