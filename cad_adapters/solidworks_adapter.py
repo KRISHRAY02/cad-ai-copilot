@@ -207,14 +207,15 @@ class SolidWorksAdapter(CadAdapter):
         IPartDoc::GetBodies2, called once for swSolidBody (0) and once for
         swSheetBody (1) -- these two swBodyType_e values are consistent
         across SolidWorks API versions, avoiding reliance on a less
-        consistently documented "all body types" constant. GetFaceCount is
-        a zero-arg property, so per this project's established dynamic-
-        dispatch quirk (see module docstring notes elsewhere in this repo)
-        it's read without parens.
+        consistently documented "all body types" constant.
 
-        **Not yet verified against a live SolidWorks session** (unlike the
-        rest of this adapter) -- verify against a real part before relying
-        on this for the ML cost model.
+        **Verified live 2026-08-04** against a real part ("5200 battery
+        HV"): 19 faces on 1 solid body, 0 sheet bodies. Note this
+        contradicts the usual dynamic-dispatch quirk documented elsewhere
+        in this file (zero-arg members normally auto-invoke without
+        parens) -- IBody2.GetFaceCount specifically does NOT auto-invoke;
+        accessing it without parens returns a bound method object, not an
+        int, so it must be called with explicit parens here.
         """
         model = self._get_active_doc()
 
@@ -224,7 +225,7 @@ class SolidWorksAdapter(CadAdapter):
             if not bodies:
                 continue
             for body in bodies:
-                total_faces += body.GetFaceCount
+                total_faces += body.GetFaceCount()
 
         return total_faces
 
