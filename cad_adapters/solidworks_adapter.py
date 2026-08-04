@@ -6,10 +6,20 @@ feature tree. Requires SolidWorks to be installed and running with a part
 or assembly open; this module only runs on Windows.
 """
 
+import math
+
 import pythoncom
 import win32com.client
 
 from cad_adapters.base_adapter import CadAdapter, Feature, MaterialInfo, PartInfo
+from cad_adapters.dfm_checks import (
+    MAX_HOLE_DEPTH_TO_DIAMETER_RATIO,
+    MIN_DRAFT_ANGLE_DEG,
+    MIN_HOLE_DIAMETER_MM,
+    MIN_TOLERANCE_BAND_MM,
+    MIN_WALL_THICKNESS_MM,
+    make_finding,
+)
 
 # swDocumentTypes_e
 _DOC_TYPE_NAMES = {
@@ -185,29 +195,62 @@ class SolidWorksAdapter(CadAdapter):
 
     def get_features(self) -> list[Feature]:
         model = self._get_active_doc()
-        features: list[Feature] = []
+        return [
+            Feature(
+                name=feat.Name,
+                feature_type=feat.GetTypeName2,
+                suppressed=self._is_suppressed(feat),
+            )
+            for feat in self._iter_raw_features(model)
+        ]
 
+    @staticmethod
+    def _iter_raw_features(model):
+        """Yield each raw COM IFeature object in the feature tree, in
+        modeling order. Shared by get_features() and the DFM checks below,
+        which (unlike get_features()) need the actual COM object to call
+        GetDefinition() on.
+        """
         feat = model.FirstFeature
         while feat is not None:
-            features.append(
-                Feature(
-                    name=feat.Name,
-                    feature_type=feat.GetTypeName2,
-                    suppressed=self._is_suppressed(feat),
-                )
-            )
+            yield feat
             feat = feat.GetNextFeature
 
-        return features
+    @staticmethod
+    def _iter_bodies(model):
+        """Yield every IBody2 in the part -- solid bodies (swSolidBody=0)
+        then sheet metal bodies (swSheetBody=1). Shared by get_face_count()
+        and the wall-thickness DFM check.
+        """
+        for body_type in (0, 1):
+            bodies = model.GetBodies2(body_type, True)
+            if bodies:
+                yield from bodies
+
+    @staticmethod
+    def _dyn_get(obj, member_name: str):
+        """Read a COM member that may or may not auto-invoke under this
+        environment's dynamic dispatch (no gencache/makepy type-library
+        binding -- see the module-level notes above _is_suppressed).
+
+        Most zero-arg members (FirstFeature, GetType, GetTypeName2, ...)
+        auto-invoke on plain attribute access. But some don't --
+        IBody2.GetFaceCount was found to return a bound *method* object
+        instead (see get_face_count()'s history), which crashed arithmetic
+        until called with explicit parens. Rather than verify each new
+        member individually against a live part that may not even have
+        the relevant feature type available to test, this helper handles
+        both cases uniformly: call it only if what comes back is callable.
+        """
+        value = getattr(obj, member_name)
+        if callable(value):
+            value = value()
+        return value
 
     def get_face_count(self) -> int:
         """Total face count across the part's solid and sheet metal bodies.
 
-        Sums IBody2::GetFaceCount over every body returned by
-        IPartDoc::GetBodies2, called once for swSolidBody (0) and once for
-        swSheetBody (1) -- these two swBodyType_e values are consistent
-        across SolidWorks API versions, avoiding reliance on a less
-        consistently documented "all body types" constant.
+        Sums IBody2::GetFaceCount over every body from _iter_bodies().
 
         **Verified live 2026-08-04** against a real part ("5200 battery
         HV"): 19 faces on 1 solid body, 0 sheet bodies. Note this
@@ -218,16 +261,429 @@ class SolidWorksAdapter(CadAdapter):
         int, so it must be called with explicit parens here.
         """
         model = self._get_active_doc()
+        return sum(body.GetFaceCount() for body in self._iter_bodies(model))
 
-        total_faces = 0
-        for body_type in (0, 1):  # 0 = swSolidBody, 1 = swSheetBody
-            bodies = model.GetBodies2(body_type, True)
-            if not bodies:
+    def run_dfm_check(self) -> list[dict]:
+        """Run all four DFM checks (hole geometry, wall thickness, draft
+        angle, dimension tolerance) against the current part.
+
+        **Not yet fully live-verified**: verified live 2026-08-04 against
+        the "5200 battery HV" part for the "no such feature"
+        not_applicable paths (holes/draft/tolerance), since that part has
+        none of those feature types, and for wall thickness's own
+        not_applicable fallback (IFace2.GetSurface turned out to raise a
+        COM error via dynamic dispatch in this environment -- see
+        _check_wall_thickness -- so this path was exercised too, just not
+        the curved/planar detection it was meant to guard). The Hole
+        Wizard/Shell/Draft/tolerance *data-reading* code paths themselves
+        (IWizardHoleFeatureData2.Diameter/Depth, IDraftFeatureData2's
+        angle property, IDimension's tolerance methods) are implemented
+        from SOLIDWORKS API documentation but have not been exercised
+        against a live part that actually has those feature types --
+        verify against a part with a Hole Wizard hole, a Shell feature,
+        and a Draft feature before relying on those specific results.
+        """
+        model = self._get_active_doc()
+        findings: list[dict] = []
+        findings.extend(self._check_holes(model))
+        findings.extend(self._check_wall_thickness(model))
+        findings.extend(self._check_draft(model))
+        findings.extend(self._check_tolerances(model))
+        return findings
+
+    def _check_holes(self, model) -> list[dict]:
+        """Protects against holes that are too small to drill reliably, or
+        too deep relative to their diameter -- a long thin drill flexes
+        and wanders off-axis, breaks more often, and produces a
+        rougher/less accurate bore than the CAD model implies.
+
+        Only detects Hole Wizard features (GetTypeName2 == "HoleWzd") --
+        plain cylindrical cut-extrudes used to model a hole aren't tagged
+        as holes at all in the feature tree, so this is a scope
+        limitation of what SolidWorks' API can tell us, not a bug.
+        """
+        findings = []
+        found_any = False
+
+        for feat in self._iter_raw_features(model):
+            if feat.GetTypeName2 != "HoleWzd":
                 continue
-            for body in bodies:
-                total_faces += body.GetFaceCount()
+            found_any = True
+            name = feat.Name
 
-        return total_faces
+            try:
+                definition = self._dyn_get(feat, "GetDefinition")
+                diameter_m = self._dyn_get(definition, "Diameter")
+                depth_m = self._dyn_get(definition, "Depth")
+            except Exception as e:
+                findings.append(
+                    make_finding(
+                        "hole", "not_applicable", feature=name,
+                        message=f"Could not read hole geometry for '{name}': {e}",
+                    )
+                )
+                continue
+
+            if not diameter_m:
+                findings.append(
+                    make_finding(
+                        "hole", "not_applicable", feature=name,
+                        message=(
+                            f"Diameter not available for hole '{name}' (some "
+                            "Hole Wizard types, e.g. tapered holes, don't "
+                            "expose a single diameter value)."
+                        ),
+                    )
+                )
+                continue
+
+            diameter_mm = diameter_m * 1000
+            # depth_m is 0/None for "through all" holes, whose real depth
+            # depends on part thickness, not a fixed feature parameter --
+            # skip the ratio check rather than guess a depth.
+            depth_mm = depth_m * 1000 if depth_m else None
+
+            issues = []
+            if diameter_mm < MIN_HOLE_DIAMETER_MM:
+                issues.append(
+                    f"diameter {diameter_mm:.2f}mm is below the "
+                    f"{MIN_HOLE_DIAMETER_MM}mm minimum"
+                )
+            if depth_mm is not None:
+                ratio = depth_mm / diameter_mm
+                if ratio > MAX_HOLE_DEPTH_TO_DIAMETER_RATIO:
+                    issues.append(
+                        f"depth:diameter ratio {ratio:.1f}:1 exceeds the "
+                        f"{MAX_HOLE_DEPTH_TO_DIAMETER_RATIO}:1 maximum"
+                    )
+
+            extra = {
+                "diameter_mm": round(diameter_mm, 3),
+                "depth_mm": round(depth_mm, 3) if depth_mm is not None else None,
+            }
+            if issues:
+                findings.append(
+                    make_finding("hole", "flagged", feature=name, message="; ".join(issues), **extra)
+                )
+            else:
+                findings.append(
+                    make_finding(
+                        "hole", "pass", feature=name,
+                        message="Hole diameter and depth-to-diameter ratio within limits.",
+                        **extra,
+                    )
+                )
+
+        if not found_any:
+            findings.append(
+                make_finding(
+                    "hole", "not_applicable",
+                    message=(
+                        "No Hole Wizard features found on this part. (Plain "
+                        "cylindrical cut holes not created via Hole Wizard "
+                        "aren't detected by this check.)"
+                    ),
+                )
+            )
+        return findings
+
+    def _check_wall_thickness(self, model) -> list[dict]:
+        """Protects against walls too thin for the manufacturing process
+        (injection molding, casting) to fill/cool reliably -- thin walls
+        warp, sink, or simply don't fill before the material solidifies.
+
+        Only measurable for Shell features, whose thickness is an exact
+        feature parameter. A part could be thin-walled by construction
+        (e.g. two offset surfaces) without a Shell feature at all, but
+        that thickness isn't a single readable number without a real
+        measurement/probing pass this project doesn't implement -- rather
+        than approximate it, this check only fires when a Shell feature
+        gives an exact answer.
+        """
+        bodies = list(self._iter_bodies(model))
+        if not bodies:
+            return [
+                make_finding(
+                    "wall_thickness", "not_applicable",
+                    message="No solid or sheet metal bodies found on this part.",
+                )
+            ]
+
+        has_curved_surface = False
+        try:
+            for body in bodies:
+                faces = self._dyn_get(body, "GetFaces") or []
+                for face in faces:
+                    surface = self._dyn_get(face, "GetSurface")
+                    if surface is None:
+                        continue
+                    if not self._dyn_get(surface, "IsPlane"):
+                        has_curved_surface = True
+                        break
+                if has_curved_surface:
+                    break
+        except Exception as e:
+            # **Verified live 2026-08-04**: IFace2.GetSurface raises a COM
+            # error ("Unable to read write-only property") via dynamic
+            # dispatch in this environment -- a deeper limitation than the
+            # usual auto-invoke-vs-explicit-parens quirk (same family as
+            # the CastTo/gencache limitation documented in get_material()
+            # above), not something _dyn_get can paper over. Rather than
+            # assume planar or curved, report that this couldn't be
+            # determined at all.
+            return [
+                make_finding(
+                    "wall_thickness", "not_applicable",
+                    message=(
+                        "Could not read face surface types via the "
+                        f"SolidWorks API in this environment ({e}) -- wall "
+                        "thickness check skipped."
+                    ),
+                )
+            ]
+
+        if has_curved_surface:
+            return [
+                make_finding(
+                    "wall_thickness", "not_applicable",
+                    message="Wall thickness can't be determined for parts with curved surfaces.",
+                )
+            ]
+
+        shell_feat = next(
+            (f for f in self._iter_raw_features(model) if f.GetTypeName2 == "Shell"), None
+        )
+        if shell_feat is None:
+            return [
+                make_finding(
+                    "wall_thickness", "not_applicable",
+                    message="Not applicable to this part (no Shell feature present to measure).",
+                )
+            ]
+
+        try:
+            definition = self._dyn_get(shell_feat, "GetDefinition")
+            thickness_m = self._dyn_get(definition, "Thickness")
+        except Exception as e:
+            return [
+                make_finding(
+                    "wall_thickness", "not_applicable", feature=shell_feat.Name,
+                    message=f"Could not read Shell feature thickness: {e}",
+                )
+            ]
+
+        thickness_mm = thickness_m * 1000
+        if thickness_mm < MIN_WALL_THICKNESS_MM:
+            return [
+                make_finding(
+                    "wall_thickness", "flagged", feature=shell_feat.Name,
+                    message=(
+                        f"Shell thickness {thickness_mm:.2f}mm is below the "
+                        f"{MIN_WALL_THICKNESS_MM}mm minimum."
+                    ),
+                    thickness_mm=round(thickness_mm, 3),
+                )
+            ]
+        return [
+            make_finding(
+                "wall_thickness", "pass", feature=shell_feat.Name,
+                message="Shell thickness within limits.",
+                thickness_mm=round(thickness_mm, 3),
+            )
+        ]
+
+    def _check_draft(self, model) -> list[dict]:
+        """Protects against faces that stick in a mold or die on ejection
+        -- without enough draft, a molded/cast part drags against the
+        tool as it's pulled out, tearing, scoring, or simply refusing to
+        release.
+        """
+        findings = []
+        found_any = False
+
+        for feat in self._iter_raw_features(model):
+            if feat.GetTypeName2 != "Draft":
+                continue
+            found_any = True
+            name = feat.Name
+
+            angle_rad = None
+            try:
+                definition = self._dyn_get(feat, "GetDefinition")
+                # Property name for the draft angle isn't confirmed for
+                # this SOLIDWORKS version -- try the documented candidates
+                # in order rather than guess a value.
+                for member in ("DraftAngle", "Angle"):
+                    try:
+                        angle_rad = self._dyn_get(definition, member)
+                        break
+                    except AttributeError:
+                        continue
+            except Exception:
+                angle_rad = None
+
+            if angle_rad is None:
+                findings.append(
+                    make_finding(
+                        "draft_angle", "not_applicable", feature=name,
+                        message=f"Could not read draft angle for '{name}'.",
+                    )
+                )
+                continue
+
+            angle_deg = math.degrees(angle_rad)
+            if angle_deg < MIN_DRAFT_ANGLE_DEG:
+                findings.append(
+                    make_finding(
+                        "draft_angle", "flagged", feature=name,
+                        message=(
+                            f"Draft angle {angle_deg:.2f} deg is below the "
+                            f"{MIN_DRAFT_ANGLE_DEG} deg minimum."
+                        ),
+                        angle_deg=round(angle_deg, 3),
+                    )
+                )
+            else:
+                findings.append(
+                    make_finding(
+                        "draft_angle", "pass", feature=name,
+                        message="Draft angle within limits.",
+                        angle_deg=round(angle_deg, 3),
+                    )
+                )
+
+        if not found_any:
+            findings.append(
+                make_finding(
+                    "draft_angle", "not_applicable",
+                    message="Not applicable to this part (no Draft feature present to measure).",
+                )
+            )
+        return findings
+
+    def _check_tolerances(self, model) -> list[dict]:
+        """Protects against tolerances tighter than a shop's normal
+        process capability -- every extra 0.001mm of precision below
+        what a standard process can reliably hold means special tooling,
+        secondary operations (grinding, honing), and/or 100% inspection
+        instead of sampling, all of which cost disproportionately more
+        than the nominal dimension suggests.
+
+        Scope limitation, **confirmed live 2026-08-04**: this walks each
+        feature's *display* dimensions (GetFirstDisplayDimension /
+        GetNextDisplayDimension), which is the standard SOLIDWORKS API
+        approach for enumerating dimensions -- but a display dimension
+        only exists once a dimension has actually been shown/inserted in
+        the graphics area (e.g. via "Show Feature Dimensions"), not for
+        every underlying sketch dimension automatically. Live-tested
+        against "5200 battery HV", which has no dimensions displayed at
+        all, so this returned zero regardless of whether any of its
+        sketch dimensions actually carry a tolerance. This is a real
+        SOLIDWORKS API constraint, not a bug: reading tolerance data off
+        *hidden* dimensions would need walking every sketch's
+        DimensionManager directly, which is out of scope here.
+        """
+        findings = []
+        found_any = False
+        seen_names = set()
+
+        for feat in self._iter_raw_features(model):
+            try:
+                disp_dim = self._dyn_get(feat, "GetFirstDisplayDimension")
+            except Exception:
+                continue
+
+            while disp_dim is not None:
+                name = None
+                try:
+                    dim = disp_dim.GetDimension2(0)
+                    name = self._dyn_get(dim, "GetNameForSelection")
+                except Exception:
+                    disp_dim = feat.GetNextDisplayDimension(disp_dim)
+                    continue
+
+                if name in seen_names:
+                    disp_dim = feat.GetNextDisplayDimension(disp_dim)
+                    continue
+                seen_names.add(name)
+
+                try:
+                    tol_type = self._dyn_get(dim, "GetToleranceType")
+                except Exception:
+                    disp_dim = feat.GetNextDisplayDimension(disp_dim)
+                    continue
+
+                if not tol_type:  # swTolNONE (0) -- no explicit tolerance set
+                    disp_dim = feat.GetNextDisplayDimension(disp_dim)
+                    continue
+
+                found_any = True
+                try:
+                    tol_values = self._dyn_get(dim, "GetToleranceValues")
+                    min_tol_m, max_tol_m = tol_values[0], tol_values[1]
+                except Exception as e:
+                    findings.append(
+                        make_finding(
+                            "tolerance", "not_applicable", feature=name,
+                            message=f"Tolerance type set but values couldn't be read: {e}",
+                        )
+                    )
+                    disp_dim = feat.GetNextDisplayDimension(disp_dim)
+                    continue
+
+                band_mm = abs(max_tol_m - min_tol_m) * 1000
+                extra = {
+                    "min_tolerance_mm": round(min_tol_m * 1000, 4),
+                    "max_tolerance_mm": round(max_tol_m * 1000, 4),
+                }
+                if band_mm < MIN_TOLERANCE_BAND_MM:
+                    findings.append(
+                        make_finding(
+                            "tolerance", "flagged", feature=name,
+                            message=(
+                                f"Tolerance band {band_mm:.4f}mm is tighter than the "
+                                f"{MIN_TOLERANCE_BAND_MM}mm threshold -- may increase "
+                                "manufacturing cost."
+                            ),
+                            **extra,
+                        )
+                    )
+                else:
+                    findings.append(
+                        make_finding(
+                            "tolerance", "pass", feature=name,
+                            message="Tolerance band within normal manufacturing limits.",
+                            **extra,
+                        )
+                    )
+
+                disp_dim = feat.GetNextDisplayDimension(disp_dim)
+
+        if not found_any:
+            findings.append(
+                make_finding(
+                    "tolerance", "not_applicable",
+                    message="No dimensions with an explicit tolerance applied were found on this part.",
+                )
+            )
+
+        # The part's overall/general tolerance limit (the default standard
+        # applied to any dimension *without* an explicit tolerance, e.g.
+        # an ISO 2768 class) lives in SOLIDWORKS' DimXpert general-
+        # tolerance table, which requires a secondary DimXpert type
+        # library and doesn't expose a single simple "current class"
+        # property reachable via dynamic COM dispatch without
+        # gencache/makepy binding in this environment (same class of
+        # limitation as the CastTo failure documented in get_material()
+        # above). Reported as unavailable rather than guessed.
+        findings.append(
+            make_finding(
+                "tolerance", "not_applicable",
+                message="General tolerance setting not available for this part.",
+            )
+        )
+
+        return findings
 
     @staticmethod
     def _is_suppressed(feat) -> bool:

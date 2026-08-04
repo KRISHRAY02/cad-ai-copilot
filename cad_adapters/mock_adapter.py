@@ -7,6 +7,12 @@ mounting bracket.
 """
 
 from cad_adapters.base_adapter import CadAdapter, Feature, MaterialInfo, PartInfo
+from cad_adapters.dfm_checks import (
+    MAX_HOLE_DEPTH_TO_DIAMETER_RATIO,
+    MIN_HOLE_DIAMETER_MM,
+    MIN_TOLERANCE_BAND_MM,
+    make_finding,
+)
 
 
 class MockAdapter(CadAdapter):
@@ -110,3 +116,85 @@ class MockAdapter(CadAdapter):
 
     def get_face_count(self) -> int:
         return self._face_count
+
+    def run_dfm_check(self) -> list[dict]:
+        """Synthetic DFM results demonstrating all three outcome types
+        (flagged, pass, not_applicable) for demo purposes, including one
+        "no such feature" not_applicable (draft) and one "curved
+        surfaces" not_applicable (wall thickness) -- see
+        cad_adapters/dfm_checks.py for the thresholds and
+        cad_adapters/solidworks_adapter.py for what a real SolidWorks
+        read of the same checks looks like.
+        """
+        findings = []
+
+        # 1. Hole check: one good hole (pass), one too-small/too-deep
+        # dowel hole (flagged), matching this bracket's "Mounting Holes"
+        # Hole Wizard feature plus one hypothetical extra hole for demo
+        # variety.
+        findings.append(
+            make_finding(
+                "hole", "pass", feature="Mounting Holes",
+                message="Hole diameter and depth-to-diameter ratio within limits.",
+                diameter_mm=6.5, depth_mm=10.0,
+            )
+        )
+        findings.append(
+            make_finding(
+                "hole", "flagged", feature="Dowel Pin Hole",
+                message=(
+                    f"diameter 0.80mm is below the {MIN_HOLE_DIAMETER_MM}mm "
+                    f"minimum; depth:diameter ratio 18.8:1 exceeds the "
+                    f"{MAX_HOLE_DEPTH_TO_DIAMETER_RATIO}:1 maximum"
+                ),
+                diameter_mm=0.8, depth_mm=15.0,
+            )
+        )
+
+        # 2. Wall thickness: this bracket has a Fillet1 feature, i.e. it
+        # has curved surfaces, so thickness can't be determined -- same
+        # "not applicable" outcome a real curved SolidWorks part hits.
+        findings.append(
+            make_finding(
+                "wall_thickness", "not_applicable",
+                message="Wall thickness can't be determined for parts with curved surfaces.",
+            )
+        )
+
+        # 3. Draft check: this mock part has no Draft feature at all.
+        findings.append(
+            make_finding(
+                "draft_angle", "not_applicable",
+                message="Not applicable to this part (no Draft feature present to measure).",
+            )
+        )
+
+        # 4. Tolerance check: one tight/flagged dimension, one normal/pass
+        # dimension, plus the part's general tolerance limit.
+        findings.append(
+            make_finding(
+                "tolerance", "flagged", feature="D2@Boss-Extrude1",
+                message=(
+                    f"Tolerance band 0.0004mm is tighter than the "
+                    f"{MIN_TOLERANCE_BAND_MM}mm threshold -- may increase "
+                    "manufacturing cost."
+                ),
+                min_tolerance_mm=-0.0002, max_tolerance_mm=0.0002,
+            )
+        )
+        findings.append(
+            make_finding(
+                "tolerance", "pass", feature="D1@Sketch1",
+                message="Tolerance band within normal manufacturing limits.",
+                min_tolerance_mm=-0.05, max_tolerance_mm=0.05,
+            )
+        )
+        findings.append(
+            make_finding(
+                "tolerance", "pass", feature=None,
+                message="General tolerance limit: ISO 2768-mK (medium).",
+                general_tolerance_class="ISO 2768-mK",
+            )
+        )
+
+        return findings

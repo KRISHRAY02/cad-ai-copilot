@@ -62,6 +62,18 @@ adapter's methods:
   checks over the feature tree (e.g. fillet radii below a machinable
   minimum, suppressed features left in the tree, missing fillets/chamfers
   on sharp edges).
+- `run_dfm_check` (singular — a separate, more detailed tool) — four
+  geometry-driven checks backed by `CadAdapter.run_dfm_check()`: hole
+  diameter/depth ratio (Hole Wizard features), wall thickness (Shell
+  features only), draft angle (Draft features only), and dimension
+  tolerance. Reads exact feature/dimension parameters rather than
+  heuristics, and reports `not_applicable` instead of guessing when the
+  relevant feature/dimension isn't present. See
+  `cad_adapters/dfm_checks.py` for thresholds and
+  `cad_adapters/solidworks_adapter.py` for the SOLIDWORKS API specifics
+  and known environment limitations (e.g. `IFace2.GetSurface` can't be
+  read via dynamic COM dispatch here, and display-dimension enumeration
+  only sees dimensions actually shown in the graphics area).
 
 Every tool function calls only `adapter.get_...()` methods — never a
 concrete adapter class — so this file is identical regardless of which

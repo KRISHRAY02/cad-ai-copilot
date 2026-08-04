@@ -268,5 +268,26 @@ def run_dfm_checks() -> list[dict]:
     return findings
 
 
+@mcp.tool()
+def run_dfm_check() -> list[dict]:
+    """Run four geometry-driven design-for-manufacturability checks:
+    hole diameter/depth ratio, wall thickness (Shell features), draft
+    angle, and dimension tolerance. Distinct from (and more detailed
+    than) `run_dfm_checks` above, which only looks at fillet/chamfer/
+    suppression on the feature tree -- this one reads exact feature and
+    dimension parameters (e.g. a Hole Wizard hole's real diameter, a
+    Shell feature's real thickness) via the CAD adapter.
+
+    Each finding has a "check" (hole/wall_thickness/draft_angle/
+    tolerance), a "status" (flagged/pass/not_applicable), the
+    feature/dimension name involved (if any), and a message. Never
+    estimates a value where real feature/dimension data isn't available
+    on the part -- reports not_applicable instead (e.g. no Shell feature
+    to measure, or a part with curved surfaces where thickness can't be
+    determined at all).
+    """
+    return adapter.run_dfm_check()
+
+
 if __name__ == "__main__":
     mcp.run()

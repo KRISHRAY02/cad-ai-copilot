@@ -117,6 +117,21 @@ class CadAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def run_dfm_check(self) -> list[dict]:
+        """Run the four geometry-driven DFM checks: hole geometry, wall
+        thickness, draft angle, and dimension tolerance -- see
+        cad_adapters/dfm_checks.py for thresholds and the real
+        manufacturing problem each check protects against.
+
+        Returns a combined list of finding dicts (see
+        dfm_checks.make_finding), each either a flagged issue, a pass, or
+        "not_applicable" when there's no real feature/dimension data to
+        check against. Never returns an estimated or guessed value where
+        real data isn't available.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def get_face_count(self) -> int:
         """Return the total number of faces across the part's solid bodies.
 
