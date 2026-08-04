@@ -10,14 +10,23 @@ to CAD_ADAPTER (env var) or the default in `_build_adapter()`.
 """
 
 import dataclasses
+import datetime
 import os
 
 from mcp.server.mcpserver import MCPServer
 
 from cad_adapters.base_adapter import CadAdapter
 from cad_adapters.mock_adapter import MockAdapter
+from cost_model.features import infer_material_type
 
 _MIN_FILLET_RADIUS_MM = 1.0
+
+# Default machine type/supplier for estimate_cost() when the user doesn't
+# specify one -- CNC 3-axis is the most general-purpose machining process,
+# and Supplier_A is just the first of the synthetic suppliers the cost
+# model was trained on (see cost_model/generate_synthetic_dataset.py).
+_DEFAULT_MACHINE_TYPE = "CNC_3axis"
+_DEFAULT_SUPPLIER = "Supplier_A"
 
 
 def _build_adapter() -> CadAdapter:
@@ -105,20 +114,80 @@ def get_features() -> list[dict]:
 
 
 @mcp.tool()
-def estimate_cost(quantity: int = 1) -> dict:
-    """Estimate the material + machining cost to produce `quantity` units
-    of the current part, in INR.
+def estimate_cost(
+    quantity: int = 1,
+    order_year: int | None = None,
+    supplier: str = _DEFAULT_SUPPLIER,
+    machine_type: str = _DEFAULT_MACHINE_TYPE,
+) -> dict:
+    """Estimate the cost to produce `quantity` units of the current part,
+    in INR, using a trained Random Forest Regression model (see
+    cost_model/) instead of a flat formula.
 
-    Looks up the current material's cost_per_kg in materials.csv (exact
-    name match, falling back to a fuzzy match), then applies:
-    (mass * cost_per_kg + a flat machining fee) * a quantity discount
-    multiplier, times quantity. See CadAdapter.estimate_cost() for the
-    full formula. Returns found=False with an explanatory message
-    instead of guessing if the material isn't in materials.csv. Not a
-    real manufacturing quote -- a rough, explainable estimate for a
-    student project.
+    Pulls the part's geometry (volume, surface area, face count) and
+    material (name, density) live from the CAD adapter, combines them
+    with the given order-level parameters (quantity, order_year --
+    defaults to the current year -- supplier, machine_type), and passes
+    all of it to cost_model.predict.predict_cost(). The model was trained
+    on a synthetic dataset whose per-row cost target is grounded in the
+    real cost_per_kg figures in materials.csv (see
+    cost_model/generate_synthetic_dataset.py) -- it is a student-project
+    estimate, not a real manufacturing quote.
+
+    Returns found=False with an explanatory message if the trained model
+    file doesn't exist yet (run cost_model/generate_synthetic_dataset.py
+    then cost_model/train_model.py first) instead of guessing.
     """
-    return adapter.estimate_cost(quantity)
+    from cost_model.predict import predict_cost
+
+    mass_kg = adapter.get_mass()
+    material = adapter.get_material()
+    mass_properties = adapter.get_mass_properties()
+    face_count = adapter.get_face_count()
+
+    volume_m3 = mass_properties.get("volume_m3")
+    surface_area_m2 = mass_properties.get("surface_area_m2")
+    if volume_m3 is None or surface_area_m2 is None:
+        return {
+            "found": False,
+            "message": (
+                "Could not read volume/surface area for the current part "
+                "(no solid geometry?) -- cost cannot be estimated."
+            ),
+        }
+
+    features = {
+        "volume_m3": volume_m3,
+        "surface_area_m2": surface_area_m2,
+        "face_count": face_count,
+        "density_kg_m3": material.density_kg_m3,
+        "mass_kg": mass_kg,
+        "order_quantity": quantity,
+        "order_year": order_year or datetime.date.today().year,
+        "material_type": infer_material_type(material.name),
+        "supplier": supplier,
+        "machine_type": machine_type,
+    }
+
+    try:
+        prediction = predict_cost(features)
+    except FileNotFoundError as e:
+        return {"found": False, "message": str(e)}
+
+    return {
+        "found": True,
+        "predicted_cost_per_unit_inr": prediction["predicted_cost_inr"],
+        "estimated_total_cost_inr": round(
+            prediction["predicted_cost_inr"] * quantity, 2
+        ),
+        "material_used": material.name,
+        "inputs_used": prediction["features_used"],
+        "assumptions": (
+            "Random Forest Regression model trained on a synthetic "
+            "dataset grounded in materials.csv cost figures -- see "
+            "cost_model/ for methodology. Not a real manufacturing quote."
+        ),
+    }
 
 
 @mcp.tool()

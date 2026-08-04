@@ -49,9 +49,12 @@ adapter's methods:
 
 - `get_current_part_info`, `get_mass`, `get_material`, `get_features` —
   direct pass-throughs to the corresponding `CadAdapter` methods.
-- `estimate_cost` — a simple heuristic (material Rs/kg, looked up from
-  materials.csv by material name or a per-category fallback, times mass,
-  plus a flat machining fee) built from `get_mass()` and `get_material()`.
+- `estimate_cost` — a trained Random Forest Regression model
+  (`cost_model/`), fed live geometry (volume, surface area, face count)
+  and material data from the adapter plus user-supplied order parameters
+  (quantity, order year, supplier, machine type). See
+  `cost_model/generate_synthetic_dataset.py` and
+  `cost_model/train_model.py` for the training methodology.
 - `estimate_carbon` — the same pattern, using published average
   cradle-to-gate emission factors (kg CO2e per kg of material) instead of
   cost figures.

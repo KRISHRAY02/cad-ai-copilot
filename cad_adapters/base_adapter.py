@@ -14,21 +14,6 @@ from typing import Any
 
 from materials_db import get_material_cost_and_carbon, load_materials
 
-# Flat per-unit machining/setup fee, in INR. Same rough, illustrative
-# figure used throughout this project -- not a real manufacturing quote.
-_MACHINING_BASE_FEE_INR = 2150.0
-
-# Batch-size discount tiers for estimate_cost()'s quantity multiplier:
-# (minimum quantity, multiplier applied to material+process cost per unit).
-# Modeled loosely on how per-unit setup/overhead cost amortizes better
-# across a larger batch -- a real quoting simplification, not a precise
-# manufacturing cost model.
-_QUANTITY_DISCOUNT_TIERS = [
-    (100, 0.80),
-    (10, 0.90),
-    (1, 1.00),
-]
-
 _materials_cache = None
 _materials_load_error = None
 _materials_loaded = False
@@ -39,8 +24,8 @@ def _get_materials():
 
     Deferred until first use, same reasoning as why SolidWorksAdapter
     doesn't connect() at import time: a missing/broken materials.csv
-    shouldn't prevent importing this module, only estimate_cost()/
-    estimate_carbon() calls that actually need it.
+    shouldn't prevent importing this module, only estimate_carbon()
+    calls that actually need it.
     """
     global _materials_cache, _materials_load_error, _materials_loaded
     if not _materials_loaded:
@@ -51,13 +36,6 @@ def _get_materials():
             _materials_load_error = str(e)
         _materials_loaded = True
     return _materials_cache
-
-
-def _quantity_multiplier(quantity: int) -> float:
-    for threshold, multiplier in _QUANTITY_DISCOUNT_TIERS:
-        if quantity >= threshold:
-            return multiplier
-    return 1.0
 
 
 @dataclass
@@ -138,78 +116,23 @@ class CadAdapter(ABC):
         """Return the list of features in the current part's feature tree."""
         raise NotImplementedError
 
-    # estimate_cost() and estimate_carbon() are concrete, not abstract:
-    # they're built entirely out of get_mass()/get_material() plus
-    # materials.csv, so every subclass gets them for free rather than
-    # having to reimplement the same materials_db lookup logic.
+    @abstractmethod
+    def get_face_count(self) -> int:
+        """Return the total number of faces across the part's solid bodies.
 
-    def estimate_cost(self, quantity: int = 1) -> dict:
-        """Estimate the material + machining cost to produce `quantity`
-        units of the current part, in INR.
-
-        Looks up the current material's cost_per_kg in materials.csv (via
-        materials_db.get_material_cost_and_carbon(), which tries an exact
-        name match first and falls back to a fuzzy match). Returns
-        found=False with an explanatory message instead of guessing if
-        materials.csv is unavailable, the material isn't in it, or its
-        cost_per_kg cell is blank.
+        Used as a geometric complexity feature for the ML cost model (see
+        cost_model/) -- more faces generally means more machining
+        operations.
         """
-        if quantity < 1:
-            raise ValueError("quantity must be at least 1")
+        raise NotImplementedError
 
-        materials = _get_materials()
-        if materials is None:
-            return {
-                "found": False,
-                "message": (
-                    "materials.csv is unavailable"
-                    + (f" ({_materials_load_error})" if _materials_load_error else "")
-                    + " -- cost cannot be estimated."
-                ),
-            }
-
-        material = self.get_material()
-        lookup = get_material_cost_and_carbon(material.name, materials)
-        if not lookup["found"]:
-            return {"found": False, "message": lookup["message"]}
-
-        cost_per_kg = lookup["cost_per_kg"]
-        if cost_per_kg is None:
-            return {
-                "found": False,
-                "message": (
-                    f"'{lookup['matched_from']}' was matched in materials.csv "
-                    f"but its cost_per_kg cell is blank -- please fill it in."
-                ),
-            }
-
-        # Cost formula, deliberately simple and explainable:
-        #   material_cost_per_unit = mass (kg) * cost_per_kg (materials.csv)
-        #   + a flat per-unit machining/process fee
-        #   x a quantity multiplier that discounts per-unit cost at larger
-        #     batch sizes (setup/overhead amortizes better), see
-        #     _QUANTITY_DISCOUNT_TIERS above.
-        # Not a real manufacturing quote -- a rough, explainable estimate.
-        mass_kg = self.get_mass()
-        material_cost_per_unit = mass_kg * cost_per_kg
-        multiplier = _quantity_multiplier(quantity)
-        cost_per_unit = (material_cost_per_unit + _MACHINING_BASE_FEE_INR) * multiplier
-        total_cost = cost_per_unit * quantity
-
-        return {
-            "found": True,
-            "quantity": quantity,
-            "cost_per_unit_inr": round(cost_per_unit, 2),
-            "estimated_total_cost_inr": round(total_cost, 2),
-            "material_matched": lookup["matched_from"],
-            "is_fuzzy_match": lookup["is_fuzzy_match"],
-            "assumptions": (
-                f"Rs {cost_per_kg}/kg for '{lookup['matched_from']}'"
-                + (" (fuzzy match)" if lookup["is_fuzzy_match"] else "")
-                + f", + Rs {_MACHINING_BASE_FEE_INR} flat machining fee/unit, "
-                f"x{multiplier} quantity multiplier for a batch of {quantity}"
-            ),
-        }
+    # estimate_carbon() is concrete, not abstract: it's built entirely out
+    # of get_mass()/get_material() plus materials.csv, so every subclass
+    # gets it for free rather than having to reimplement the same
+    # materials_db lookup logic. (estimate_cost() used to live here as a
+    # similarly simple formula, but has been replaced by the Random
+    # Forest model in cost_model/ -- see mcp_server.py's estimate_cost
+    # tool, which now calls cost_model.predict.predict_cost() directly.)
 
     def estimate_carbon(self) -> dict:
         """Estimate the embodied carbon (cradle-to-gate) of the current

@@ -33,3 +33,8 @@ htmlcov/
 
 # Logs
 *.log
+
+# Generated ML artifacts (reproducible via generate_synthetic_dataset.py
+# + train_model.py with a fixed random seed -- see cost_model/)
+cost_model/synthetic_cost_dataset.csv
+cost_model/trained_model.joblib

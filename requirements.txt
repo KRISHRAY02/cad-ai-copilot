@@ -2,3 +2,7 @@ pywin32
 mcp
 ollama
 streamlit
+scikit-learn
+pandas
+numpy
+joblib

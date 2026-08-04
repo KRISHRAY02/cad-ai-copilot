@@ -200,6 +200,34 @@ class SolidWorksAdapter(CadAdapter):
 
         return features
 
+    def get_face_count(self) -> int:
+        """Total face count across the part's solid and sheet metal bodies.
+
+        Sums IBody2::GetFaceCount over every body returned by
+        IPartDoc::GetBodies2, called once for swSolidBody (0) and once for
+        swSheetBody (1) -- these two swBodyType_e values are consistent
+        across SolidWorks API versions, avoiding reliance on a less
+        consistently documented "all body types" constant. GetFaceCount is
+        a zero-arg property, so per this project's established dynamic-
+        dispatch quirk (see module docstring notes elsewhere in this repo)
+        it's read without parens.
+
+        **Not yet verified against a live SolidWorks session** (unlike the
+        rest of this adapter) -- verify against a real part before relying
+        on this for the ML cost model.
+        """
+        model = self._get_active_doc()
+
+        total_faces = 0
+        for body_type in (0, 1):  # 0 = swSolidBody, 1 = swSheetBody
+            bodies = model.GetBodies2(body_type, True)
+            if not bodies:
+                continue
+            for body in bodies:
+                total_faces += body.GetFaceCount
+
+        return total_faces
+
     @staticmethod
     def _is_suppressed(feat) -> bool:
         """Best-effort read of a feature's suppression state.

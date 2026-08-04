@@ -34,6 +34,7 @@ class MockAdapter(CadAdapter):
         )
 
         self._mass_kg = 0.842
+        self._face_count = 18
 
         self._features = [
             Feature(
@@ -106,3 +107,6 @@ class MockAdapter(CadAdapter):
 
     def get_features(self) -> list[Feature]:
         return list(self._features)
+
+    def get_face_count(self) -> int:
+        return self._face_count
