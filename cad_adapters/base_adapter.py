@@ -141,6 +141,32 @@ class CadAdapter(ABC):
         """
         raise NotImplementedError
 
+    @abstractmethod
+    def get_bend_count(self) -> int:
+        """Return the number of Sheet Metal bend features in the current
+        part's feature tree.
+
+        Used by the Sheet Metal production cost formula (see
+        production_cost.py) -- each bend is a separate press-brake
+        operation. Returns 0 for parts with no Sheet Metal bend features
+        (including parts made with any other manufacturing process), not
+        an error -- a part simply having zero bends is a valid real
+        answer, distinct from bend data being unavailable.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_bounding_box_mm(self) -> tuple[float, float, float]:
+        """Return the current part's axis-aligned bounding box dimensions
+        (x, y, z), in millimeters.
+
+        Used by the Sheet Metal production cost formula (see
+        production_cost.py) to approximate cutting length from the
+        part's footprint perimeter -- a documented approximation, not a
+        true flat-pattern measurement.
+        """
+        raise NotImplementedError
+
     # estimate_carbon() is concrete, not abstract: it's built entirely out
     # of get_mass()/get_material() plus materials.csv, so every subclass
     # gets it for free rather than having to reimplement the same

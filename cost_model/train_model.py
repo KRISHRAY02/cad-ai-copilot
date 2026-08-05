@@ -3,9 +3,10 @@ the approach in Nirmalakumari K. et al., "Efficient Method for Product Cost
 Estimation using Artificial Intelligence Techniques," 2025 3rd ICAECA,
 DOI: 10.1109/ICAECA63854.2025.11012624:
 
-- Features: geometric (volume, surface area, face count, material density,
-  mass) + order-level (material type, order quantity, order year, supplier,
-  machine type).
+- Features: geometric (volume, surface area, face count, bend count,
+  material density, mass) + order-level (material type, order quantity,
+  order year, supplier, machine type, manufacturing_process -- CNC
+  Machining / Injection Molding / Sheet Metal, see production_cost.py).
 - Model: RandomForestRegressor, hyperparameters tuned with GridSearchCV
   (n_estimators, max_depth, min_samples_split).
 - Split: 75% train / 25% test, matching the paper.

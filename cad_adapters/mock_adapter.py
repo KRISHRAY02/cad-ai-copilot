@@ -41,6 +41,8 @@ class MockAdapter(CadAdapter):
 
         self._mass_kg = 0.842
         self._face_count = 18
+        self._bend_count = 0  # this sample part is a machined bracket, not sheet metal
+        self._bounding_box_mm = (120.0, 80.0, 25.0)
 
         self._features = [
             Feature(
@@ -116,6 +118,12 @@ class MockAdapter(CadAdapter):
 
     def get_face_count(self) -> int:
         return self._face_count
+
+    def get_bend_count(self) -> int:
+        return self._bend_count
+
+    def get_bounding_box_mm(self) -> tuple[float, float, float]:
+        return self._bounding_box_mm
 
     def run_dfm_check(self) -> list[dict]:
         """Synthetic DFM results demonstrating all three outcome types

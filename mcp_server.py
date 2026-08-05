@@ -18,6 +18,8 @@ from mcp.server.mcpserver import MCPServer
 from cad_adapters.base_adapter import CadAdapter
 from cad_adapters.mock_adapter import MockAdapter
 from cost_model.features import infer_material_type
+from materials_db import get_material_cost_and_carbon
+from production_cost import PROCESSES
 
 _MIN_FILLET_RADIUS_MM = 1.0
 
@@ -115,6 +117,7 @@ def get_features() -> list[dict]:
 
 @mcp.tool()
 def estimate_cost(
+    manufacturing_process: str | None = None,
     quantity: int = 1,
     order_year: int | None = None,
     supplier: str = _DEFAULT_SUPPLIER,
@@ -122,28 +125,60 @@ def estimate_cost(
 ) -> dict:
     """Estimate the cost to produce `quantity` units of the current part,
     in INR, using a trained Random Forest Regression model (see
-    cost_model/) instead of a flat formula.
+    cost_model/) for a total, PLUS an explicit breakdown into material
+    cost and production cost computed directly from real data (see
+    production_cost.py).
 
-    Pulls the part's geometry (volume, surface area, face count) and
-    material (name, density) live from the CAD adapter, combines them
-    with the given order-level parameters (quantity, order_year --
-    defaults to the current year -- supplier, machine_type), and passes
-    all of it to cost_model.predict.predict_cost(). The model was trained
-    on a synthetic dataset whose per-row cost target is grounded in the
-    real cost_per_kg figures in materials.csv (see
-    cost_model/generate_synthetic_dataset.py) -- it is a student-project
-    estimate, not a real manufacturing quote.
+    `manufacturing_process` MUST be one of "CNC Machining", "Injection
+    Molding", or "Sheet Metal" -- it drives which production cost formula
+    is used (machining time for CNC, cycle time + tooling amortization for
+    Injection Molding, cutting length + bend count for Sheet Metal), and
+    real parts cost very differently to produce depending on which of
+    these processes makes them. **If the user's question doesn't specify
+    a process, ASK THE USER which one to assume before calling this tool
+    -- do not silently guess one.** If you call this tool without a
+    process anyway (e.g. because the user can't be reached), it returns
+    found=False listing the three valid options rather than guessing.
+
+    Pulls the part's geometry (volume, surface area, face count, bend
+    count, bounding box) and material (name, density, cost_per_kg) live
+    from the CAD adapter and materials.csv, combines them with the given
+    order-level parameters (quantity, order_year -- defaults to the
+    current year -- supplier, machine_type), and passes all of it to
+    cost_model.predict.predict_cost(). The model was trained on a
+    synthetic dataset whose per-row cost target is grounded in real
+    cost_per_kg figures (materials.csv) plus production_cost.py's
+    formulas (see cost_model/generate_synthetic_dataset.py) -- it is a
+    student-project estimate, not a real manufacturing quote, and the
+    production cost formulas use PLACEHOLDER shop-rate constants (see
+    production_cost.py) that haven't been replaced with real researched
+    figures yet.
 
     Returns found=False with an explanatory message if the trained model
     file doesn't exist yet (run cost_model/generate_synthetic_dataset.py
-    then cost_model/train_model.py first) instead of guessing.
+    then cost_model/train_model.py first), if materials.csv can't
+    resolve the part's material cost, or if manufacturing_process is
+    missing/invalid -- instead of guessing.
     """
     from cost_model.predict import predict_cost
+
+    if manufacturing_process not in PROCESSES:
+        return {
+            "found": False,
+            "message": (
+                f"manufacturing_process must be one of {list(PROCESSES)}. "
+                "Ask the user which manufacturing process to assume for "
+                "this part, then call estimate_cost again with their "
+                "answer."
+            ),
+        }
 
     mass_kg = adapter.get_mass()
     material = adapter.get_material()
     mass_properties = adapter.get_mass_properties()
     face_count = adapter.get_face_count()
+    bend_count = adapter.get_bend_count()
+    bounding_box_mm = adapter.get_bounding_box_mm()
 
     volume_m3 = mass_properties.get("volume_m3")
     surface_area_m2 = mass_properties.get("surface_area_m2")
@@ -156,10 +191,22 @@ def estimate_cost(
             ),
         }
 
+    material_lookup = get_material_cost_and_carbon(material.name)
+    if not material_lookup["found"] or material_lookup["cost_per_kg"] is None:
+        return {
+            "found": False,
+            "message": (
+                f"Material '{material.name}' cost_per_kg is unavailable in "
+                "materials.csv -- material cost (and therefore total cost) "
+                "cannot be estimated."
+            ),
+        }
+
     features = {
         "volume_m3": volume_m3,
         "surface_area_m2": surface_area_m2,
         "face_count": face_count,
+        "bend_count": bend_count,
         "density_kg_m3": material.density_kg_m3,
         "mass_kg": mass_kg,
         "order_quantity": quantity,
@@ -167,6 +214,9 @@ def estimate_cost(
         "material_type": infer_material_type(material.name),
         "supplier": supplier,
         "machine_type": machine_type,
+        "manufacturing_process": manufacturing_process,
+        "cost_per_kg": material_lookup["cost_per_kg"],
+        "bounding_box_mm": bounding_box_mm,
     }
 
     try:
@@ -174,18 +224,40 @@ def estimate_cost(
     except FileNotFoundError as e:
         return {"found": False, "message": str(e)}
 
+    material_cost_per_unit = prediction["material_cost_inr"]
+    production_cost_per_unit = prediction["production_cost_inr"]
+    predicted_total_per_unit = prediction["predicted_total_cost_inr"]
+
     return {
         "found": True,
-        "predicted_cost_per_unit_inr": prediction["predicted_cost_inr"],
-        "estimated_total_cost_inr": round(
-            prediction["predicted_cost_inr"] * quantity, 2
+        "manufacturing_process": manufacturing_process,
+        "material_cost_per_unit_inr": material_cost_per_unit,
+        "production_cost_per_unit_inr": production_cost_per_unit,
+        "total_cost_per_unit_inr": round(
+            material_cost_per_unit + production_cost_per_unit, 2
         ),
+        "ml_predicted_total_cost_per_unit_inr": predicted_total_per_unit,
+        "total_cost_for_quantity_inr": round(
+            (material_cost_per_unit + production_cost_per_unit) * quantity, 2
+        ),
+        "quantity": quantity,
         "material_used": material.name,
+        "material_cost_per_kg_inr": material_lookup["cost_per_kg"],
+        "production_cost_breakdown": prediction["production_cost_breakdown"],
+        "production_cost_assumptions": prediction["production_cost_assumptions"],
         "inputs_used": prediction["features_used"],
         "assumptions": (
-            "Random Forest Regression model trained on a synthetic "
-            "dataset grounded in materials.csv cost figures -- see "
-            "cost_model/ for methodology. Not a real manufacturing quote."
+            "total_cost_per_unit_inr = material_cost_per_unit_inr "
+            "(mass x materials.csv cost_per_kg) + "
+            "production_cost_per_unit_inr (process-specific formula, see "
+            "production_cost_assumptions -- uses PLACEHOLDER shop rates, "
+            "not real researched figures). "
+            "ml_predicted_total_cost_per_unit_inr is a separate Random "
+            "Forest Regression estimate (see cost_model/) trained on a "
+            "synthetic dataset grounded in these same real material and "
+            "production cost figures -- shown for comparison, not "
+            "summed into the total. Neither figure is a real "
+            "manufacturing quote."
         ),
     }
 

@@ -12,17 +12,24 @@ from sklearn.preprocessing import LabelEncoder
 # area, face count, density, mass) + order-level properties (material
 # type, order quantity, order year, supplier) -- machine_type is an extra
 # categorical feature this project's synthetic generator also varies,
-# included the same way as the other categoricals.
+# included the same way as the other categoricals. bend_count is a
+# geometric feature relevant mainly to Sheet Metal parts (0 for every
+# other process, see production_cost.py); manufacturing_process (CNC
+# Machining / Injection Molding / Sheet Metal) is the process-aware
+# extension to the paper -- see production_cost.py for the per-process
+# production cost formulas whose output is what the synthetic target cost
+# is grounded in (see generate_synthetic_dataset.py).
 NUMERIC_FEATURES = [
     "volume_m3",
     "surface_area_m2",
     "face_count",
+    "bend_count",
     "density_kg_m3",
     "mass_kg",
     "order_quantity",
     "order_year",
 ]
-CATEGORICAL_FEATURES = ["material_type", "supplier", "machine_type"]
+CATEGORICAL_FEATURES = ["material_type", "supplier", "machine_type", "manufacturing_process"]
 FEATURE_COLUMNS = NUMERIC_FEATURES + CATEGORICAL_FEATURES
 
 # Coarse material-type buckets inferred from the material name, since

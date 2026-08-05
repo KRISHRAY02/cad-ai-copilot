@@ -45,6 +45,25 @@ _LENGTH_UNIT_NAMES = {
 # swUserPreferenceIntegerValue_e.swUnitsLinear
 _SW_UNITS_LINEAR = 1
 
+# GetTypeName2 strings for SOLIDWORKS Sheet Metal features that create a
+# bend line, used by get_bend_count(). This counts *bend-producing
+# features*, one count per feature -- not a true count of individual bend
+# lines: an Edge-Flange or Miter-Flange applied along a multi-segment edge
+# can produce more than one physical bend from a single feature, which
+# this approximation would undercount. A true per-bend-line count would
+# need to walk each body's bend table (ISheetMetalFolder /
+# IFlatPatternFeatureData2), which isn't implemented here. "SketchBend"
+# (Sketched Bend) is the one type guaranteed to be exactly one bend per
+# feature.
+_SHEET_METAL_BEND_FEATURE_TYPES = {
+    "SketchBend",
+    "Base-Flange",
+    "Edge-Flange",
+    "Miter-Flange",
+    "Jog",
+    "Lofted-Bend",
+}
+
 
 class SolidWorksConnectionError(RuntimeError):
     """Base class for failures connecting to SolidWorks."""
@@ -262,6 +281,60 @@ class SolidWorksAdapter(CadAdapter):
         """
         model = self._get_active_doc()
         return sum(body.GetFaceCount() for body in self._iter_bodies(model))
+
+    def get_bend_count(self) -> int:
+        """Count Sheet Metal bend-producing features in the feature tree.
+
+        See the _SHEET_METAL_BEND_FEATURE_TYPES module constant for the
+        approximation this makes (one count per bend-producing feature,
+        not per physical bend line) and its known undercounting case.
+        Returns 0 for a part with no such features, e.g. any non-sheet-
+        metal part -- a real, valid answer, not an error.
+        """
+        model = self._get_active_doc()
+        return sum(
+            1
+            for feat in self._iter_raw_features(model)
+            if feat.GetTypeName2 in _SHEET_METAL_BEND_FEATURE_TYPES
+        )
+
+    def get_bounding_box_mm(self) -> tuple[float, float, float]:
+        """Axis-aligned bounding box dimensions (x, y, z), in millimeters.
+
+        **Verified live 2026-08-05** against the real part "5200 battery
+        HV": returned (139.0, 45.0, 52.0) mm.
+
+        Uses IBody2::GetBodyBox() (per body, from _iter_bodies() -- same
+        source as get_face_count()), NOT IModelDocExtension::GetBox --
+        that was tried first and found to raise `AttributeError:
+        <unknown>.GetBox` via dynamic dispatch in this environment
+        regardless of argument count (0/1/2 args, on both `model` and
+        `model.Extension`), the same deeper "member not resolvable via
+        dynamic dispatch" limitation documented for IFace2.GetSurface in
+        _check_wall_thickness -- not the usual auto-invoke-vs-parens
+        quirk, since it isn't reachable at all. GetBodyBox() **does**
+        auto-resolve, and like GetFaceCount() must be called with
+        explicit parens (returns a bound method otherwise). Each body's
+        box is 6 doubles (xmin,ymin,zmin,xmax,ymax,zmax) in meters; for a
+        multi-body part, the boxes are unioned across all bodies to get
+        the whole part's overall bounding box.
+        """
+        model = self._get_active_doc()
+        bodies = list(self._iter_bodies(model))
+        if not bodies:
+            return (0.0, 0.0, 0.0)
+
+        xmin = ymin = zmin = float("inf")
+        xmax = ymax = zmax = float("-inf")
+        for body in bodies:
+            bx0, by0, bz0, bx1, by1, bz1 = body.GetBodyBox()
+            xmin, ymin, zmin = min(xmin, bx0), min(ymin, by0), min(zmin, bz0)
+            xmax, ymax, zmax = max(xmax, bx1), max(ymax, by1), max(zmax, bz1)
+
+        x_mm = (xmax - xmin) * 1000.0
+        y_mm = (ymax - ymin) * 1000.0
+        z_mm = (zmax - zmin) * 1000.0
+        return (x_mm, y_mm, z_mm)
 
     def run_dfm_check(self) -> list[dict]:
         """Run all four DFM checks (hole geometry, wall thickness, draft

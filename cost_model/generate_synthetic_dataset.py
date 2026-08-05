@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from cost_model.features import infer_material_type  # noqa: E402
 from materials_db import load_materials  # noqa: E402
+from production_cost import PROCESSES, estimate_production_cost  # noqa: E402
 
 _OUTPUT_CSV_PATH = Path(__file__).parent / "synthetic_cost_dataset.csv"
 _NUM_ROWS = 300
@@ -59,6 +60,18 @@ _FACE_COUNT_RANGE = (4, 60)
 _MAX_COST_PER_KG_INR = 20000.0
 
 _ORDER_QUANTITIES = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1000]
+# Injection Molding's tooling cost (IM_TOOLING_COST_INR, see
+# production_cost.py) is only amortized economically at high volumes --
+# in reality nobody cuts a steel mold to injection-mold a single part.
+# Sampling from the full _ORDER_QUANTITIES range (including 1-50) for
+# Injection Molding rows produced a handful of extreme per-unit costs
+# (tooling / 1 unit) that dominated the RMSE-based accuracy metric, the
+# same "one process at one unrealistic setting overwhelms the metric"
+# failure mode documented above for precious metals -- fixed the same
+# way, by restricting the sampled range to realistic values for that
+# process rather than leaving the flawed sampling in and adjusting the
+# metric.
+_INJECTION_MOLDING_ORDER_QUANTITIES = [100, 250, 500, 1000]
 _ORDER_YEARS = [2020, 2021, 2022, 2023, 2024, 2025, 2026]
 _SUPPLIERS = ["Supplier_A", "Supplier_B", "Supplier_C", "Supplier_D"]
 _MACHINE_TYPES = ["CNC_3axis", "CNC_5axis", "Manual_Mill", "Laser_Cut"]
@@ -85,12 +98,23 @@ _SUPPLIER_PREMIUM = {
     "Supplier_D": 1.10,
 }
 
-# Production-cost formula constants, in INR -- illustrative figures, not
-# a real shop rate card (same spirit as the flat machining fee this
-# project's old formula-based estimate_cost() used before it moved here).
-_BASE_SETUP_FEE_INR = 2000.0
-_PER_FACE_COST_INR = 45.0
-_FINISHING_RATE_INR_PER_M2 = 15000.0
+# Production cost is no longer a single flat formula here -- it's computed
+# by production_cost.py's process-specific formulas (CNC Machining /
+# Injection Molding / Sheet Metal), the same ones the live estimate_cost()
+# MCP tool uses via predict.py, so the model is trained on ground-truth
+# costs computed the identical way a live prediction's breakdown is.
+
+# Sheet metal rows need a plausible bounding box to feed
+# production_cost.estimate_sheet_metal_cost()'s cutting-length
+# approximation. Since this dataset doesn't have real CAD geometry, sheet
+# metal rows are modeled as a thin rectangular plate: volume = length x
+# width x thickness, with thickness sampled from a typical sheet-gauge
+# range and a random length:width aspect ratio -- illustrative, not a
+# real flat-pattern measurement (see production_cost.py's own
+# approximation note).
+_SHEET_METAL_THICKNESS_MM_RANGE = (0.5, 3.0)
+_SHEET_METAL_ASPECT_RATIO_RANGE = (1.0, 3.0)
+_BEND_COUNT_RANGE = (1, 8)  # only sampled for Sheet Metal rows
 
 # Batch-size discount tiers: per-unit setup/overhead amortizes better at
 # larger batch sizes, same tiered shape used elsewhere in this project
@@ -112,6 +136,21 @@ def _quantity_multiplier(quantity: int) -> float:
     return 1.0
 
 
+def _synthetic_bounding_box_mm(volume_m3: float, np_rng: np.random.Generator) -> tuple[float, float, float]:
+    """Model a Sheet Metal row's part as a thin rectangular plate (length x
+    width x thickness = volume) so production_cost.estimate_sheet_metal_cost
+    has a bounding box to approximate cutting length from. See the module
+    docstring note above _SHEET_METAL_THICKNESS_MM_RANGE.
+    """
+    thickness_mm = np_rng.uniform(*_SHEET_METAL_THICKNESS_MM_RANGE)
+    volume_mm3 = volume_m3 * 1e9
+    footprint_area_mm2 = volume_mm3 / thickness_mm
+    aspect_ratio = np_rng.uniform(*_SHEET_METAL_ASPECT_RATIO_RANGE)
+    width_mm = (footprint_area_mm2 / aspect_ratio) ** 0.5
+    length_mm = footprint_area_mm2 / width_mm
+    return (length_mm, width_mm, thickness_mm)
+
+
 def _generate_row(rng: random.Random, np_rng: np.random.Generator, materials: list[dict]) -> dict:
     material = rng.choice(materials)
     density_kg_m3 = material["density_kg_m3"]
@@ -124,12 +163,27 @@ def _generate_row(rng: random.Random, np_rng: np.random.Generator, materials: li
     # independently of volume, as a real part's surface area would.
     base_surface_area = volume_m3 ** (2 / 3)
     surface_area_m2 = base_surface_area * np_rng.uniform(3.0, 12.0)
-    face_count = np_rng.integers(_FACE_COUNT_RANGE[0], _FACE_COUNT_RANGE[1] + 1)
+    face_count = int(np_rng.integers(_FACE_COUNT_RANGE[0], _FACE_COUNT_RANGE[1] + 1))
 
-    order_quantity = rng.choice(_ORDER_QUANTITIES)
     order_year = rng.choice(_ORDER_YEARS)
     supplier = rng.choice(_SUPPLIERS)
     machine_type = rng.choice(_MACHINE_TYPES)
+    manufacturing_process = rng.choice(PROCESSES)
+    order_quantity = (
+        rng.choice(_INJECTION_MOLDING_ORDER_QUANTITIES)
+        if manufacturing_process == "Injection Molding"
+        else rng.choice(_ORDER_QUANTITIES)
+    )
+
+    # bend_count only means anything for Sheet Metal parts -- 0 for every
+    # other process, matching what CadAdapter.get_bend_count() returns for
+    # a real non-sheet-metal part.
+    if manufacturing_process == "Sheet Metal":
+        bend_count = rng.randint(*_BEND_COUNT_RANGE)
+        bounding_box_mm = _synthetic_bounding_box_mm(volume_m3, np_rng)
+    else:
+        bend_count = 0
+        bounding_box_mm = (0.0, 0.0, 0.0)
 
     mass_kg = volume_m3 * density_kg_m3
 
@@ -137,15 +191,25 @@ def _generate_row(rng: random.Random, np_rng: np.random.Generator, materials: li
     # 1. Material cost: real mass x real materials.csv cost_per_kg.
     material_cost_inr = mass_kg * cost_per_kg
 
-    # 2. Production/process cost: a flat setup fee, plus a per-face
-    #    machining cost (more faces ~ more machining operations), plus a
-    #    finishing cost proportional to surface area, all scaled by a
-    #    machine-type difficulty factor.
-    production_cost_inr = (
-        _BASE_SETUP_FEE_INR
-        + _PER_FACE_COST_INR * face_count
-        + _FINISHING_RATE_INR_PER_M2 * surface_area_m2
-    ) * _MACHINE_TYPE_FACTOR[machine_type]
+    # 2. Production/process cost: computed by production_cost.py's
+    #    process-specific formula for whichever manufacturing_process this
+    #    row was assigned (CNC Machining: setup + per-feature machining
+    #    time; Injection Molding: cycle time + amortized tooling; Sheet
+    #    Metal: cutting length + per-bend cost) -- the SAME formula the
+    #    live estimate_cost() MCP tool uses via predict.py, so training
+    #    ground truth and live predictions are grounded in identical
+    #    process economics. Also scaled by a machine-type difficulty
+    #    factor (independent of manufacturing_process -- see
+    #    _MACHINE_TYPE_FACTOR).
+    production_result = estimate_production_cost(
+        manufacturing_process,
+        feature_count=face_count,
+        volume_m3=volume_m3,
+        order_quantity=order_quantity,
+        bounding_box_mm=bounding_box_mm,
+        bend_count=bend_count,
+    )
+    production_cost_inr = production_result.production_cost_inr * _MACHINE_TYPE_FACTOR[machine_type]
 
     # 3. Batch discount: larger order quantities amortize setup/overhead
     #    better, see _QUANTITY_DISCOUNT_TIERS above.
@@ -175,12 +239,14 @@ def _generate_row(rng: random.Random, np_rng: np.random.Generator, materials: li
         "density_kg_m3": density_kg_m3,
         "volume_m3": volume_m3,
         "surface_area_m2": surface_area_m2,
-        "face_count": int(face_count),
+        "face_count": face_count,
+        "bend_count": bend_count,
         "mass_kg": mass_kg,
         "order_quantity": order_quantity,
         "order_year": order_year,
         "supplier": supplier,
         "machine_type": machine_type,
+        "manufacturing_process": manufacturing_process,
         "cost_inr": round(cost_inr, 2),
     }
 
