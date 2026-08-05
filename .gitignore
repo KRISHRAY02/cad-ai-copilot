@@ -38,3 +38,6 @@ htmlcov/
 # + train_model.py with a fixed random seed -- see cost_model/)
 cost_model/synthetic_cost_dataset.csv
 cost_model/trained_model.joblib
+
+# Generated manufacturing readiness reports (see report/generate_report.py)
+*.pdf

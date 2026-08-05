@@ -12,6 +12,8 @@ to CAD_ADAPTER (env var) or the default in `_build_adapter()`.
 import dataclasses
 import datetime
 import os
+import tempfile
+from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
 
@@ -359,6 +361,124 @@ def run_dfm_check() -> list[dict]:
     determined at all).
     """
     return adapter.run_dfm_check()
+
+
+@mcp.tool()
+def compare_materials(
+    material_names: list[str],
+    quantity: int = 1,
+    manufacturing_process: str | None = None,
+) -> dict:
+    """Compare cost and carbon footprint for the CURRENTLY OPEN part's
+    REAL geometry as if it were made from each material in
+    `material_names` instead -- a "what if I used a different material"
+    comparison. This is a hypothetical, read-only comparison: it does
+    NOT change the material assigned in the actual CAD file, and does not
+    modify the model in any way. Use this when the user asks things like
+    "what would this cost in aluminum vs steel?" or "compare titanium and
+    stainless steel for this part" -- do NOT use estimate_cost/
+    estimate_carbon repeatedly for this, since those use the part's
+    actual assigned material, not a hypothetical one.
+
+    Each material name is looked up in materials.csv the same
+    exact-then-fuzzy way estimate_cost() does; the geometry (volume, face
+    count, bend count, bounding box) is read once from the real part and
+    reused unchanged for every material -- only the material itself
+    varies between comparison entries.
+
+    `manufacturing_process` MUST be one of "CNC Machining", "Injection
+    Molding", "Sheet Metal" (same as estimate_cost). If the user's
+    question doesn't specify one, ASK THE USER rather than guessing --
+    if called without one anyway, returns found=False listing the valid
+    options.
+
+    Returns {"found": True, "comparison": [one dict per material queried,
+    each with material_matched, hypothetical_mass_kg, material_cost_inr,
+    production_cost_inr, total_cost_per_unit_inr,
+    total_cost_for_quantity_inr, estimated_kg_co2e -- or found=False +
+    message for a material that couldn't be resolved/priced], "note":
+    ...}. Present this to the user as a small comparison table (material
+    / mass / cost / carbon), not prose. production_cost_inr is identical
+    across every material in the comparison, by design -- it depends
+    only on the part's geometry, not material choice; only
+    material_cost_inr and estimated_kg_co2e actually differ per
+    material.
+    """
+    if manufacturing_process not in PROCESSES:
+        return {
+            "found": False,
+            "message": (
+                f"manufacturing_process must be one of {list(PROCESSES)}. "
+                "Ask the user which manufacturing process to assume, then "
+                "call compare_materials again with their answer."
+            ),
+        }
+
+    comparison = adapter.compare_materials(material_names, quantity, manufacturing_process)
+
+    return {
+        "found": True,
+        "manufacturing_process": manufacturing_process,
+        "quantity": quantity,
+        "comparison": comparison,
+        "note": (
+            "production_cost_inr is identical across all materials here "
+            "since production cost depends only on the part's geometry "
+            "(face count / volume / bounding box / bend count), not "
+            "material choice -- material_cost_inr and estimated_kg_co2e "
+            "are what actually differ per material. This compares "
+            "hypothetical materials against the real part's geometry; "
+            "the actual CAD file's assigned material is unchanged."
+        ),
+    }
+
+
+@mcp.tool()
+def generate_report(
+    manufacturing_process: str | None = None,
+    quantity: int | None = None,
+    output_path: str | None = None,
+) -> dict:
+    """Generate a "manufacturing readiness report" PDF for the currently
+    open CAD part -- a single document combining a viewport screenshot,
+    part identity/mass/material info, a cost breakdown, a carbon
+    estimate, and DFM check results. Call this when the user asks to
+    "export a report", "generate a summary/report", "give me a PDF", or
+    similar phrasing, instead of trying to answer with several separate
+    tool calls.
+
+    `manufacturing_process` (one of "CNC Machining", "Injection
+    Molding", "Sheet Metal") and `quantity` should be whatever the user
+    already told you earlier in this conversation, if anything -- pass
+    those through here rather than re-asking, so the report reflects the
+    same assumptions the chat has been using. If you don't know either
+    one from the conversation, leave it as None: the report will use a
+    clearly-labeled default (CNC Machining, quantity 1) rather than the
+    tool guessing silently.
+
+    `output_path` defaults to a timestamped PDF in the system temp
+    directory if not given.
+
+    After this returns found=True, tell the user the exact file path so
+    they can open it.
+    """
+    from report.generate_report import generate_manufacturing_report
+
+    if output_path is None:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = str(Path(tempfile.gettempdir()) / f"manufacturing_report_{timestamp}.pdf")
+
+    try:
+        saved_path = generate_manufacturing_report(
+            output_path, manufacturing_process=manufacturing_process, quantity=quantity
+        )
+    except Exception as e:
+        return {
+            "found": False,
+            "message": f"Could not generate the report: {e}",
+        }
+
+    return {"found": True, "report_path": saved_path}
 
 
 if __name__ == "__main__":

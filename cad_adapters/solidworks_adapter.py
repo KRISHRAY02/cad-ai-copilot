@@ -7,6 +7,8 @@ or assembly open; this module only runs on Windows.
 """
 
 import math
+import tempfile
+from pathlib import Path
 
 import pythoncom
 import win32com.client
@@ -44,6 +46,9 @@ _LENGTH_UNIT_NAMES = {
 
 # swUserPreferenceIntegerValue_e.swUnitsLinear
 _SW_UNITS_LINEAR = 1
+
+_SCREENSHOT_WIDTH_PX = 800
+_SCREENSHOT_HEIGHT_PX = 600
 
 # GetTypeName2 strings for SOLIDWORKS Sheet Metal features that create a
 # bend line, used by get_bend_count(). This counts *bend-producing
@@ -281,6 +286,30 @@ class SolidWorksAdapter(CadAdapter):
         """
         model = self._get_active_doc()
         return sum(body.GetFaceCount() for body in self._iter_bodies(model))
+
+    def capture_screenshot(self, output_path: str | None = None) -> str:
+        """Save a screenshot of the current viewport (whatever view/zoom
+        is currently active in SolidWorks) as a BMP file, returning the
+        saved path.
+
+        **Verified live 2026-08-05** against the real part "5200 battery
+        HV": `IModelDoc2.SaveBMP(path, width_px, height_px)` produced a
+        real ~900KB, non-blank bitmap (confirmed via PIL: varying
+        grayscale pixel values, not a uniform blank image). Note the
+        argument order was verified empirically, not from documentation:
+        passing (300, 800) produced an image whose PIL `.size` was
+        exactly `(300, 800)` (width, height) -- so despite SOLIDWORKS'
+        own API documentation calling these arguments "Height, Width" in
+        that order, they behave as (width_px, height_px) as passed
+        through this dynamic-dispatch call in this environment.
+        """
+        model = self._get_active_doc()
+        if output_path is None:
+            part_name = model.GetTitle or "screenshot"
+            output_path = str(Path(tempfile.gettempdir()) / f"{part_name}_screenshot.bmp")
+
+        model.SaveBMP(output_path, _SCREENSHOT_WIDTH_PX, _SCREENSHOT_HEIGHT_PX)
+        return output_path
 
     def get_bend_count(self) -> int:
         """Count Sheet Metal bend-producing features in the feature tree.

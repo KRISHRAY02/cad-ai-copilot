@@ -6,6 +6,9 @@ CAD software) running. The sample data models a simple machined aluminum
 mounting bracket.
 """
 
+import tempfile
+from pathlib import Path
+
 from cad_adapters.base_adapter import CadAdapter, Feature, MaterialInfo, PartInfo
 from cad_adapters.dfm_checks import (
     MAX_HOLE_DEPTH_TO_DIAMETER_RATIO,
@@ -13,6 +16,10 @@ from cad_adapters.dfm_checks import (
     MIN_TOLERANCE_BAND_MM,
     make_finding,
 )
+
+_PLACEHOLDER_SCREENSHOT_SIZE = (640, 480)
+_PLACEHOLDER_SCREENSHOT_BG = (230, 234, 240)
+_PLACEHOLDER_SCREENSHOT_TEXT_COLOR = (91, 107, 133)
 
 
 class MockAdapter(CadAdapter):
@@ -124,6 +131,41 @@ class MockAdapter(CadAdapter):
 
     def get_bounding_box_mm(self) -> tuple[float, float, float]:
         return self._bounding_box_mm
+
+    def capture_screenshot(self, output_path: str | None = None) -> str:
+        """Draws a simple placeholder image (no real CAD viewport exists
+        for the mock adapter) labeled clearly as a placeholder, so a
+        generated report is never mistaken for showing real part
+        geometry.
+        """
+        from PIL import Image, ImageDraw
+
+        if output_path is None:
+            output_path = str(
+                Path(tempfile.gettempdir()) / f"{self._part_info.name}_placeholder.png"
+            )
+
+        image = Image.new("RGB", _PLACEHOLDER_SCREENSHOT_SIZE, color=_PLACEHOLDER_SCREENSHOT_BG)
+        draw = ImageDraw.Draw(image)
+        lines = [
+            "[Mock Adapter -- no CAD viewport]",
+            self._part_info.name,
+            "(placeholder image, not a real screenshot)",
+        ]
+        width, height = _PLACEHOLDER_SCREENSHOT_SIZE
+        y = height // 2 - (len(lines) * 16) // 2
+        for line in lines:
+            bbox = draw.textbbox((0, 0), line)
+            text_width = bbox[2] - bbox[0]
+            draw.text(
+                ((width - text_width) / 2, y),
+                line,
+                fill=_PLACEHOLDER_SCREENSHOT_TEXT_COLOR,
+            )
+            y += 20
+
+        image.save(output_path)
+        return output_path
 
     def run_dfm_check(self) -> list[dict]:
         """Synthetic DFM results demonstrating all three outcome types
