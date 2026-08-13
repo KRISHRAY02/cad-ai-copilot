@@ -32,6 +32,8 @@ from reportlab.platypus import (
 
 from mcp_server import adapter, estimate_cost
 
+_ASSEMBLY_BOM_COL_WIDTHS = [26 * mm, 20 * mm, 20 * mm, 32 * mm, 12 * mm, 22 * mm, 22 * mm]
+
 _PAGE_MARGIN_MM = 18
 _MAX_IMAGE_WIDTH_MM = 170
 _MAX_IMAGE_HEIGHT_MM = 100
@@ -211,6 +213,169 @@ def _dfm_section(styles) -> list:
     return flowables
 
 
+def _fmt(value, suffix: str = "") -> str:
+    if value is None:
+        return "N/A"
+    if isinstance(value, float):
+        return f"{value:.2f}{suffix}"
+    return f"{value}{suffix}"
+
+
+def _bom_row_cells(row: dict) -> list[str]:
+    return [
+        row["part_name"],
+        row["configuration"],
+        row["classification"],
+        row["material"] or "-",
+        str(row["quantity_per_assembly"]),
+        _fmt(row["unit_cost_inr"], " Rs") if row["unit_cost_inr"] is not None else "N/A",
+        _fmt(row["total_cost_inr"], " Rs") if row["total_cost_inr"] is not None else "N/A",
+    ]
+
+
+def _assembly_bom_section(
+    styles, manufacturing_process: str, quantity: int, process_is_default: bool, quantity_is_default: bool
+) -> tuple[list, dict | None]:
+    """BOM table + assembly-level rollup totals for an assembly report.
+
+    Returns (flowables, bom_result) -- bom_result is reused by
+    _assembly_cost_drivers_section() so get_assembly_bom() (which walks
+    the whole component tree via COM) only runs once per report.
+    """
+    flowables = [Paragraph("Bill of Materials", styles["SectionHeading"])]
+
+    assumption_note = (
+        f"Manufacturing process: {manufacturing_process}"
+        + (" (default -- not specified by the user)" if process_is_default else "")
+        + f" | Quantity: {quantity}"
+        + (" (default -- not specified by the user)" if quantity_is_default else "")
+    )
+    flowables.append(Paragraph(assumption_note, styles["Note"]))
+
+    bom_result = adapter.get_assembly_bom(manufacturing_process, quantity)
+
+    rows = [["Part", "Config", "Make/Buy", "Material", "Qty", "Unit Cost", "Total Cost"]]
+    for row in bom_result["bom"]:
+        rows.append(_bom_row_cells(row))
+    flowables.append(_table(rows, col_widths=_ASSEMBLY_BOM_COL_WIDTHS))
+
+    totals = bom_result["totals"]
+    flowables.append(Spacer(1, 10))
+    flowables.append(Paragraph("Assembly Totals", styles["SectionHeading"]))
+    flowables.append(
+        _table(
+            [
+                ["Item", "Value"],
+                ["Unique parts", str(totals["unique_part_count"])],
+                ["Total part instances (incl. duplicates)", str(totals["total_instance_count"])],
+                ["Total assembly mass", f"{totals['total_assembly_mass_kg']:.3f} kg"],
+                ["Total cost -- 1 assembly", f"Rs {totals['total_assembly_cost_one_unit_inr']:.2f}"],
+                [
+                    f"Total cost -- {quantity} assembl{'y' if quantity == 1 else 'ies'}",
+                    f"Rs {totals['total_assembly_cost_for_quantity_inr']:.2f}",
+                ],
+            ],
+            col_widths=[85 * mm, 85 * mm],
+        )
+    )
+
+    if bom_result["missing_data"]:
+        flowables.append(Spacer(1, 6))
+        flowables.append(
+            Paragraph(
+                "Components with missing material or pricing data (excluded from the totals above):",
+                styles["Note"],
+            )
+        )
+        for entry in bom_result["missing_data"]:
+            flowables.append(
+                Paragraph(
+                    f"- {entry['part_name']} ({entry['configuration']}): {entry['reason']}",
+                    styles["Note"],
+                )
+            )
+
+    return flowables, bom_result
+
+
+def _assembly_cost_drivers_section(styles, bom_result: dict) -> list:
+    """Top cost-driving components, reusing the already-computed BOM
+    rather than re-walking the assembly tree a second time.
+    """
+    flowables = [Paragraph("Top Cost Drivers", styles["SectionHeading"])]
+
+    priced_rows = [r for r in bom_result["bom"] if r["total_cost_inr"] is not None]
+    ranked = sorted(priced_rows, key=lambda r: r["total_cost_inr"], reverse=True)[:5]
+
+    if not ranked:
+        flowables.append(Paragraph("No priced components to rank.", styles["Normal"]))
+        return flowables
+
+    rows = [["Part", "Config", "Make/Buy", "Total Cost (1 assembly)"]]
+    for row in ranked:
+        rows.append(
+            [
+                row["part_name"],
+                row["configuration"],
+                row["classification"],
+                f"Rs {row['total_cost_inr']:.2f}",
+            ]
+        )
+    flowables.append(_table(rows, col_widths=[50 * mm, 35 * mm, 35 * mm, 50 * mm]))
+    return flowables
+
+
+def _generate_assembly_report(
+    output_path: str,
+    manufacturing_process: str,
+    quantity: int,
+    process_is_default: bool,
+    quantity_is_default: bool,
+) -> str:
+    part_info = adapter.get_current_part_info()
+    screenshot_path = adapter.capture_screenshot()
+
+    styles = _styles()
+    doc = SimpleDocTemplate(
+        output_path,
+        pagesize=A4,
+        leftMargin=_PAGE_MARGIN_MM * mm,
+        rightMargin=_PAGE_MARGIN_MM * mm,
+        topMargin=_PAGE_MARGIN_MM * mm,
+        bottomMargin=_PAGE_MARGIN_MM * mm,
+        title=f"Assembly Manufacturing Readiness Report -- {part_info.name}",
+    )
+
+    generated_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    story = [
+        Paragraph(f"Assembly Manufacturing Readiness Report -- {part_info.name}", styles["ReportTitle"]),
+        Paragraph(f"Generated {generated_at}", styles["ReportSubtitle"]),
+        _screenshot_flowable(screenshot_path),
+        Spacer(1, 12),
+        Paragraph("Assembly Information", styles["SectionHeading"]),
+        _table(
+            [
+                ["Item", "Value"],
+                ["Name", part_info.name],
+                ["File path", part_info.file_path],
+                ["Type", part_info.part_type],
+                ["Units", part_info.units],
+            ],
+            col_widths=[45 * mm, 125 * mm],
+        ),
+    ]
+
+    bom_flowables, bom_result = _assembly_bom_section(
+        styles, manufacturing_process, quantity, process_is_default, quantity_is_default
+    )
+    story += bom_flowables
+    story += _assembly_cost_drivers_section(styles, bom_result)
+
+    doc.build(story)
+    return output_path
+
+
 def generate_manufacturing_report(
     output_path: str,
     manufacturing_process: str | None = None,
@@ -232,6 +397,18 @@ def generate_manufacturing_report(
     quantity_is_default = quantity is None
     manufacturing_process = manufacturing_process or _DEFAULT_MANUFACTURING_PROCESS
     quantity = quantity or _DEFAULT_QUANTITY
+
+    if adapter.is_assembly():
+        # Assembly documents don't have a single mass/material/feature
+        # tree the way a part does -- get_mass()/get_material()/
+        # get_features() either raise or aren't meaningful at the
+        # assembly level, so this branches to an entirely different
+        # report shape (BOM + rollup totals + cost drivers) rather than
+        # trying to force the single-part sections below to fit an
+        # assembly.
+        return _generate_assembly_report(
+            output_path, manufacturing_process, quantity, process_is_default, quantity_is_default
+        )
 
     part_info = adapter.get_current_part_info()
     mass_kg = adapter.get_mass()

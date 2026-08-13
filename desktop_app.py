@@ -23,7 +23,16 @@ from ai_orchestrator import (
     McpServerUnavailableError,
     run_ai_orchestrator,
 )
+from bom_export import export_bom as write_bom_file
+from mcp_server import adapter
 from report.generate_report import generate_manufacturing_report
+
+# Defaults used only when exporting a BOM from the button (no chat context
+# to pull manufacturing_process/quantity from) -- always stated explicitly
+# in the resulting chat bubble, same "never silently present a default as
+# the user's real request" rule generate_manufacturing_report follows.
+_DEFAULT_BOM_MANUFACTURING_PROCESS = "CNC Machining"
+_DEFAULT_BOM_QUANTITY = 1
 
 # --------------------------------------------------------------------------
 # Style constants -- change colors/fonts/spacing here, nowhere else.
@@ -342,6 +351,13 @@ async def main(page: ft.Page) -> None:
         tooltip="Export manufacturing readiness report (PDF)",
     )
 
+    export_bom_button = ft.IconButton(
+        icon=ft.Icons.TABLE_CHART_OUTLINED,
+        icon_color=COLOR_ACCENT,
+        style=ft.ButtonStyle(shape=ft.CircleBorder()),
+        tooltip="Export Bill of Materials (assembly only, .xlsx)",
+    )
+
     sidebar_list = ft.ListView(expand=True, spacing=2, padding=pad_symmetric(vertical=8))
     new_chat_button = ft.Container(
         content=ft.Row(
@@ -637,6 +653,54 @@ async def main(page: ft.Page) -> None:
 
     export_report_button.on_click = export_report
 
+    async def export_bom_action(e: ft.ControlEvent) -> None:
+        # Same is_sending guard/race-avoidance reasoning as export_report.
+        if state["is_sending"]:
+            return
+        state["is_sending"] = True
+        export_bom_button.disabled = True
+        page.update()
+
+        def _build_bom_file() -> str:
+            if not adapter.is_assembly():
+                raise RuntimeError(
+                    "The currently open document is not an assembly -- "
+                    "open an assembly in SOLIDWORKS to export a BOM."
+                )
+            bom_result = adapter.get_assembly_bom(
+                _DEFAULT_BOM_MANUFACTURING_PROCESS, _DEFAULT_BOM_QUANTITY
+            )
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = str(Path(tempfile.gettempdir()) / f"bom_{timestamp}.xlsx")
+            return write_bom_file(bom_result, output_path, False)
+
+        try:
+            # Blocking COM + file I/O work -- run off the UI thread, same
+            # reasoning as export_report/run_ai_orchestrator.
+            saved_path = await asyncio.to_thread(_build_bom_file)
+            text = (
+                f"BOM exported to:\n{saved_path}\n\n"
+                f"(Flat BOM, manufacturing process "
+                f"'{_DEFAULT_BOM_MANUFACTURING_PROCESS}' and quantity "
+                f"{_DEFAULT_BOM_QUANTITY} -- defaults, not specified via "
+                "chat. Ask in chat for a different process/quantity/"
+                "indented BOM.)"
+            )
+            role = "ai"
+        except Exception as exc:
+            text = f"Could not export the BOM: {exc}"
+            role = "error"
+
+        empty_state.visible = False
+        await add_bubble_animated(ChatMessage(role, text, timestamp_now()))
+        page.update()
+
+        export_bom_button.disabled = False
+        state["is_sending"] = False
+        page.update()
+
+    export_bom_button.on_click = export_bom_action
+
     send_button.on_click = send_message
     message_input.on_submit = send_message
 
@@ -666,7 +730,7 @@ async def main(page: ft.Page) -> None:
     )
 
     input_bar = ft.Container(
-        content=ft.Row([message_input, export_report_button, send_button], spacing=10),
+        content=ft.Row([message_input, export_report_button, export_bom_button, send_button], spacing=10),
         bgcolor=COLOR_INPUT_BAR_BG,
         padding=pad_all(16),
         border=ft.Border(top=ft.BorderSide(1, COLOR_INPUT_BORDER)),

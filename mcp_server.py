@@ -45,6 +45,12 @@ def _build_adapter() -> CadAdapter:
     backend = os.environ.get("CAD_ADAPTER", "solidworks").lower()
     if backend == "mock":
         return MockAdapter()
+    if backend == "mock_assembly":
+        # Synthetic multi-level assembly (see MockAdapter's
+        # _build_raw_assembly_components()) -- lets the assembly BOM/
+        # rollup feature be demoed and tested without a real SolidWorks
+        # assembly open.
+        return MockAdapter(simulate_assembly=True)
 
     from cad_adapters.solidworks_adapter import SolidWorksAdapter
 
@@ -431,6 +437,166 @@ def compare_materials(
             "the actual CAD file's assigned material is unchanged."
         ),
     }
+
+
+@mcp.tool()
+def get_assembly_bom(manufacturing_process: str | None = None, quantity: int = 1) -> dict:
+    """Roll up the CURRENTLY OPEN ASSEMBLY into a structured Bill of
+    Materials: one row per unique (part, configuration) combination found
+    anywhere in the assembly tree (including nested sub-assemblies), each
+    classified as "Make" (custom-manufactured -- cost from material +
+    production cost, same formulas as estimate_cost()) or "Buy" (purchased
+    standard hardware -- cost from standard_hardware.csv), plus
+    assembly-level totals (unique part count, total part instance count,
+    total mass, total cost for one assembly and for `quantity` assemblies)
+    and a list of any components with missing material/pricing data.
+
+    Use this for questions like "what's the total cost/mass of this
+    assembly for a production run of N", "how many unique parts vs. total
+    parts does this assembly have", or "which parts are missing
+    material/pricing" -- this tool answers all of those directly from one
+    call, rather than needing several get_mass/estimate_cost calls on
+    individual parts.
+
+    `manufacturing_process` MUST be one of "CNC Machining", "Injection
+    Molding", or "Sheet Metal" -- same as estimate_cost(), since it drives
+    which production cost formula applies to every "Make" component. **If
+    the user's question doesn't specify a process, ASK THE USER which one
+    to assume before calling this tool.** Returns found=False listing the
+    three valid options if called without one anyway.
+
+    Returns found=False if the currently open document isn't an assembly
+    (call get_current_part_info() first if you're not sure).
+    """
+    if manufacturing_process not in PROCESSES:
+        return {
+            "found": False,
+            "message": (
+                f"manufacturing_process must be one of {list(PROCESSES)}. "
+                "Ask the user which manufacturing process to assume for "
+                "this assembly's Make parts, then call get_assembly_bom "
+                "again with their answer."
+            ),
+        }
+
+    if not adapter.is_assembly():
+        return {
+            "found": False,
+            "message": (
+                "The currently open document is not an assembly. Open an "
+                "assembly to get a BOM, or use estimate_cost() for a "
+                "single part."
+            ),
+        }
+
+    result = adapter.get_assembly_bom(manufacturing_process, quantity)
+    return {"found": True, **result}
+
+
+@mcp.tool()
+def get_assembly_cost_drivers(manufacturing_process: str | None = None, quantity: int = 1) -> dict:
+    """Return the CURRENTLY OPEN ASSEMBLY's Bill of Materials sorted by
+    total cost (highest first) -- use this directly for questions like
+    "which components are driving the cost the most" or "what's the most
+    expensive part in this assembly", instead of calling get_assembly_bom
+    and re-sorting it yourself.
+
+    Rows with unknown total cost (missing material/pricing data -- see
+    "missing_data" in the response) are sorted to the end, not treated as
+    zero, since a missing price is not the same as a free part.
+
+    Same `manufacturing_process`/`quantity` parameters and found=False
+    behavior as get_assembly_bom() -- ask the user for the manufacturing
+    process if they haven't specified one.
+    """
+    if manufacturing_process not in PROCESSES:
+        return {
+            "found": False,
+            "message": (
+                f"manufacturing_process must be one of {list(PROCESSES)}. "
+                "Ask the user which manufacturing process to assume, then "
+                "call get_assembly_cost_drivers again with their answer."
+            ),
+        }
+
+    if not adapter.is_assembly():
+        return {
+            "found": False,
+            "message": "The currently open document is not an assembly.",
+        }
+
+    result = adapter.get_assembly_bom(manufacturing_process, quantity)
+    ranked = sorted(
+        result["bom"],
+        key=lambda row: (row["total_cost_inr"] is None, -(row["total_cost_inr"] or 0)),
+    )
+    return {
+        "found": True,
+        "manufacturing_process": manufacturing_process,
+        "quantity": quantity,
+        "cost_drivers": ranked,
+        "totals": result["totals"],
+        "missing_data": result["missing_data"],
+    }
+
+
+@mcp.tool()
+def export_bom(
+    manufacturing_process: str | None = None,
+    quantity: int = 1,
+    output_path: str | None = None,
+    indented: bool = False,
+) -> dict:
+    """Export the CURRENTLY OPEN ASSEMBLY's Bill of Materials to a real
+    .xlsx BOM file with standard columns (Item No, Part Name,
+    Configuration, Make/Buy, Material, Qty, Unit Mass, Total Mass, Unit
+    Cost, Total Cost). Call this when the user asks to "export the BOM",
+    "give me a parts list", or similar.
+
+    `indented=False` (default) produces a flat parts-only list: one row
+    per unique (part, configuration) with its TOTAL quantity across the
+    whole assembly -- what a purchasing/stores department needs.
+    `indented=True` preserves sub-assembly grouping (a bold sub-assembly
+    header row followed by its indented children) -- what an
+    assembler/planner needs to see build structure. If the user doesn't
+    say which they want, a flat BOM is the more common default; ask if
+    it's ambiguous from context.
+
+    Same `manufacturing_process`/`quantity` requirements as
+    get_assembly_bom() -- ask the user for the manufacturing process if
+    unspecified. `output_path` defaults to a timestamped .xlsx in the
+    system temp directory. After this returns found=True, tell the user
+    the exact file path.
+    """
+    from bom_export import export_bom as write_bom_file
+
+    if manufacturing_process not in PROCESSES:
+        return {
+            "found": False,
+            "message": (
+                f"manufacturing_process must be one of {list(PROCESSES)}. "
+                "Ask the user which manufacturing process to assume, then "
+                "call export_bom again with their answer."
+            ),
+        }
+
+    if not adapter.is_assembly():
+        return {
+            "found": False,
+            "message": "The currently open document is not an assembly.",
+        }
+
+    if output_path is None:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = str(Path(tempfile.gettempdir()) / f"bom_{timestamp}.xlsx")
+
+    bom_result = adapter.get_assembly_bom(manufacturing_process, quantity)
+    try:
+        saved_path = write_bom_file(bom_result, output_path, indented)
+    except Exception as e:
+        return {"found": False, "message": f"Could not export the BOM: {e}"}
+
+    return {"found": True, "bom_path": saved_path, "indented": indented}
 
 
 @mcp.tool()

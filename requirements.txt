@@ -8,3 +8,4 @@ numpy
 joblib
 flet
 reportlab
+openpyxl

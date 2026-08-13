@@ -12,6 +12,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
+from hardware_db import classify_component, load_hardware
 from materials_db import get_material_cost_and_carbon, load_materials
 from production_cost import PROCESSES, estimate_production_cost
 
@@ -66,6 +67,46 @@ class Feature:
     feature_type: str
     suppressed: bool = False
     parameters: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class AssemblyComponent:
+    """One row of an assembly's flattened, rolled-up component list --
+    one entry per unique (part file, referenced configuration) combination
+    found anywhere in the assembly tree, aggregated across the WHOLE tree
+    (a part used both at the top level and inside a sub-assembly counts as
+    one row with a combined quantity). This is what get_assembly_bom()
+    needs for accurate cost/mass totals: a real assembly BOM rollup counts
+    total quantity of a part needed to build one assembly, regardless of
+    how deeply it's nested.
+
+    `parent_assembly`/`level` describe where this component was *first*
+    encountered during the tree walk -- kept for the indented BOM export
+    (see bom_export.py), which groups rows by immediate parent for
+    display. If the same part+configuration is reused under more than one
+    parent, the indented view shows it once, under its first occurrence,
+    while `quantity` here still correctly totals every instance across the
+    whole tree. This is a deliberate simplification (a fully faithful
+    indented BOM would repeat a shared part under every parent it appears
+    under) rather than an oversight.
+
+    Suppressed components and reference-only components (envelopes) are
+    never turned into an AssemblyComponent at all -- skipped during the
+    tree walk, not filtered out afterward.
+    """
+
+    part_name: str
+    file_path: str
+    configuration: str
+    quantity: int
+    parent_assembly: str | None
+    level: int
+    mass_kg: float | None
+    volume_m3: float | None
+    material: MaterialInfo | None
+    face_count: int | None
+    bend_count: int | None
+    bounding_box_mm: tuple[float, float, float] | None
 
 
 class CadAdapter(ABC):
@@ -178,6 +219,207 @@ class CadAdapter(ABC):
         true flat-pattern measurement.
         """
         raise NotImplementedError
+
+    @abstractmethod
+    def is_assembly(self) -> bool:
+        """True if the currently active/open document is an assembly
+        (possibly containing nested sub-assemblies), not a single part.
+
+        Used by generate_manufacturing_report() to decide whether to
+        generate an assembly-level report (screenshot, BOM, cost/mass
+        rollup, cost-driver ranking) or a single-part report.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_assembly_components(self) -> list[AssemblyComponent]:
+        """Walk the currently open assembly's full component tree
+        (including nested sub-assemblies) and return one AssemblyComponent
+        per unique (part file, referenced configuration) combination found
+        anywhere in it, with quantity aggregated across the whole tree.
+
+        Suppressed components and reference-only/envelope components are
+        skipped entirely -- never returned as a row. A part referenced
+        under two different configurations (e.g. the same bracket in
+        "Default" and "Heavy Duty") is returned as two separate rows,
+        since different configurations of a part can have different
+        mass/material.
+
+        Each returned AssemblyComponent's mass/material/face_count/
+        bend_count/bounding_box_mm are read from that specific part file
+        + configuration the same way get_mass()/get_material()/
+        get_face_count()/get_bend_count()/get_bounding_box_mm() read them
+        for a standalone open part -- any of these that can't be read
+        (e.g. an unresolved/missing reference) is None rather than a
+        guessed value.
+
+        Raises if the currently open document is not an assembly -- call
+        is_assembly() first.
+        """
+        raise NotImplementedError
+
+    def get_assembly_bom(self, manufacturing_process: str, quantity: int) -> dict:
+        """Roll up the currently open assembly's components into a
+        structured Bill of Materials: one row per unique (part,
+        configuration), each priced either as "Make" (material +
+        production cost, same formulas as estimate_cost()) or "Buy"
+        (a real purchased unit price from standard_hardware.csv) -- see
+        hardware_db.classify_component() for the Make/Buy rule -- plus
+        assembly-level totals (unique part count, total instance count,
+        total mass, total cost for one assembly and for `quantity`
+        assemblies) and a list of components with missing pricing data.
+
+        Concrete (not abstract): built entirely out of
+        get_assembly_components() plus the same materials_db/
+        production_cost/hardware_db machinery estimate_cost() and
+        compare_materials() already use, so every subclass gets it for
+        free -- same reasoning as estimate_carbon() and compare_materials()
+        above.
+
+        Raises ValueError if `manufacturing_process` isn't one of
+        production_cost.PROCESSES. Never guesses: a Make component with an
+        unresolved material, or a Buy component with no
+        standard_hardware.csv price, gets None cost/mass fields and is
+        listed in the returned "missing_data" list instead of a wrong
+        number silently feeding into the totals.
+        """
+        if manufacturing_process not in PROCESSES:
+            raise ValueError(
+                f"manufacturing_process must be one of {list(PROCESSES)}"
+            )
+
+        materials = _get_materials()
+        try:
+            hardware = load_hardware()
+        except (FileNotFoundError, ValueError):
+            hardware = {}
+
+        components = self.get_assembly_components()
+
+        rows = []
+        missing_data = []
+        total_mass_kg = 0.0
+        total_cost_one_assembly_inr = 0.0
+        total_instance_count = 0
+
+        for component in components:
+            total_instance_count += component.quantity
+
+            classification_result = classify_component(
+                component.part_name, component.file_path, hardware
+            )
+            classification = classification_result["classification"]
+
+            unit_mass_kg = component.mass_kg
+            unit_cost_inr = None
+            material_name = component.material.name if component.material else None
+            row_missing_reason = None
+
+            if classification == "Buy":
+                unit_cost_inr = classification_result["unit_cost_inr"]
+
+            elif classification == "Buy - price not available":
+                row_missing_reason = (
+                    f"'{component.part_name}' looks like purchased hardware "
+                    "(SOLIDWORKS Toolbox path) but has no entry in "
+                    "standard_hardware.csv -- add a row for it."
+                )
+
+            else:  # "Make"
+                if materials is None:
+                    row_missing_reason = (
+                        "materials.csv is unavailable"
+                        + (f" ({_materials_load_error})" if _materials_load_error else "")
+                    )
+                elif component.material is None:
+                    row_missing_reason = (
+                        f"Could not read material for '{component.part_name}' "
+                        f"(configuration '{component.configuration}')."
+                    )
+                else:
+                    material_lookup = get_material_cost_and_carbon(
+                        component.material.name, materials
+                    )
+                    if not material_lookup["found"] or material_lookup["cost_per_kg"] is None:
+                        row_missing_reason = (
+                            f"Material '{component.material.name}' "
+                            "(used by "
+                            f"'{component.part_name}') has no cost_per_kg in "
+                            "materials.csv."
+                        )
+                        material_name = component.material.name
+                    elif unit_mass_kg is None or component.volume_m3 is None:
+                        row_missing_reason = (
+                            f"Could not read geometry for '{component.part_name}' "
+                            f"(configuration '{component.configuration}')."
+                        )
+                        material_name = material_lookup["matched_from"]
+                    else:
+                        material_name = material_lookup["matched_from"]
+                        material_cost_per_unit = unit_mass_kg * material_lookup["cost_per_kg"]
+                        production_result = estimate_production_cost(
+                            manufacturing_process,
+                            feature_count=component.face_count or 0,
+                            volume_m3=component.volume_m3,
+                            order_quantity=quantity,
+                            bounding_box_mm=component.bounding_box_mm or (0.0, 0.0, 0.0),
+                            bend_count=component.bend_count or 0,
+                        )
+                        unit_cost_inr = round(
+                            material_cost_per_unit + production_result.production_cost_inr, 2
+                        )
+
+            total_mass_for_row = (
+                round(unit_mass_kg * component.quantity, 4) if unit_mass_kg is not None else None
+            )
+            total_cost_for_row = (
+                round(unit_cost_inr * component.quantity, 2) if unit_cost_inr is not None else None
+            )
+
+            if total_mass_for_row is not None:
+                total_mass_kg += total_mass_for_row
+            if total_cost_for_row is not None:
+                total_cost_one_assembly_inr += total_cost_for_row
+
+            row = {
+                "part_name": component.part_name,
+                "configuration": component.configuration,
+                "classification": classification,
+                "material": material_name,
+                "quantity_per_assembly": component.quantity,
+                "unit_mass_kg": unit_mass_kg,
+                "total_mass_kg": total_mass_for_row,
+                "unit_cost_inr": unit_cost_inr,
+                "total_cost_inr": total_cost_for_row,
+                "parent_assembly": component.parent_assembly,
+                "level": component.level,
+            }
+            rows.append(row)
+
+            if row_missing_reason:
+                missing_data.append(
+                    {
+                        "part_name": component.part_name,
+                        "configuration": component.configuration,
+                        "reason": row_missing_reason,
+                    }
+                )
+
+        return {
+            "manufacturing_process": manufacturing_process,
+            "quantity": quantity,
+            "bom": rows,
+            "totals": {
+                "unique_part_count": len(rows),
+                "total_instance_count": total_instance_count,
+                "total_assembly_mass_kg": round(total_mass_kg, 4),
+                "total_assembly_cost_one_unit_inr": round(total_cost_one_assembly_inr, 2),
+                "total_assembly_cost_for_quantity_inr": round(
+                    total_cost_one_assembly_inr * quantity, 2
+                ),
+            },
+            "missing_data": missing_data,
+        }
 
     # estimate_carbon() is concrete, not abstract: it's built entirely out
     # of get_mass()/get_material() plus materials.csv, so every subclass

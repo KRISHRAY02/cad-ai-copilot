@@ -13,7 +13,13 @@ from pathlib import Path
 import pythoncom
 import win32com.client
 
-from cad_adapters.base_adapter import CadAdapter, Feature, MaterialInfo, PartInfo
+from cad_adapters.base_adapter import (
+    AssemblyComponent,
+    CadAdapter,
+    Feature,
+    MaterialInfo,
+    PartInfo,
+)
 from cad_adapters.dfm_checks import (
     MAX_HOLE_DEPTH_TO_DIAMETER_RATIO,
     MIN_DRAFT_ANGLE_DEG,
@@ -68,6 +74,16 @@ _SHEET_METAL_BEND_FEATURE_TYPES = {
     "Jog",
     "Lofted-Bend",
 }
+
+# swComponentSuppressionState_e -- documented SOLIDWORKS API enum value for
+# "fully suppressed". Used as a fallback if IComponent2.IsSuppressed (tried
+# first, see _is_component_suppressed) isn't exposed via dynamic dispatch
+# in this environment, the same class of per-member uncertainty documented
+# for IFeature suppression above. **Not yet live-verified against a real
+# assembly** -- if suppressed components still appear in
+# get_assembly_components() results, check this enum value against the
+# SOLIDWORKS API Help for the installed version.
+_SW_COMPONENT_SUPPRESSED = 2
 
 
 class SolidWorksConnectionError(RuntimeError):
@@ -153,7 +169,10 @@ class SolidWorksAdapter(CadAdapter):
         )
 
     def get_mass(self) -> float:
-        model = self._get_active_doc()
+        return self._read_mass(self._get_active_doc())
+
+    @staticmethod
+    def _read_mass(model) -> float:
         mass_property = model.Extension.CreateMassProperty
         mass_property.UseSystemUnits = True  # forces SI units: kg, m
         return mass_property.Mass
@@ -166,7 +185,10 @@ class SolidWorksAdapter(CadAdapter):
         raises a COM error in that case, so each property is read
         defensively and reported as None rather than crashing.
         """
-        model = self._get_active_doc()
+        return self._read_mass_properties(self._get_active_doc())
+
+    @staticmethod
+    def _read_mass_properties(model) -> dict:
         mass_property = model.Extension.CreateMassProperty
         mass_property.UseSystemUnits = True  # forces SI units: kg, m, m^2
 
@@ -184,8 +206,10 @@ class SolidWorksAdapter(CadAdapter):
         return properties
 
     def get_material(self) -> MaterialInfo:
-        model = self._get_active_doc()
+        return self._read_material(self._get_active_doc())
 
+    @staticmethod
+    def _read_material(model) -> MaterialInfo:
         if _DOC_TYPE_NAMES.get(model.GetType) != "part":
             raise RuntimeError(
                 "Material lookup is only supported for parts, not assemblies "
@@ -202,6 +226,13 @@ class SolidWorksAdapter(CadAdapter):
         # gencache/makepy, dynamic dispatch has no type-library info to
         # marshal a plain str as byref, so it must be wrapped explicitly
         # as a byref VARIANT or the call fails with "Type mismatch".
+        #
+        # Reads `model`'s currently-ACTIVE configuration -- for a
+        # standalone open part this is whatever the user has selected in
+        # SOLIDWORKS; for an assembly component document, the caller
+        # (_read_component_part_data) must call ShowConfiguration2() to
+        # switch to the referenced configuration first, or this reads the
+        # wrong configuration's material.
         config_name = model.ConfigurationManager.ActiveConfiguration.Name
         database_path = win32com.client.VARIANT(
             pythoncom.VT_BYREF | pythoncom.VT_BSTR, ""
@@ -284,8 +315,11 @@ class SolidWorksAdapter(CadAdapter):
         accessing it without parens returns a bound method object, not an
         int, so it must be called with explicit parens here.
         """
-        model = self._get_active_doc()
-        return sum(body.GetFaceCount() for body in self._iter_bodies(model))
+        return self._read_face_count(self._get_active_doc())
+
+    @classmethod
+    def _read_face_count(cls, model) -> int:
+        return sum(body.GetFaceCount() for body in cls._iter_bodies(model))
 
     def capture_screenshot(self, output_path: str | None = None) -> str:
         """Save a screenshot of the current viewport (whatever view/zoom
@@ -320,10 +354,13 @@ class SolidWorksAdapter(CadAdapter):
         Returns 0 for a part with no such features, e.g. any non-sheet-
         metal part -- a real, valid answer, not an error.
         """
-        model = self._get_active_doc()
+        return self._read_bend_count(self._get_active_doc())
+
+    @classmethod
+    def _read_bend_count(cls, model) -> int:
         return sum(
             1
-            for feat in self._iter_raw_features(model)
+            for feat in cls._iter_raw_features(model)
             if feat.GetTypeName2 in _SHEET_METAL_BEND_FEATURE_TYPES
         )
 
@@ -348,8 +385,11 @@ class SolidWorksAdapter(CadAdapter):
         multi-body part, the boxes are unioned across all bodies to get
         the whole part's overall bounding box.
         """
-        model = self._get_active_doc()
-        bodies = list(self._iter_bodies(model))
+        return self._read_bounding_box(self._get_active_doc())
+
+    @classmethod
+    def _read_bounding_box(cls, model) -> tuple[float, float, float]:
+        bodies = list(cls._iter_bodies(model))
         if not bodies:
             return (0.0, 0.0, 0.0)
 
@@ -364,6 +404,203 @@ class SolidWorksAdapter(CadAdapter):
         y_mm = (ymax - ymin) * 1000.0
         z_mm = (zmax - zmin) * 1000.0
         return (x_mm, y_mm, z_mm)
+
+    def is_assembly(self) -> bool:
+        model = self._get_active_doc()
+        return _DOC_TYPE_NAMES.get(model.GetType) == "assembly"
+
+    def get_assembly_components(self) -> list[AssemblyComponent]:
+        """Recursively walk the currently open assembly's component tree
+        (including nested sub-assemblies) and return one AssemblyComponent
+        per unique (part file, referenced configuration) combination,
+        aggregated across the whole tree.
+
+        Uses the documented SOLIDWORKS Assembly API:
+        - `IConfiguration::GetRootComponent3(Resolve)` to get the
+          assembly's root IComponent2.
+        - `IComponent2::GetChildren` to walk down the tree -- a component
+          with children is a sub-assembly (not itself a manufacturable
+          part, so it never becomes a BOM row -- only its leaf-part
+          descendants do); a component with no children is a leaf part.
+        - `IComponent2::GetPathName` / `.ReferencedConfiguration` to
+          identify which (part file, configuration) a leaf component
+          resolves to.
+        - `IComponent2::GetModelDoc2` to get that component's own
+          IModelDoc2, then `IModelDoc2::ShowConfiguration2(config)` to
+          switch that specific document to the referenced configuration
+          before reading its mass/material/geometry via the same
+          `_read_*` helpers get_mass()/get_material()/etc. use for a
+          standalone open part.
+        - `IComponent2::IsEnvelope` to skip reference/envelope-only
+          components (not real manufacturable parts).
+        - Suppression via `_is_component_suppressed` (see its docstring).
+
+        **Not yet live-verified against a real assembly** (this project's
+        SolidWorks adapter methods have historically needed empirical
+        fixes once tested live -- see e.g. get_face_count()/
+        get_bounding_box_mm()'s history above -- so treat the specific
+        COM member names here as a documented-API starting point, not a
+        guarantee, and check the SOLIDWORKS API Help for your installed
+        version if something doesn't resolve). Every per-component read is
+        wrapped defensively so one unreadable component (e.g. an
+        unresolved/missing reference) degrades that row to None fields
+        rather than crashing the whole traversal.
+        """
+        model = self._get_active_doc()
+        if _DOC_TYPE_NAMES.get(model.GetType) != "assembly":
+            raise RuntimeError(
+                "The current document is not an assembly -- open an "
+                "assembly in SOLIDWORKS and try again."
+            )
+
+        active_config = model.ConfigurationManager.ActiveConfiguration
+        root_component = active_config.GetRootComponent3(True)
+
+        aggregated: dict[tuple[str, str], dict] = {}
+        order: list[tuple[str, str]] = []
+
+        def visit(component, parent_assembly: str | None, level: int) -> None:
+            if component is None or self._is_component_suppressed(component):
+                return
+
+            try:
+                if bool(self._dyn_get(component, "IsEnvelope")):
+                    return
+            except Exception:
+                pass
+
+            try:
+                comp_name = self._dyn_get(component, "Name2")
+            except Exception:
+                comp_name = self._dyn_get(component, "Name")
+
+            children = self._dyn_get(component, "GetChildren") or []
+            if len(children) > 0:
+                # Sub-assembly: recurse into its children one level deeper
+                # instead of emitting a row for the sub-assembly itself.
+                for child in children:
+                    visit(child, comp_name, level + 1)
+                return
+
+            file_path = self._dyn_get(component, "GetPathName") or ""
+            config_name = self._dyn_get(component, "ReferencedConfiguration") or ""
+            key = (file_path, config_name)
+
+            if key not in aggregated:
+                part_data = self._read_component_part_data(component, comp_name, config_name)
+                aggregated[key] = {**part_data, "parent_assembly": parent_assembly, "level": level, "quantity": 0}
+                order.append(key)
+            aggregated[key]["quantity"] += 1
+
+        top_children = self._dyn_get(root_component, "GetChildren") or []
+        for child in top_children:
+            visit(child, None, 0)
+
+        return [
+            AssemblyComponent(
+                part_name=data["part_name"],
+                file_path=data["file_path"],
+                configuration=data["configuration"],
+                quantity=data["quantity"],
+                parent_assembly=data["parent_assembly"],
+                level=data["level"],
+                mass_kg=data["mass_kg"],
+                volume_m3=data["volume_m3"],
+                material=data["material"],
+                face_count=data["face_count"],
+                bend_count=data["bend_count"],
+                bounding_box_mm=data["bounding_box_mm"],
+            )
+            for key in order
+            for data in [aggregated[key]]
+        ]
+
+    def _read_component_part_data(self, component, comp_name: str, config_name: str) -> dict:
+        """Read mass/material/geometry for one leaf assembly component, by
+        getting its own IModelDoc2 and switching it to the referenced
+        configuration -- see get_assembly_components()'s docstring for the
+        COM members used. Each sub-read is independently defensive: a
+        failure reading e.g. material doesn't prevent mass from being
+        returned, it just leaves that one field None.
+        """
+        file_path = self._dyn_get(component, "GetPathName") or ""
+        part_name = Path(file_path).stem if file_path else comp_name
+
+        try:
+            comp_doc = self._dyn_get(component, "GetModelDoc2")
+        except Exception:
+            comp_doc = None
+
+        result = {
+            "part_name": part_name,
+            "file_path": file_path,
+            "configuration": config_name,
+            "mass_kg": None,
+            "volume_m3": None,
+            "material": None,
+            "face_count": None,
+            "bend_count": None,
+            "bounding_box_mm": None,
+        }
+
+        if comp_doc is None:
+            return result
+
+        try:
+            comp_doc.ShowConfiguration2(config_name)
+        except Exception:
+            pass  # best effort -- falls back to whatever config is active
+
+        try:
+            mass_properties = self._read_mass_properties(comp_doc)
+            result["mass_kg"] = mass_properties.get("mass_kg")
+            result["volume_m3"] = mass_properties.get("volume_m3")
+        except Exception:
+            pass
+
+        try:
+            result["material"] = self._read_material(comp_doc)
+        except Exception:
+            pass
+
+        try:
+            result["face_count"] = self._read_face_count(comp_doc)
+        except Exception:
+            pass
+
+        try:
+            result["bend_count"] = self._read_bend_count(comp_doc)
+        except Exception:
+            pass
+
+        try:
+            result["bounding_box_mm"] = self._read_bounding_box(comp_doc)
+        except Exception:
+            pass
+
+        return result
+
+    @staticmethod
+    def _is_component_suppressed(component) -> bool:
+        """Best-effort suppression check for an assembly component.
+
+        Tries `IComponent2.IsSuppressed` first, mirroring how
+        `_is_suppressed()` for IFeature above found the documented
+        `GetSuppression2` unusable in this environment but a same-named
+        boolean property worked -- worth trying the same shortcut here
+        before falling back to the documented `GetSuppression()` method
+        compared against `_SW_COMPONENT_SUPPRESSED`. Returns False (not
+        suppressed) if neither resolves, rather than crashing the whole
+        traversal over one unreadable component.
+        """
+        try:
+            return bool(component.IsSuppressed)
+        except Exception:
+            pass
+        try:
+            return SolidWorksAdapter._dyn_get(component, "GetSuppression") == _SW_COMPONENT_SUPPRESSED
+        except Exception:
+            return False
 
     def run_dfm_check(self) -> list[dict]:
         """Run all four DFM checks (hole geometry, wall thickness, draft

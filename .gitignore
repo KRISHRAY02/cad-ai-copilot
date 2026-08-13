@@ -41,3 +41,9 @@ cost_model/trained_model.joblib
 
 # Generated manufacturing readiness reports (see report/generate_report.py)
 *.pdf
+
+# Persistent desktop chat history (see chat_db.py)
+chat_history.db
+
+# Generated BOM exports (see bom_export.py)
+*.xlsx

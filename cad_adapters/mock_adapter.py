@@ -9,7 +9,13 @@ mounting bracket.
 import tempfile
 from pathlib import Path
 
-from cad_adapters.base_adapter import CadAdapter, Feature, MaterialInfo, PartInfo
+from cad_adapters.base_adapter import (
+    AssemblyComponent,
+    CadAdapter,
+    Feature,
+    MaterialInfo,
+    PartInfo,
+)
 from cad_adapters.dfm_checks import (
     MAX_HOLE_DEPTH_TO_DIAMETER_RATIO,
     MIN_HOLE_DIAMETER_MM,
@@ -21,6 +27,148 @@ _PLACEHOLDER_SCREENSHOT_SIZE = (640, 480)
 _PLACEHOLDER_SCREENSHOT_BG = (230, 234, 240)
 _PLACEHOLDER_SCREENSHOT_TEXT_COLOR = (91, 107, 133)
 
+_ASSEMBLY_ROOT = r"C:\CAD\Projects\demo_assembly"
+_TOOLBOX_ROOT = r"C:\Program Files\SOLIDWORKS Corp\SOLIDWORKS Data\browser\toolbox\ansi metric"
+
+
+def _build_raw_assembly_components() -> list[dict]:
+    """One dict per component *instance* in a small synthetic multi-level
+    assembly, before aggregation -- demonstrates every case
+    get_assembly_components() has to handle for real: a part repeated
+    multiple times (Bracket x2, hardware), one part referenced under two
+    different configurations with different mass/material (Base Plate),
+    one nested sub-assembly (Hinge Assembly, level 1) whose own children
+    are also captured, one suppressed component that must be skipped
+    entirely (Old Bracket), one reference/envelope-only component that
+    must also be skipped (Packaging Envelope), one hardware item that
+    matches standard_hardware.csv (Hex Bolt, Hex Nut) and one that looks
+    like Toolbox hardware but has no CSV entry yet (Washer) -- exercising
+    the "Buy - price not available" path.
+    """
+    aluminum = MaterialInfo(name="6061 Alloy", density_kg_m3=2700.0, category="Aluminum")
+    cast_alloy = MaterialInfo(
+        name="201.0-T7 Insulated Mold Casting (SS)", density_kg_m3=2680.0, category="Aluminum Casting"
+    )
+    stainless = MaterialInfo(
+        name="AISI 316 Stainless Steel Sheet (SS)", density_kg_m3=8000.0, category="Stainless Steel"
+    )
+
+    def instance(
+        part_name, file_path, configuration, *, parent_assembly=None, level=0,
+        suppressed=False, envelope=False, mass_kg=None, volume_m3=None,
+        material=None, face_count=None, bend_count=0, bounding_box_mm=None,
+    ):
+        return {
+            "part_name": part_name,
+            "file_path": file_path,
+            "configuration": configuration,
+            "parent_assembly": parent_assembly,
+            "level": level,
+            "suppressed": suppressed,
+            "envelope": envelope,
+            "mass_kg": mass_kg,
+            "volume_m3": volume_m3,
+            "material": material,
+            "face_count": face_count,
+            "bend_count": bend_count,
+            "bounding_box_mm": bounding_box_mm,
+        }
+
+    components = []
+
+    # Bracket x2 (top level, Make) -- same part+config, aggregates to qty 2.
+    for i in (1, 2):
+        components.append(
+            instance(
+                "Bracket", rf"{_ASSEMBLY_ROOT}\bracket.sldprt", "Default",
+                mass_kg=0.842, volume_m3=3.12e-4, material=aluminum,
+                face_count=18, bounding_box_mm=(120.0, 80.0, 25.0),
+            )
+        )
+
+    # Base Plate under two different configurations (Make) -- distinct BOM
+    # rows since the configuration changes mass and material.
+    components.append(
+        instance(
+            "Base Plate", rf"{_ASSEMBLY_ROOT}\base_plate.sldprt", "Default",
+            mass_kg=1.5, volume_m3=5.6e-4, material=cast_alloy,
+            face_count=12, bounding_box_mm=(150.0, 100.0, 10.0),
+        )
+    )
+    components.append(
+        instance(
+            "Base Plate", rf"{_ASSEMBLY_ROOT}\base_plate.sldprt", "Heavy Duty",
+            mass_kg=3.0, volume_m3=5.6e-4, material=stainless,
+            face_count=12, bounding_box_mm=(150.0, 100.0, 14.0),
+        )
+    )
+
+    # Suppressed component -- must never appear in get_assembly_components().
+    components.append(
+        instance(
+            "Old Bracket (deprecated)", rf"{_ASSEMBLY_ROOT}\old_bracket.sldprt", "Default",
+            suppressed=True,
+        )
+    )
+
+    # Reference/envelope-only component (packaging clearance volume, not a
+    # real manufacturable part) -- must also never appear in the output.
+    components.append(
+        instance(
+            "Packaging Envelope", rf"{_ASSEMBLY_ROOT}\packaging_envelope.sldprt", "Default",
+            envelope=True,
+        )
+    )
+
+    # Standard hardware (Buy, priced via standard_hardware.csv) -- 4 bolts,
+    # 4 nuts, both matching a row in standard_hardware.csv.
+    for i in range(4):
+        components.append(
+            instance(
+                "M6x20 Hex Bolt", rf"{_TOOLBOX_ROOT}\bolts and screws\hex bolt.sldprt", "Default",
+                mass_kg=0.012, volume_m3=1.5e-6, face_count=6, bounding_box_mm=(6.0, 6.0, 20.0),
+            )
+        )
+    for i in range(4):
+        components.append(
+            instance(
+                "M6 Hex Nut", rf"{_TOOLBOX_ROOT}\nuts\hex nut.sldprt", "Default",
+                mass_kg=0.003, volume_m3=4.0e-7, face_count=8, bounding_box_mm=(10.0, 10.0, 5.0),
+            )
+        )
+
+    # Standard hardware (Toolbox path, but no standard_hardware.csv entry
+    # yet) -- demonstrates "Buy - price not available", not a guessed cost.
+    for i in range(2):
+        components.append(
+            instance(
+                "M6 Washer", rf"{_TOOLBOX_ROOT}\washers\washer.sldprt", "Default",
+                mass_kg=0.001, volume_m3=1.2e-7, face_count=4, bounding_box_mm=(12.0, 12.0, 1.5),
+            )
+        )
+
+    # Nested sub-assembly: Hinge Assembly (level 1) containing its own
+    # Make components -- Pin x2 and Bushing x1.
+    for i in (1, 2):
+        components.append(
+            instance(
+                "Pin", rf"{_ASSEMBLY_ROOT}\pin.sldprt", "Default",
+                parent_assembly="Hinge Assembly", level=1,
+                mass_kg=0.05, volume_m3=6.3e-6, material=aluminum,
+                face_count=6, bounding_box_mm=(8.0, 8.0, 40.0),
+            )
+        )
+    components.append(
+        instance(
+            "Bushing", rf"{_ASSEMBLY_ROOT}\bushing.sldprt", "Default",
+            parent_assembly="Hinge Assembly", level=1,
+            mass_kg=0.02, volume_m3=2.5e-6, material=cast_alloy,
+            face_count=6, bounding_box_mm=(12.0, 12.0, 10.0),
+        )
+    )
+
+    return components
+
 
 class MockAdapter(CadAdapter):
     """CadAdapter implementation backed by hardcoded sample data.
@@ -28,10 +176,18 @@ class MockAdapter(CadAdapter):
     Simulates a single open part — a machined aluminum mounting bracket —
     so the rest of the application can be built and tested without any
     CAD software installed or running. `connect()` never fails.
+
+    Pass `simulate_assembly=True` to instead simulate a small open
+    assembly (see _build_raw_assembly_components() below) -- lets the
+    assembly BOM/rollup feature (is_assembly(), get_assembly_components(),
+    get_assembly_bom()) be demoed and tested without a real SolidWorks
+    assembly open. The single-part sample data above is unaffected/unused
+    in this mode; only the assembly-specific methods behave differently.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, simulate_assembly: bool = False) -> None:
         self._connected = False
+        self._simulate_assembly = simulate_assembly
 
         self._part_info = PartInfo(
             name="mounting_bracket_v3",
@@ -100,11 +256,24 @@ class MockAdapter(CadAdapter):
             ),
         ]
 
+        self._assembly_info = PartInfo(
+            name="demo_gearbox_assembly",
+            file_path=r"C:\CAD\Projects\demo_assembly\demo_gearbox_assembly.sldasm",
+            part_type="assembly",
+            units="mm",
+        )
+        self._raw_assembly_components = _build_raw_assembly_components()
+
     def connect(self) -> bool:
         self._connected = True
         return True
 
+    def is_assembly(self) -> bool:
+        return self._simulate_assembly
+
     def get_current_part_info(self) -> PartInfo:
+        if self._simulate_assembly:
+            return self._assembly_info
         return self._part_info
 
     def get_mass(self) -> float:
@@ -131,6 +300,50 @@ class MockAdapter(CadAdapter):
 
     def get_bounding_box_mm(self) -> tuple[float, float, float]:
         return self._bounding_box_mm
+
+    def get_assembly_components(self) -> list[AssemblyComponent]:
+        """Aggregate the raw synthetic component list into one row per
+        unique (file_path, configuration), skipping suppressed/envelope
+        entries -- same aggregation logic a real adapter's assembly
+        traversal has to do, just against hardcoded data instead of a
+        live COM tree walk.
+        """
+        if not self._simulate_assembly:
+            raise RuntimeError(
+                "The current document is not an assembly -- construct "
+                "MockAdapter(simulate_assembly=True) to use this."
+            )
+
+        aggregated: dict[tuple[str, str], dict] = {}
+        order: list[tuple[str, str]] = []
+        for raw in self._raw_assembly_components:
+            if raw["suppressed"] or raw["envelope"]:
+                continue
+            key = (raw["file_path"], raw["configuration"])
+            if key not in aggregated:
+                aggregated[key] = dict(raw)
+                aggregated[key]["quantity"] = 0
+                order.append(key)
+            aggregated[key]["quantity"] += 1
+
+        return [
+            AssemblyComponent(
+                part_name=data["part_name"],
+                file_path=data["file_path"],
+                configuration=data["configuration"],
+                quantity=data["quantity"],
+                parent_assembly=data["parent_assembly"],
+                level=data["level"],
+                mass_kg=data["mass_kg"],
+                volume_m3=data["volume_m3"],
+                material=data["material"],
+                face_count=data["face_count"],
+                bend_count=data["bend_count"],
+                bounding_box_mm=data["bounding_box_mm"],
+            )
+            for key in order
+            for data in [aggregated[key]]
+        ]
 
     def capture_screenshot(self, output_path: str | None = None) -> str:
         """Draws a simple placeholder image (no real CAD viewport exists
