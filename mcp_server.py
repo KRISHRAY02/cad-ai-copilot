@@ -440,6 +440,84 @@ def compare_materials(
 
 
 @mcp.tool()
+def get_cost_drivers(manufacturing_process: str | None = None, quantity: int = 1) -> dict:
+    """Break down the CURRENTLY OPEN part's production cost into a ranked
+    list of cost components (highest cost first) -- use this instead of
+    estimate_cost() when the user asks "what's driving the cost" / "which
+    feature is most expensive" / "why does this cost so much", since
+    estimate_cost() only returns a single total.
+
+    For CNC Machining: each Hole Wizard hole is its own ranked entry
+    (with the specific feature name, diameter, depth, and depth:diameter
+    ratio that drove its cost -- deeper/narrower holes cost more, since a
+    thin long drill has to slow down for chip evacuation, deflection, and
+    heat), plus one flat "Other Features" bucket for every non-hole
+    feature (clearly labeled as a flat/aggregate estimate, not per-feature)
+    and one "Setup Time" entry for the fixed per-job cost.
+
+    For Sheet Metal: two entries, "Cutting" and "Bending" (both real,
+    independently computed).
+
+    For Injection Molding: two entries, "Machine Cycle Cost" and "Tooling
+    Amortization" (both real, independently computed).
+
+    Each entry has a label, cost_per_unit_inr, percentage_of_total_
+    production_cost, and is_individual_feature (True only for CNC holes --
+    use this to know which entries correspond to a real, individually
+    selectable feature vs. a flat/aggregate bucket). Present this as a
+    ranked table, not prose.
+
+    `manufacturing_process` MUST be one of "CNC Machining", "Injection
+    Molding", "Sheet Metal" -- ASK THE USER if not specified, same as
+    estimate_cost(). Returns found=False listing the valid options if
+    called without one.
+    """
+    if manufacturing_process not in PROCESSES:
+        return {
+            "found": False,
+            "message": (
+                f"manufacturing_process must be one of {list(PROCESSES)}. "
+                "Ask the user which manufacturing process to assume, then "
+                "call get_cost_drivers again with their answer."
+            ),
+        }
+    return adapter.get_cost_drivers(manufacturing_process, quantity)
+
+
+@mcp.tool()
+def highlight_cost_driver(manufacturing_process: str | None = None, quantity: int = 1) -> dict:
+    """Find the single highest-cost driver for the CURRENTLY OPEN part
+    (via the same ranking as get_cost_drivers()) and, if it's an
+    individual feature (e.g. a specific deep/narrow hole), select it in
+    the live CAD viewport -- the same visual highlight as clicking it in
+    the feature tree -- so the user can see exactly which feature is
+    driving the cost. Use this when the user asks to "highlight the most
+    expensive feature", "show me what's driving the cost", or similar.
+
+    If the top cost driver is a flat/aggregate bucket rather than one
+    individual feature (e.g. "Other Features" or "Setup Time" for CNC, or
+    either component for Sheet Metal/Injection Molding, none of which
+    correspond to a single selectable feature), nothing is highlighted --
+    the returned message says so explicitly instead of guessing a feature
+    to select.
+
+    Returns {"found", "message" (relay this directly to the user in
+    chat), "highlighted" (bool), "top_driver"}. Same
+    `manufacturing_process`/`quantity` requirements as get_cost_drivers().
+    """
+    if manufacturing_process not in PROCESSES:
+        return {
+            "found": False,
+            "message": (
+                f"manufacturing_process must be one of {list(PROCESSES)}. "
+                "Ask the user which manufacturing process to assume, then "
+                "call highlight_cost_driver again with their answer."
+            ),
+        }
+    return adapter.highlight_cost_driver(manufacturing_process, quantity)
+
+
+@mcp.tool()
 def get_assembly_bom(manufacturing_process: str | None = None, quantity: int = 1) -> dict:
     """Roll up the CURRENTLY OPEN ASSEMBLY into a structured Bill of
     Materials: one row per unique (part, configuration) combination found

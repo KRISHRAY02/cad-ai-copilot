@@ -301,6 +301,31 @@ class MockAdapter(CadAdapter):
     def get_bounding_box_mm(self) -> tuple[float, float, float]:
         return self._bounding_box_mm
 
+    def get_hole_features(self) -> list[dict]:
+        """Synthetic holes matching this bracket's own "Mounting Holes"
+        Hole Wizard feature plus one hypothetical deep/narrow dowel hole,
+        the same two holes used by run_dfm_check()'s demo data -- kept
+        consistent so cost-driver demos and DFM demos tell the same story
+        about this mock part.
+        """
+        return [
+            {"feature_name": "Mounting Holes", "diameter_mm": 6.5, "depth_mm": 10.0},
+            {"feature_name": "Dowel Pin Hole", "diameter_mm": 0.8, "depth_mm": 15.0},
+        ]
+
+    def highlight_feature(self, feature_id: str) -> dict:
+        """No real CAD viewport exists for the mock adapter -- returns a
+        simple success acknowledgment instead of actually selecting
+        anything.
+        """
+        return {
+            "success": True,
+            "message": (
+                f"[Mock Adapter -- no real CAD viewport] Would highlight "
+                f"feature '{feature_id}'."
+            ),
+        }
+
     def get_assembly_components(self) -> list[AssemblyComponent]:
         """Aggregate the raw synthetic component list into one row per
         unique (file_path, configuration), skipping suppressed/envelope

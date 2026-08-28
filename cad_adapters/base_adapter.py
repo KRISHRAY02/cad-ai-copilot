@@ -198,6 +198,38 @@ class CadAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def get_hole_features(self) -> list[dict]:
+        """Return one dict per Hole Wizard hole in the current part's
+        feature tree: {"feature_name": str, "diameter_mm": float | None,
+        "depth_mm": float | None}.
+
+        Same underlying hole data run_dfm_check()'s hole check reads (see
+        _check_holes in solidworks_adapter.py) -- diameter/depth are real
+        feature parameters, not estimates. depth_mm is None for a
+        "through all" hole (its real depth depends on part thickness, not
+        a fixed feature parameter) or when the Hole Wizard type doesn't
+        expose a single depth/diameter value; callers must not guess a
+        value for these. Used by production_cost.py's CNC Machining
+        formula for per-hole machining time attribution. Returns an empty
+        list for a part with no Hole Wizard holes -- a real, valid answer,
+        not an error.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def highlight_feature(self, feature_id: str) -> dict:
+        """Select/highlight the named feature so it visually highlights in
+        the CAD viewport, the same way clicking it in the feature tree
+        would.
+
+        `feature_id` is a feature name as returned by get_features() or
+        get_hole_features() (e.g. "Hole3"). Returns {"success": bool,
+        "message": str}. Used by highlight_cost_driver() to visually point
+        out the specific feature identified as the top cost driver.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def capture_screenshot(self, output_path: str | None = None) -> str:
         """Capture a screenshot of the current part's viewport and save it
         to disk, returning the saved file's path.
@@ -633,3 +665,240 @@ class CadAdapter(ABC):
             results.append(entry)
 
         return results
+
+    def get_cost_drivers(self, manufacturing_process: str, quantity: int) -> dict:
+        """Break the current part's production cost down into a ranked
+        list of cost components (highest cost first), instead of a single
+        total -- so a chat answer (or highlight_cost_driver()) can say
+        *which* feature or cost element is actually driving the price.
+
+        Concrete (not abstract): built entirely out of get_hole_features()
+        / get_features() / get_bend_count() / get_bounding_box_mm() /
+        get_mass_properties(), same reasoning as compare_materials() and
+        estimate_carbon() above.
+
+        For CNC Machining: every Hole Wizard hole becomes its own ranked
+        entry (is_individual_feature=True, feature_name set) using the
+        per-hole time estimate from production_cost.py; every other
+        feature is lumped into one "Other Features" bucket entry
+        (is_individual_feature=False) since those aren't individually
+        modeled -- see production_cost.estimate_cnc_machining_cost's
+        docstring for why depth:diameter ratio drives each hole's cost.
+        Setup time is its own fixed-cost entry, also not tied to a
+        feature.
+
+        For Sheet Metal: two entries, "Cutting" and "Bending" (both
+        already independently real numbers, not lumped).
+
+        For Injection Molding: two entries, "Machine Cycle Cost" and
+        "Tooling Amortization" (also already independently real).
+
+        Raises ValueError if `manufacturing_process` isn't one of
+        production_cost.PROCESSES. Returns found=False with a message
+        (never guesses) if required geometry can't be read (e.g. no solid
+        body for Injection Molding's volume).
+        """
+        if manufacturing_process not in PROCESSES:
+            raise ValueError(
+                f"manufacturing_process must be one of {list(PROCESSES)}"
+            )
+
+        components: list[dict] = []
+
+        if manufacturing_process == "CNC Machining":
+            hole_features = self.get_hole_features()
+            hole_names = {h["feature_name"] for h in hole_features}
+            other_feature_count = sum(
+                1
+                for f in self.get_features()
+                if not f.suppressed and f.name not in hole_names
+            )
+            result = estimate_production_cost(
+                manufacturing_process,
+                hole_features=hole_features,
+                other_feature_count=other_feature_count,
+            )
+            breakdown = result.breakdown
+
+            for hole in breakdown["holes"]:
+                flat_note = " (flat estimate -- missing depth/diameter data)" if hole["is_flat_estimate"] else ""
+                components.append({
+                    "label": f"Hole '{hole['feature_name']}'{flat_note}",
+                    "cost_per_unit_inr": hole["estimated_cost_inr"],
+                    "is_individual_feature": True,
+                    "feature_name": hole["feature_name"],
+                    "details": {
+                        "diameter_mm": hole["diameter_mm"],
+                        "depth_mm": hole["depth_mm"],
+                        "depth_to_diameter_ratio": hole["depth_to_diameter_ratio"],
+                        "is_flat_estimate": hole["is_flat_estimate"],
+                    },
+                })
+
+            other = breakdown["other_features"]
+            components.append({
+                "label": other["label"],
+                "cost_per_unit_inr": other["estimated_cost_inr"],
+                "is_individual_feature": False,
+                "feature_name": None,
+                "details": {"feature_count": other["count"]},
+            })
+
+            setup = breakdown["setup"]
+            components.append({
+                "label": setup["label"],
+                "cost_per_unit_inr": setup["estimated_cost_inr"],
+                "is_individual_feature": False,
+                "feature_name": None,
+                "details": {},
+            })
+
+        elif manufacturing_process == "Sheet Metal":
+            bounding_box_mm = self.get_bounding_box_mm()
+            bend_count = self.get_bend_count()
+            result = estimate_production_cost(
+                manufacturing_process, bounding_box_mm=bounding_box_mm, bend_count=bend_count
+            )
+            breakdown = result.breakdown
+            components.append({
+                "label": "Cutting",
+                "cost_per_unit_inr": breakdown["cutting_cost_inr"],
+                "is_individual_feature": False,
+                "feature_name": None,
+                "details": {"cutting_length_mm_approx": breakdown["cutting_length_mm_approx"]},
+            })
+            components.append({
+                "label": "Bending",
+                "cost_per_unit_inr": breakdown["bending_cost_inr"],
+                "is_individual_feature": False,
+                "feature_name": None,
+                "details": {"bend_count": breakdown["bend_count"]},
+            })
+
+        else:  # Injection Molding
+            mass_properties = self.get_mass_properties()
+            volume_m3 = mass_properties.get("volume_m3")
+            if volume_m3 is None:
+                return {
+                    "found": False,
+                    "message": (
+                        "Could not read volume for the current part (no "
+                        "solid geometry?) -- cost drivers cannot be computed."
+                    ),
+                }
+            result = estimate_production_cost(
+                manufacturing_process, volume_m3=volume_m3, order_quantity=quantity
+            )
+            breakdown = result.breakdown
+            components.append({
+                "label": "Machine Cycle Cost",
+                "cost_per_unit_inr": breakdown["machine_cost_per_shot_inr"],
+                "is_individual_feature": False,
+                "feature_name": None,
+                "details": {"cycle_time_seconds": breakdown["cycle_time_seconds"]},
+            })
+            components.append({
+                "label": "Tooling Amortization",
+                "cost_per_unit_inr": breakdown["tooling_cost_per_unit_inr"],
+                "is_individual_feature": False,
+                "feature_name": None,
+                "details": {"order_quantity_used_for_amortization": breakdown["order_quantity_used_for_amortization"]},
+            })
+
+        production_cost_inr = result.production_cost_inr
+        for component in components:
+            component["percentage_of_total_production_cost"] = (
+                round(component["cost_per_unit_inr"] / production_cost_inr * 100, 2)
+                if production_cost_inr
+                else 0.0
+            )
+
+        components.sort(key=lambda c: c["cost_per_unit_inr"], reverse=True)
+
+        return {
+            "found": True,
+            "manufacturing_process": manufacturing_process,
+            "quantity": quantity,
+            "production_cost_per_unit_inr": production_cost_inr,
+            "cost_drivers": components,
+            "assumptions": result.assumptions,
+        }
+
+    def highlight_cost_driver(self, manufacturing_process: str, quantity: int) -> dict:
+        """Identify the single highest-cost driver (via get_cost_drivers())
+        and, if it's an individual feature (e.g. a specific hole), select
+        it in the CAD viewport via highlight_feature() -- so the AI can
+        point the user directly at the offending feature instead of just
+        naming it.
+
+        If the top driver is a flat, non-individual bucket (e.g. "Other
+        Features" or "Setup Time" for CNC, or either Sheet Metal/
+        Injection Molding component, none of which correspond to one
+        selectable feature), this says so explicitly instead of silently
+        skipping the highlight or picking an arbitrary feature to select.
+
+        Returns {"found": bool, "message": str, "highlighted": bool,
+        "top_driver": dict | None}. The "message" field is meant to be
+        relayed directly to the user in chat.
+        """
+        drivers_result = self.get_cost_drivers(manufacturing_process, quantity)
+        if not drivers_result["found"]:
+            return {"found": False, "message": drivers_result["message"], "highlighted": False, "top_driver": None}
+
+        cost_drivers = drivers_result["cost_drivers"]
+        if not cost_drivers:
+            return {
+                "found": False,
+                "message": "No cost drivers were computed for the current part.",
+                "highlighted": False,
+                "top_driver": None,
+            }
+
+        top = cost_drivers[0]
+
+        if not top["is_individual_feature"]:
+            return {
+                "found": True,
+                "message": (
+                    f"The top cost driver is '{top['label']}', accounting for "
+                    f"~{top['percentage_of_total_production_cost']:.0f}% of the "
+                    f"production cost (Rs {top['cost_per_unit_inr']:.2f}/unit). "
+                    "This is a flat/aggregate estimate, not a single feature, "
+                    "so there's nothing specific to highlight in the viewport."
+                ),
+                "highlighted": False,
+                "top_driver": top,
+            }
+
+        highlight_result = self.highlight_feature(top["feature_name"])
+
+        details = top.get("details", {})
+        reason = ""
+        if manufacturing_process == "CNC Machining" and details.get("depth_to_diameter_ratio") is not None:
+            reason = (
+                f" due to its depth:diameter ratio of "
+                f"{details['depth_to_diameter_ratio']:.1f}:1 "
+                f"(diameter {details['diameter_mm']:.2f}mm, depth "
+                f"{details['depth_mm']:.2f}mm)"
+            )
+
+        if highlight_result["success"]:
+            message = (
+                f"Feature '{top['feature_name']}' ({top['label']}) accounts for "
+                f"~{top['percentage_of_total_production_cost']:.0f}% of the "
+                f"machining cost{reason} -- highlighted in the CAD viewport."
+            )
+        else:
+            message = (
+                f"Feature '{top['feature_name']}' ({top['label']}) accounts for "
+                f"~{top['percentage_of_total_production_cost']:.0f}% of the "
+                f"machining cost{reason}, but it could not be highlighted in "
+                f"the viewport: {highlight_result['message']}"
+            )
+
+        return {
+            "found": True,
+            "message": message,
+            "highlighted": highlight_result["success"],
+            "top_driver": top,
+        }

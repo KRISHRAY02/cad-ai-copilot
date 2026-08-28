@@ -630,6 +630,99 @@ class SolidWorksAdapter(CadAdapter):
         findings.extend(self._check_tolerances(model))
         return findings
 
+    @classmethod
+    def _read_holes(cls, model) -> list[dict]:
+        """Yield one dict per Hole Wizard feature: {"feat" (raw COM
+        object), "name", "diameter_mm" (or None), "depth_mm" (or None),
+        "error" (str, only present if geometry couldn't be read at all)}.
+
+        Shared by _check_holes() (DFM check) and get_hole_features()
+        (production cost attribution) so both read hole geometry exactly
+        the same way instead of duplicating the dynamic-dispatch COM
+        calls in two places.
+        """
+        holes = []
+        for feat in cls._iter_raw_features(model):
+            if feat.GetTypeName2 != "HoleWzd":
+                continue
+            name = feat.Name
+
+            try:
+                definition = cls._dyn_get(feat, "GetDefinition")
+                diameter_m = cls._dyn_get(definition, "Diameter")
+                depth_m = cls._dyn_get(definition, "Depth")
+            except Exception as e:
+                holes.append({"feat": feat, "name": name, "diameter_mm": None, "depth_mm": None, "error": str(e)})
+                continue
+
+            if not diameter_m:
+                holes.append({
+                    "feat": feat, "name": name, "diameter_mm": None, "depth_mm": None,
+                    "error": (
+                        f"Diameter not available for hole '{name}' (some Hole "
+                        "Wizard types, e.g. tapered holes, don't expose a "
+                        "single diameter value)."
+                    ),
+                })
+                continue
+
+            diameter_mm = diameter_m * 1000
+            # depth_m is 0/None for "through all" holes, whose real depth
+            # depends on part thickness, not a fixed feature parameter --
+            # reported as None rather than a guessed depth.
+            depth_mm = depth_m * 1000 if depth_m else None
+            holes.append({"feat": feat, "name": name, "diameter_mm": diameter_mm, "depth_mm": depth_mm, "error": None})
+
+        return holes
+
+    def get_hole_features(self) -> list[dict]:
+        """Real diameter/depth for every Hole Wizard hole -- see
+        CadAdapter.get_hole_features()'s docstring. Used by
+        production_cost.py's CNC formula for per-hole cost attribution.
+        """
+        return [
+            {"feature_name": h["name"], "diameter_mm": h["diameter_mm"], "depth_mm": h["depth_mm"]}
+            for h in self._read_holes(self._get_active_doc())
+        ]
+
+    def highlight_feature(self, feature_id: str) -> dict:
+        """Select the named feature via SOLIDWORKS' real feature-selection
+        API, highlighting it in the graphics area/viewport exactly like
+        clicking it in the feature tree would.
+
+        Uses `IModelDoc2.FeatureByName(name)` to look up the feature, then
+        `IFeature.Select2(Append, Mark)` to select it (Append=False clears
+        any prior selection so only this feature is highlighted; Mark=-1
+        uses the default selection mark). Both are documented SOLIDWORKS
+        API members reachable via this environment's dynamic dispatch
+        (same family as FirstFeature/GetNextFeature used elsewhere in this
+        adapter).
+        """
+        model = self._get_active_doc()
+        try:
+            feat = model.FeatureByName(feature_id)
+        except Exception as e:
+            return {"success": False, "message": f"Could not look up feature '{feature_id}': {e}"}
+
+        if feat is None:
+            return {
+                "success": False,
+                "message": f"No feature named '{feature_id}' was found in the current part.",
+            }
+
+        try:
+            selected = feat.Select2(False, -1)
+        except Exception as e:
+            return {"success": False, "message": f"Could not select feature '{feature_id}': {e}"}
+
+        if not selected:
+            return {
+                "success": False,
+                "message": f"SOLIDWORKS rejected selecting feature '{feature_id}'.",
+            }
+
+        return {"success": True, "message": f"Feature '{feature_id}' selected/highlighted in SOLIDWORKS."}
+
     def _check_holes(self, model) -> list[dict]:
         """Protects against holes that are too small to drill reliably, or
         too deep relative to their diameter -- a long thin drill flexes
@@ -644,43 +737,18 @@ class SolidWorksAdapter(CadAdapter):
         findings = []
         found_any = False
 
-        for feat in self._iter_raw_features(model):
-            if feat.GetTypeName2 != "HoleWzd":
-                continue
+        for hole in self._read_holes(model):
             found_any = True
-            name = feat.Name
+            name = hole["name"]
 
-            try:
-                definition = self._dyn_get(feat, "GetDefinition")
-                diameter_m = self._dyn_get(definition, "Diameter")
-                depth_m = self._dyn_get(definition, "Depth")
-            except Exception as e:
+            if hole["error"] is not None:
                 findings.append(
-                    make_finding(
-                        "hole", "not_applicable", feature=name,
-                        message=f"Could not read hole geometry for '{name}': {e}",
-                    )
+                    make_finding("hole", "not_applicable", feature=name, message=hole["error"])
                 )
                 continue
 
-            if not diameter_m:
-                findings.append(
-                    make_finding(
-                        "hole", "not_applicable", feature=name,
-                        message=(
-                            f"Diameter not available for hole '{name}' (some "
-                            "Hole Wizard types, e.g. tapered holes, don't "
-                            "expose a single diameter value)."
-                        ),
-                    )
-                )
-                continue
-
-            diameter_mm = diameter_m * 1000
-            # depth_m is 0/None for "through all" holes, whose real depth
-            # depends on part thickness, not a fixed feature parameter --
-            # skip the ratio check rather than guess a depth.
-            depth_mm = depth_m * 1000 if depth_m else None
+            diameter_mm = hole["diameter_mm"]
+            depth_mm = hole["depth_mm"]
 
             issues = []
             if diameter_mm < MIN_HOLE_DIAMETER_MM:

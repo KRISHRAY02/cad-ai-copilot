@@ -28,6 +28,11 @@ section of a report):
   cut adds tool-path time. Multiplying total time by (machine rate + labor
   rate) reflects that a CNC machine and its operator are both "occupied",
   and therefore both billed, for the same stretch of time.
+  Hole Wizard holes get their own per-hole time estimate instead of the
+  flat per-feature number (see estimate_cnc_machining_cost's docstring for
+  why depth:diameter ratio is used as the time driver); every other
+  feature type still uses the flat per-feature estimate, grouped into one
+  "Other Features" bucket.
 - **Injection Molding**: cost has two very different drivers. Per-unit
   machine cost (cycle time x machine rate) is the recurring cost of one
   "shot" -- injecting, cooling, and ejecting one part -- which scales with
@@ -53,6 +58,16 @@ from dataclasses import dataclass
 
 CNC_SETUP_TIME_MINUTES = 15.0
 CNC_PER_FEATURE_MACHINING_MINUTES = 4.0
+
+# PLACEHOLDER -- fixed per-hole overhead (seconds converted to minutes): tool
+# approach, spot-drill/center-drill touch-off, and retract, which every
+# drilled hole incurs regardless of its size.
+CNC_HOLE_BASE_MACHINING_MINUTES = 0.5
+
+# PLACEHOLDER -- additional minutes per unit of depth:diameter ratio. See
+# estimate_cnc_machining_cost()'s docstring for why this ratio (not depth or
+# diameter alone) is used as the per-hole time driver.
+CNC_HOLE_DEPTH_TO_DIAMETER_MINUTES_PER_RATIO = 0.3
 
 # PLACEHOLDER -- replace with your shop's real machine hourly rate (INR/hr)
 # for your region/market before citing any results computed from this.
@@ -111,27 +126,120 @@ class ProductionCostResult:
     assumptions: str
 
 
-def estimate_cnc_machining_cost(feature_count: int) -> ProductionCostResult:
-    """CNC Machining production cost, per unit.
+def _hourly_rate_to_cost_inr(minutes: float) -> float:
+    return (minutes / 60.0) * (CNC_MACHINE_HOURLY_RATE_INR + CNC_LABOR_HOURLY_RATE_INR)
 
-    estimated_machining_time_minutes = SETUP_TIME_MINUTES +
-        (PER_FEATURE_MACHINING_MINUTES * feature_count)
-    production_cost_per_unit = (estimated_machining_time / 60) *
-        (MACHINE_HOURLY_RATE + LABOR_HOURLY_RATE)
 
-    `feature_count` is approximated by the part's face count (see
-    CadAdapter.get_face_count()) -- more faces generally means more
-    distinct machining operations were needed to produce the part. This is
-    an approximation, not a literal count of machining operations from a
-    CAM program.
+def estimate_cnc_machining_cost(
+    hole_features: list[dict] | None = None,
+    other_feature_count: int = 0,
+) -> ProductionCostResult:
+    """CNC Machining production cost, per unit -- with per-hole attribution.
+
+    Every feature used to be charged the same flat
+    PER_FEATURE_MACHINING_MINUTES, which gives nothing meaningful to rank
+    or highlight as a "cost driver". Hole Wizard holes now get their own
+    individually estimated machining time from real geometry (diameter,
+    depth); every other feature type still uses the old flat per-feature
+    estimate, grouped into a single "Other Features" bucket (labeled as a
+    flat estimate, not a per-feature one, in the returned breakdown).
+
+    `hole_features` is a list of dicts, each with at least "feature_name",
+    "diameter_mm" (float or None), and "depth_mm" (float or None) -- see
+    CadAdapter.get_hole_features(). `other_feature_count` is the count of
+    every remaining (non-hole) feature, billed at the flat
+    CNC_PER_FEATURE_MACHINING_MINUTES rate as before.
+
+    Per-hole time formula:
+        estimated_time_minutes = CNC_HOLE_BASE_MACHINING_MINUTES +
+            (depth_mm / diameter_mm) * CNC_HOLE_DEPTH_TO_DIAMETER_MINUTES_PER_RATIO
+
+    **Why depth:diameter ratio, not depth or diameter alone**: a drill
+    doesn't slow down because a hole is merely deep, or merely narrow -- it
+    slows down because of how deep it is *relative to* its own diameter.
+    A 20mm-deep hole is trivial at 10mm diameter but is a "deep hole" at
+    2mm diameter. Three real machining effects all scale with this ratio,
+    not with depth or diameter in isolation:
+      1. Chip evacuation -- flutes have to carry chips back out along the
+         same channel the drill bit occupies; a narrower channel packs
+         chips faster per unit of depth, forcing more peck-drilling
+         retraction cycles (each one extra time) as the ratio grows.
+      2. Tool deflection/wander -- a thin, long drill bit flexes under
+         cutting load; shops compensate with reduced feed rate as
+         depth:diameter increases, directly trading speed for straightness.
+      3. Heat buildup -- a narrow flute channel also carries less coolant,
+         so deep/narrow holes need slower feeds to avoid overheating the
+         bit.
+    This project's own DFM hole check (see
+    cad_adapters/dfm_checks.py::MAX_HOLE_DEPTH_TO_DIAMETER_RATIO) already
+    uses this exact ratio as the standard manufacturability threshold for
+    "is this hole a problem" -- reusing it here as the cost driver keeps
+    the same physical justification for "is this hole expensive" that the
+    DFM check already relies on for "is this hole risky", rather than
+    inventing a second, unrelated formula.
+
+    A hole missing depth data (e.g. a "through all" hole, whose real depth
+    depends on part thickness rather than a fixed feature parameter -- see
+    _check_holes in solidworks_adapter.py) falls back to the flat
+    CNC_PER_FEATURE_MACHINING_MINUTES estimate for that hole specifically,
+    and is marked is_flat_estimate=True in its breakdown entry so this
+    fallback is visible rather than silently blended in.
     """
-    machining_time_minutes = CNC_SETUP_TIME_MINUTES + (
-        CNC_PER_FEATURE_MACHINING_MINUTES * feature_count
-    )
-    machining_time_hours = machining_time_minutes / 60.0
-    production_cost = machining_time_hours * (
-        CNC_MACHINE_HOURLY_RATE_INR + CNC_LABOR_HOURLY_RATE_INR
-    )
+    hole_features = hole_features or []
+
+    hole_entries = []
+    hole_time_total = 0.0
+    for hole in hole_features:
+        name = hole.get("feature_name")
+        diameter_mm = hole.get("diameter_mm")
+        depth_mm = hole.get("depth_mm")
+
+        if diameter_mm and depth_mm:
+            ratio = depth_mm / diameter_mm
+            time_minutes = CNC_HOLE_BASE_MACHINING_MINUTES + (
+                ratio * CNC_HOLE_DEPTH_TO_DIAMETER_MINUTES_PER_RATIO
+            )
+            is_flat_estimate = False
+        else:
+            # Missing diameter or depth (e.g. a "through all" hole) -- fall
+            # back to the flat per-feature estimate for this hole only,
+            # rather than guessing a depth.
+            ratio = None
+            time_minutes = CNC_PER_FEATURE_MACHINING_MINUTES
+            is_flat_estimate = True
+
+        hole_time_total += time_minutes
+        hole_entries.append(
+            {
+                "feature_name": name,
+                "diameter_mm": diameter_mm,
+                "depth_mm": depth_mm,
+                "depth_to_diameter_ratio": round(ratio, 2) if ratio is not None else None,
+                "estimated_time_minutes": round(time_minutes, 3),
+                "estimated_cost_inr": round(_hourly_rate_to_cost_inr(time_minutes), 2),
+                "is_flat_estimate": is_flat_estimate,
+            }
+        )
+
+    other_time_minutes = CNC_PER_FEATURE_MACHINING_MINUTES * other_feature_count
+    other_entry = {
+        "label": "Other Features (flat per-feature estimate, not individually modeled)",
+        "count": other_feature_count,
+        "estimated_time_minutes": round(other_time_minutes, 3),
+        "estimated_cost_inr": round(_hourly_rate_to_cost_inr(other_time_minutes), 2),
+        "is_flat_estimate": True,
+    }
+
+    setup_entry = {
+        "label": "Setup Time (fixed per-job cost, not per feature)",
+        "estimated_time_minutes": CNC_SETUP_TIME_MINUTES,
+        "estimated_cost_inr": round(_hourly_rate_to_cost_inr(CNC_SETUP_TIME_MINUTES), 2),
+    }
+
+    machining_time_minutes = CNC_SETUP_TIME_MINUTES + hole_time_total + other_time_minutes
+    production_cost = _hourly_rate_to_cost_inr(machining_time_minutes)
+
+    feature_count = len(hole_entries) + other_feature_count
 
     return ProductionCostResult(
         process="CNC Machining",
@@ -141,11 +249,18 @@ def estimate_cnc_machining_cost(feature_count: int) -> ProductionCostResult:
             "estimated_machining_time_minutes": round(machining_time_minutes, 2),
             "machine_hourly_rate_inr": CNC_MACHINE_HOURLY_RATE_INR,
             "labor_hourly_rate_inr": CNC_LABOR_HOURLY_RATE_INR,
+            "setup": setup_entry,
+            "holes": hole_entries,
+            "other_features": other_entry,
         },
         assumptions=(
             f"CNC Machining: {CNC_SETUP_TIME_MINUTES} min setup + "
-            f"{CNC_PER_FEATURE_MACHINING_MINUTES} min/feature x "
-            f"{feature_count} features (approximated from face count) = "
+            f"{len(hole_entries)} Hole Wizard hole(s) individually estimated "
+            f"from real diameter/depth (base {CNC_HOLE_BASE_MACHINING_MINUTES} "
+            f"min + depth:diameter ratio x "
+            f"{CNC_HOLE_DEPTH_TO_DIAMETER_MINUTES_PER_RATIO} min/ratio) + "
+            f"{other_feature_count} other feature(s) at the flat "
+            f"{CNC_PER_FEATURE_MACHINING_MINUTES} min/feature estimate = "
             f"{machining_time_minutes:.1f} min, billed at "
             f"Rs {CNC_MACHINE_HOURLY_RATE_INR}/hr machine + "
             f"Rs {CNC_LABOR_HOURLY_RATE_INR}/hr labor "
@@ -251,6 +366,8 @@ def estimate_production_cost(
     order_quantity: int = 1,
     bounding_box_mm: tuple[float, float, float] = (0.0, 0.0, 0.0),
     bend_count: int = 0,
+    hole_features: list[dict] | None = None,
+    other_feature_count: int | None = None,
 ) -> ProductionCostResult:
     """Dispatch to the process-specific production cost formula.
 
@@ -258,9 +375,25 @@ def estimate_production_cost(
     Molding", "Sheet Metal"). Only the arguments relevant to the chosen
     process are used; the rest are ignored (kept as keyword args so
     callers can pass one unified geometry dict regardless of process).
+
+    For CNC Machining specifically: callers that have real per-hole
+    geometry (diameter/depth) should pass `hole_features` +
+    `other_feature_count` for per-hole cost attribution (see
+    estimate_cnc_machining_cost). Callers that don't (e.g. the ML cost
+    model's synthetic training data, which has no per-hole geometry) can
+    keep passing just `feature_count` as before -- every feature is then
+    treated as part of the flat "Other Features" bucket, reproducing the
+    old flat-formula behavior exactly.
     """
     if process == "CNC Machining":
-        return estimate_cnc_machining_cost(feature_count)
+        if hole_features is not None or other_feature_count is not None:
+            return estimate_cnc_machining_cost(
+                hole_features=hole_features,
+                other_feature_count=other_feature_count
+                if other_feature_count is not None
+                else feature_count,
+            )
+        return estimate_cnc_machining_cost(hole_features=[], other_feature_count=feature_count)
     if process == "Injection Molding":
         return estimate_injection_molding_cost(volume_m3, order_quantity)
     if process == "Sheet Metal":
