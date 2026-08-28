@@ -71,6 +71,18 @@ COLOR_ACCENT = "#2F6FED"
 COLOR_ACCENT_HOVER = "#4C82F0"
 COLOR_TIMESTAMP = "#9AA4B2"
 
+# Login/signup screen -- dark slate card on a dark slate page, matching the
+# sidebar's existing look (COLOR_SIDEBAR_BG family) rather than the light
+# chat area, since this screen is the app's "shell" chrome, not chat content.
+COLOR_LOGIN_PAGE_BG = COLOR_SIDEBAR_BG
+COLOR_LOGIN_CARD_BG = "#22314A"
+COLOR_LOGIN_FIELD_BG = "#1B2A41"
+COLOR_LOGIN_TITLE = COLOR_HEADER_TEXT
+COLOR_LOGIN_SUBTEXT = COLOR_SIDEBAR_TEXT_MUTED
+COLOR_LOGIN_LABEL = COLOR_SIDEBAR_TEXT_MUTED
+COLOR_LOGIN_TEXT = COLOR_HEADER_TEXT
+COLOR_LOGIN_ERROR = "#FF8A80"  # lighter red than COLOR_ERROR_TEXT -- readable on a dark card
+
 FONT_FAMILY = "Segoe UI"
 FONT_SIZE_MESSAGE = 14
 FONT_SIZE_TIMESTAMP = 11
@@ -298,23 +310,189 @@ def build_empty_state(on_chip_click) -> ft.Container:
 
 
 # --------------------------------------------------------------------------
+# Login / signup screen
+# --------------------------------------------------------------------------
+
+
+def build_login_view(page: ft.Page, on_authenticated) -> ft.Control:
+    """Centered login/signup card, shown before the chat interface. Local
+    accounts only -- "Create Account" makes a profile stored in this
+    machine's chat_history.db (see chat_db.create_user), not a cloud
+    sign-up.
+
+    `on_authenticated(user_id, username)` is called once login or account
+    creation succeeds. Deliberately avoids ft.Tabs for the Log In / Create
+    Account toggle -- this project's Flet version has a documented history
+    of unreliable rendering for less battle-tested widgets, so this reuses
+    only Container/Row/Column/TextField/Text, the same controls already
+    proven to render correctly elsewhere in this file.
+    """
+    mode = {"value": "login"}  # "login" | "signup"
+
+    def field(label: str, is_password: bool) -> ft.TextField:
+        return ft.TextField(
+            label=label,
+            password=is_password,
+            can_reveal_password=is_password,
+            bgcolor=COLOR_LOGIN_FIELD_BG,
+            color=COLOR_LOGIN_TEXT,
+            label_style=ft.TextStyle(color=COLOR_LOGIN_LABEL, font_family=FONT_FAMILY),
+            text_style=ft.TextStyle(font_family=FONT_FAMILY, color=COLOR_LOGIN_TEXT),
+            cursor_color=COLOR_ACCENT,
+            border_color=COLOR_SIDEBAR_DIVIDER,
+            focused_border_color=COLOR_ACCENT,
+            border_radius=10,
+        )
+
+    username_field = field("Username", is_password=False)
+    password_field = field("Password", is_password=True)
+    confirm_field = field("Confirm Password", is_password=True)
+    confirm_field.visible = False
+
+    error_text = ft.Text("", color=COLOR_LOGIN_ERROR, size=13, font_family=FONT_FAMILY, visible=False)
+
+    submit_button = ft.Container(
+        content=ft.Text("Log In", color="#FFFFFF", size=14, weight=ft.FontWeight.W_600, font_family=FONT_FAMILY),
+        bgcolor=COLOR_ACCENT,
+        border_radius=10,
+        padding=pad_symmetric(horizontal=16, vertical=12),
+        alignment=ft.Alignment(0, 0),
+        ink=True,
+        on_hover=lambda e: _set_bgcolor_on_hover(e, COLOR_ACCENT, COLOR_ACCENT_HOVER),
+    )
+
+    def _set_bgcolor_on_hover(e: ft.ControlEvent, base: str, hover: str) -> None:
+        e.control.bgcolor = hover if e.data == "true" else base
+        e.control.update()
+
+    def pill(label: str, active: bool) -> ft.Container:
+        return ft.Container(
+            content=ft.Text(
+                label,
+                color="#FFFFFF" if active else COLOR_LOGIN_SUBTEXT,
+                size=13,
+                weight=ft.FontWeight.W_600,
+                font_family=FONT_FAMILY,
+            ),
+            bgcolor=COLOR_ACCENT if active else "transparent",
+            border_radius=8,
+            padding=pad_symmetric(horizontal=14, vertical=8),
+            alignment=ft.Alignment(0, 0),
+            expand=True,
+            ink=True,
+        )
+
+    login_pill = pill("Log In", active=True)
+    signup_pill = pill("Create Account", active=False)
+    toggle_row = ft.Container(
+        content=ft.Row([login_pill, signup_pill], spacing=4),
+        bgcolor=COLOR_LOGIN_FIELD_BG,
+        border_radius=10,
+        padding=4,
+    )
+
+    def set_error(message: str) -> None:
+        error_text.value = message
+        error_text.visible = bool(message)
+        page.update()
+
+    def switch_mode(new_mode: str) -> None:
+        if mode["value"] == new_mode:
+            return
+        mode["value"] = new_mode
+        set_error("")
+        confirm_field.value = ""
+        confirm_field.visible = new_mode == "signup"
+        submit_button.content.value = "Create Account" if new_mode == "signup" else "Log In"
+        login_pill.bgcolor = COLOR_ACCENT if new_mode == "login" else "transparent"
+        login_pill.content.color = "#FFFFFF" if new_mode == "login" else COLOR_LOGIN_SUBTEXT
+        signup_pill.bgcolor = COLOR_ACCENT if new_mode == "signup" else "transparent"
+        signup_pill.content.color = "#FFFFFF" if new_mode == "signup" else COLOR_LOGIN_SUBTEXT
+        page.update()
+
+    login_pill.on_click = lambda e: switch_mode("login")
+    signup_pill.on_click = lambda e: switch_mode("signup")
+
+    def handle_submit(e: ft.ControlEvent) -> None:
+        username = (username_field.value or "").strip()
+        password = password_field.value or ""
+
+        if mode["value"] == "login":
+            if not username or not password:
+                set_error("Enter your username and password.")
+                return
+            user_id = chat_db.verify_user(username, password)
+            if user_id is None:
+                # Deliberately generic -- never reveals whether the
+                # username or the password was the wrong part.
+                set_error("Invalid username or password.")
+                return
+            on_authenticated(user_id, username)
+        else:
+            confirm = confirm_field.value or ""
+            if not username or not password or not confirm:
+                set_error("Fill in all fields.")
+                return
+            if password != confirm:
+                set_error("Passwords do not match.")
+                return
+            result = chat_db.create_user(username, password)
+            if not result["success"]:
+                set_error(result["message"])
+                return
+            on_authenticated(result["user_id"], username)
+
+    submit_button.on_click = handle_submit
+    username_field.on_submit = handle_submit
+    password_field.on_submit = handle_submit
+    confirm_field.on_submit = handle_submit
+
+    card = ft.Container(
+        content=ft.Column(
+            [
+                ft.Text(APP_TITLE, color=COLOR_LOGIN_TITLE, size=20, weight=ft.FontWeight.BOLD, font_family=FONT_FAMILY),
+                ft.Text(
+                    "Local sign-in -- your account and chat history stay on this machine.",
+                    color=COLOR_LOGIN_SUBTEXT, size=12, font_family=FONT_FAMILY,
+                ),
+                toggle_row,
+                username_field,
+                password_field,
+                confirm_field,
+                error_text,
+                submit_button,
+            ],
+            spacing=16,
+            tight=True,
+        ),
+        bgcolor=COLOR_LOGIN_CARD_BG,
+        border_radius=16,
+        padding=pad_all(32),
+        width=380,
+        shadow=ft.BoxShadow(spread_radius=0, blur_radius=24, color="#40000000", offset=ft.Offset(0, 8)),
+    )
+
+    return ft.Container(content=card, alignment=ft.Alignment(0, 0), expand=True, bgcolor=COLOR_LOGIN_PAGE_BG)
+
+
+# --------------------------------------------------------------------------
 # Main app
 # --------------------------------------------------------------------------
 
 
-async def main(page: ft.Page) -> None:
-    page.title = APP_TITLE
-    page.window.width = WINDOW_WIDTH
-    page.window.height = WINDOW_HEIGHT
-    page.window.min_width = 760
-    page.window.min_height = 520
+async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_logout) -> None:
+    """Build and show the main chat interface for one logged-in user.
+
+    Everything in here (conversation list, new-chat creation, message
+    save/load) is scoped to `user_id` -- see chat_db.list_conversations()/
+    create_conversation(), which now require a user_id and only ever
+    return/create that user's own rows. `on_logout()` clears this view and
+    returns to the login screen without closing the app.
+    """
     page.bgcolor = COLOR_CHAT_BG
-    page.padding = 0
-    page.theme = ft.Theme(font_family=FONT_FAMILY)
+    page.controls.clear()
 
-    chat_db.init_db()
-
-    state = {"conversation_id": None, "is_sending": False}
+    state = {"conversation_id": None, "is_sending": False, "user_id": user_id}
 
     # ---- controls that get referenced/updated across handlers ----
 
@@ -410,7 +588,7 @@ async def main(page: ft.Page) -> None:
 
     def render_sidebar() -> None:
         sidebar_list.controls.clear()
-        for conv in chat_db.list_conversations():
+        for conv in chat_db.list_conversations(state["user_id"]):
             sidebar_list.controls.append(build_sidebar_row(conv))
         page.update()
 
@@ -446,7 +624,15 @@ async def main(page: ft.Page) -> None:
                 on_click=lambda e: enter_confirm_state(),
                 style=ft.ButtonStyle(padding=0),
             )
-            page.update()
+
+        # Always visible, not hover-only -- hover-based reveal depends on
+        # this Flet environment's mouse-hover events firing reliably,
+        # which this project has previously found inconsistent (see the
+        # desktop UI v2 rendering notes). An always-visible trash icon is
+        # simpler and impossible to miss, at the cost of a little visual
+        # noise -- an acceptable trade for a "reliable, explicit" delete
+        # control.
+        show_delete_icon()
 
         def enter_confirm_state() -> None:
             row_state["confirming"] = True
@@ -476,13 +662,36 @@ async def main(page: ft.Page) -> None:
 
         def cancel_confirm() -> None:
             row_state["confirming"] = False
-            action_area.content = None
+            show_delete_icon()
             page.update()
 
         def do_delete() -> None:
             if state["is_sending"] and state["conversation_id"] == conv.id:
                 return
-            chat_db.delete_conversation(conv.id)
+
+            deleted = chat_db.delete_conversation(conv.id, state["user_id"])
+            if not deleted:
+                # Ownership check failed (or the conversation is already
+                # gone) -- deliberately generic, doesn't reveal whether the
+                # conversation exists under a different account. Shouldn't
+                # be reachable from this UI (the sidebar only ever lists
+                # the logged-in user's own conversations), but
+                # delete_conversation() enforces it regardless of caller.
+                # Shown as inline text in the row's own action area (reuses
+                # only Text/Container, same as the rest of this sidebar --
+                # avoids ft.SnackBar/dialog widgets, which this project has
+                # previously found unreliable to render in this Flet
+                # environment). Clears itself the next time the row stops
+                # being hovered (see on_hover below).
+                row_state["confirming"] = False
+                # COLOR_LOGIN_ERROR (not COLOR_ERROR_TEXT), since this sits
+                # on the dark sidebar background, not a light chat bubble.
+                action_area.content = ft.Text(
+                    "Error", size=FONT_SIZE_SIDEBAR_TIME, color=COLOR_LOGIN_ERROR, font_family=FONT_FAMILY
+                )
+                page.update()
+                return  # left showing "Error" instead of the trash icon; re-rendering the sidebar (e.g. clicking another chat) restores it
+
             if state["conversation_id"] == conv.id:
                 state["conversation_id"] = None
                 chat_list.controls.clear()
@@ -497,10 +706,6 @@ async def main(page: ft.Page) -> None:
                 else (COLOR_SIDEBAR_ROW_HOVER_BG if hovering else "transparent")
             )
             title_ctrl.color = COLOR_SIDEBAR_TEXT_HOVER if hovering or is_active else COLOR_SIDEBAR_TEXT
-            if hovering and not row_state["confirming"]:
-                show_delete_icon()
-            elif not hovering and not row_state["confirming"]:
-                action_area.content = None
             page.update()
 
         async def on_click(e: ft.ControlEvent) -> None:
@@ -575,7 +780,7 @@ async def main(page: ft.Page) -> None:
         try:
             is_first_message = state["conversation_id"] is None
             if is_first_message:
-                state["conversation_id"] = chat_db.create_conversation()
+                state["conversation_id"] = chat_db.create_conversation(state["user_id"])
                 chat_db.set_conversation_title(state["conversation_id"], chat_db.make_title(text))
 
             conversation_id = state["conversation_id"]
@@ -704,6 +909,56 @@ async def main(page: ft.Page) -> None:
     send_button.on_click = send_message
     message_input.on_submit = send_message
 
+    def do_logout(e: ft.ControlEvent | None = None) -> None:
+        # Same is_sending guard as start_new_chat/load_conversation --
+        # don't tear the view down while a send is still in flight.
+        if state["is_sending"]:
+            return
+        on_logout()
+
+    user_footer = ft.Container(
+        content=ft.Column(
+            [
+                ft.Row(
+                    [
+                        ft.CircleAvatar(
+                            content=ft.Text(username[:1].upper(), size=12, weight=ft.FontWeight.BOLD, color="#FFFFFF"),
+                            bgcolor=COLOR_ACCENT,
+                            radius=AVATAR_RADIUS,
+                        ),
+                        ft.Text(
+                            username,
+                            color=COLOR_SIDEBAR_TEXT,
+                            size=FONT_SIZE_SIDEBAR_TITLE,
+                            weight=ft.FontWeight.W_600,
+                            font_family=FONT_FAMILY,
+                            max_lines=1,
+                            overflow=ft.TextOverflow.ELLIPSIS,
+                            expand=True,
+                        ),
+                    ],
+                    spacing=8,
+                ),
+                ft.Container(
+                    content=ft.Row(
+                        [
+                            ft.Icon(ft.Icons.LOGOUT_ROUNDED, size=14, color=COLOR_SIDEBAR_TEXT_MUTED),
+                            ft.Text("Log Out", color=COLOR_SIDEBAR_TEXT_MUTED, size=12, font_family=FONT_FAMILY),
+                        ],
+                        spacing=6,
+                    ),
+                    on_click=do_logout,
+                    ink=True,
+                    border_radius=6,
+                    padding=pad_symmetric(horizontal=4, vertical=6),
+                ),
+            ],
+            spacing=8,
+        ),
+        padding=pad_symmetric(horizontal=16, vertical=12),
+        border=ft.Border(top=ft.BorderSide(1, COLOR_SIDEBAR_DIVIDER)),
+    )
+
     # ---- layout ----
 
     header = ft.Container(
@@ -745,6 +1000,15 @@ async def main(page: ft.Page) -> None:
                     padding=pad_symmetric(horizontal=12),
                 ),
                 sidebar_list,
+                # Trailing fixed-height child after an expand=True child --
+                # this exact Column shape had unreliable rendering in an
+                # earlier session in this Flet version/environment (see the
+                # desktop UI v2 history), though it was never conclusively
+                # confirmed as a real bug vs. a screenshot-capture artifact.
+                # Left as the idiomatic layout; if the username/Log Out row
+                # doesn't appear, try resizing the window (forces a
+                # relayout) before assuming this code is wrong.
+                user_footer,
             ],
             expand=True,
             spacing=0,
@@ -805,6 +1069,29 @@ async def main(page: ft.Page) -> None:
 
     page.update()
     await message_input.focus()
+
+
+async def main(page: ft.Page) -> None:
+    page.title = APP_TITLE
+    page.window.width = WINDOW_WIDTH
+    page.window.height = WINDOW_HEIGHT
+    page.window.min_width = 760
+    page.window.min_height = 520
+    page.padding = 0
+    page.theme = ft.Theme(font_family=FONT_FAMILY)
+
+    chat_db.init_db()
+
+    def show_login() -> None:
+        page.bgcolor = COLOR_LOGIN_PAGE_BG
+        page.controls.clear()
+        page.add(build_login_view(page, on_authenticated))
+        page.update()
+
+    def on_authenticated(user_id: int, username: str) -> None:
+        page.run_task(show_chat_interface, page, user_id, username, show_login)
+
+    show_login()
 
 
 if __name__ == "__main__":

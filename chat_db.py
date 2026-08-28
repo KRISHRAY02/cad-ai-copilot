@@ -1,14 +1,21 @@
-"""SQLite persistence for desktop_app.py's conversation history.
+"""SQLite persistence for desktop_app.py's conversation history and user
+accounts.
 
-Local single-user store: one file (chat_history.db, created next to this
-script), two tables (conversations, messages). All datetimes are naive
-local time -- there's no multi-timezone concern for a single desktop app.
+Local multi-user store: one file (chat_history.db, created next to this
+script), three tables (users, conversations, messages). Each conversation
+belongs to exactly one user (conversations.user_id); accounts are local
+profiles on this machine, not a cloud login -- passwords are hashed with
+bcrypt (see create_user/verify_user) and never leave this database. All
+datetimes are naive local time -- there's no multi-timezone concern for a
+single desktop app.
 """
 
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+import bcrypt
 
 DB_PATH = Path(__file__).parent / "chat_history.db"
 
@@ -41,10 +48,19 @@ def _connect() -> sqlite3.Connection:
 def init_db() -> None:
     with _connect() as conn:
         conn.execute(
+            """CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        conn.execute(
             """CREATE TABLE IF NOT EXISTS conversations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE
             )"""
         )
         conn.execute(
@@ -58,12 +74,79 @@ def init_db() -> None:
             )"""
         )
 
+        # Migration for a chat_history.db created before accounts existed:
+        # CREATE TABLE IF NOT EXISTS above only applies to a brand-new file,
+        # so an existing conversations table needs user_id added on top.
+        # Pre-existing conversations have no known owner and are left with
+        # user_id NULL -- they simply won't appear in any account's
+        # (user_id-filtered) sidebar, rather than being guessed into
+        # belonging to whichever account happens to log in first.
+        existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(conversations)")}
+        if "user_id" not in existing_columns:
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE CASCADE"
+            )
 
-def create_conversation() -> int:
+
+def create_user(username: str, password: str) -> dict:
+    """Create a new local user profile. Returns {"success": True, "user_id":
+    int} on success, or {"success": False, "message": str} if the username
+    is already taken or the inputs are empty -- never raises, and never
+    includes the plaintext password in the returned message (or anywhere
+    else: it's hashed with bcrypt before it ever reaches the database, and
+    it's never logged or printed).
+    """
+    username = (username or "").strip()
+    if not username:
+        return {"success": False, "message": "Username cannot be empty."}
+    if not password:
+        return {"success": False, "message": "Password cannot be empty."}
+
+    with _connect() as conn:
+        existing = conn.execute(
+            "SELECT id FROM users WHERE username = ?", (username,)
+        ).fetchone()
+        if existing is not None:
+            return {"success": False, "message": "That username is already taken."}
+
+        password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        cur = conn.execute(
+            "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+            (username, password_hash, datetime.now().isoformat()),
+        )
+        return {"success": True, "user_id": cur.lastrowid}
+
+
+def verify_user(username: str, password: str) -> int | None:
+    """Check a username/password pair against the stored bcrypt hash.
+
+    Returns the matching user's id on success, or None if the username
+    doesn't exist OR the password is wrong -- deliberately indistinguishable
+    from the caller's point of view (see desktop_app.py's login screen,
+    which shows a single generic "invalid username or password" message
+    either way, not which one was wrong).
+    """
+    username = (username or "").strip()
+    if not username or not password:
+        return None
+
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT id, password_hash FROM users WHERE username = ?", (username,)
+        ).fetchone()
+
+    if row is None:
+        return None
+    if bcrypt.checkpw(password.encode("utf-8"), row["password_hash"].encode("utf-8")):
+        return row["id"]
+    return None
+
+
+def create_conversation(user_id: int) -> int:
     with _connect() as conn:
         cur = conn.execute(
-            "INSERT INTO conversations (title, created_at) VALUES (NULL, ?)",
-            (datetime.now().isoformat(),),
+            "INSERT INTO conversations (title, created_at, user_id) VALUES (NULL, ?, ?)",
+            (datetime.now().isoformat(), user_id),
         )
         return cur.lastrowid
 
@@ -85,10 +168,16 @@ def add_message(conversation_id: int, role: str, content: str) -> None:
         )
 
 
-def list_conversations() -> list[Conversation]:
+def list_conversations(user_id: int) -> list[Conversation]:
+    """Conversations belonging to `user_id` only -- never another user's,
+    and never the pre-account-system orphaned rows with user_id NULL (see
+    the migration note in init_db()).
+    """
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT id, title, created_at FROM conversations ORDER BY created_at DESC"
+            "SELECT id, title, created_at FROM conversations "
+            "WHERE user_id = ? ORDER BY created_at DESC",
+            (user_id,),
         ).fetchall()
         return [Conversation(r["id"], r["title"], r["created_at"]) for r in rows]
 
@@ -106,10 +195,23 @@ def get_messages(conversation_id: int) -> list[Message]:
         ]
 
 
-def delete_conversation(conversation_id: int) -> None:
+def delete_conversation(conversation_id: int, user_id: int) -> bool:
+    """Delete a conversation and all its messages -- but only if
+    `conversation_id` actually belongs to `user_id`. Returns True if the
+    conversation was found (owned by this user) and deleted, False
+    otherwise (wrong owner, or no such conversation) -- callers must check
+    this rather than assuming the delete succeeded, since a False here
+    means nothing was removed.
+    """
     with _connect() as conn:
+        owner = conn.execute(
+            "SELECT user_id FROM conversations WHERE id = ?", (conversation_id,)
+        ).fetchone()
+        if owner is None or owner["user_id"] != user_id:
+            return False
         conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
         conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+        return True
 
 
 def make_title(first_message: str) -> str:
