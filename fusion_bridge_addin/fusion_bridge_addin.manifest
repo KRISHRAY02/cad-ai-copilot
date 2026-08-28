@@ -1,0 +1,13 @@
+{
+    "autodeskProduct": "Fusion",
+    "type": "addin",
+    "id": "1F6C7C7E-6C3B-4B7A-9F2D-8C4E1E2E9B31",
+    "author": "Krish Ray",
+    "description": {
+        "": "Local HTTP bridge that exposes basic info about the currently active Fusion 360 document (title, document type, units, save state) to external processes -- used by cad_adapters/fusion_adapter.py so the CAD AI copilot can talk to Fusion 360 the same way it talks to SolidWorks."
+    },
+    "version": "1.0.0",
+    "runOnStartup": false,
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
