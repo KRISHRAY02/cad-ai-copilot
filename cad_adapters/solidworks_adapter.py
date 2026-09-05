@@ -118,6 +118,26 @@ class SolidWorksAdapter(CadAdapter):
         self._get_active_doc()
         return True
 
+    @staticmethod
+    def is_running() -> bool:
+        """Quick, side-effect-free check for whether SolidWorks is already
+        running -- never launches it.
+
+        Deliberately uses win32com.client.GetActiveObject (attaches to an
+        already-registered running instance, raises if there isn't one)
+        instead of Dispatch (which, per this environment's discovered
+        pywin32 behavior, would silently *launch* a new SolidWorks instance
+        if one isn't already running -- unacceptable for a background
+        "is it running" detection check, which must stay fast and
+        non-intrusive). Never raises -- callers only care True/False.
+        """
+        pythoncom.CoInitialize()
+        try:
+            win32com.client.GetActiveObject("SldWorks.Application")
+            return True
+        except pythoncom.com_error:
+            return False
+
     def _connect_com(self):
         """Initialize COM for the calling thread and attach to SolidWorks.
 

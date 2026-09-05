@@ -87,6 +87,14 @@ def init_db() -> None:
                 "ALTER TABLE conversations ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE CASCADE"
             )
 
+        # Migration for a users table created before CAD-platform selection
+        # existed. NULL means "never successfully connected to a platform
+        # yet" -- the platform picker treats that the same as "no
+        # preference", it never guesses a default.
+        existing_user_columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+        if "last_used_platform" not in existing_user_columns:
+            conn.execute("ALTER TABLE users ADD COLUMN last_used_platform TEXT")
+
 
 def create_user(username: str, password: str) -> dict:
     """Create a new local user profile. Returns {"success": True, "user_id":
@@ -140,6 +148,28 @@ def verify_user(username: str, password: str) -> int | None:
     if bcrypt.checkpw(password.encode("utf-8"), row["password_hash"].encode("utf-8")):
         return row["id"]
     return None
+
+
+def get_last_used_platform(user_id: int) -> str | None:
+    """The CAD platform ("solidworks" | "fusion360") this user last
+    successfully connected to, or None if they never have (new account, or
+    every past attempt failed).
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT last_used_platform FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        return row["last_used_platform"] if row else None
+
+
+def set_last_used_platform(user_id: int, platform: str) -> None:
+    """Record `platform` as this user's default -- called only after a
+    real, successful adapter.connect(), never on a mere detection ping.
+    """
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE users SET last_used_platform = ? WHERE id = ?", (platform, user_id)
+        )
 
 
 def create_conversation(user_id: int) -> int:

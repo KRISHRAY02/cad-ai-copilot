@@ -18,14 +18,26 @@ from pathlib import Path
 import flet as ft
 
 import chat_db
+import mcp_server
 from ai_orchestrator import (
     AiOrchestrator,
     McpServerUnavailableError,
     run_ai_orchestrator,
 )
 from bom_export import export_bom as write_bom_file
-from mcp_server import adapter
+from cad_adapters.fusion_adapter import FusionAdapter
+from cad_adapters.solidworks_adapter import SolidWorksAdapter
 from report.generate_report import generate_manufacturing_report
+
+# CAD platform selection (post-login, see build_platform_popup /
+# run_platform_selection). Values match mcp_server._build_adapter()'s
+# CAD_ADAPTER branches and chat_db.users.last_used_platform.
+PLATFORM_SOLIDWORKS = "solidworks"
+PLATFORM_FUSION = "fusion360"
+PLATFORM_LABELS = {PLATFORM_SOLIDWORKS: "SolidWorks", PLATFORM_FUSION: "Fusion 360"}
+
+COLOR_STATUS_RUNNING = "#2E7D32"
+COLOR_STATUS_NOT_DETECTED = "#C62828"
 
 # Defaults used only when exporting a BOM from the button (no chat context
 # to pull manufacturing_process/quantity from) -- always stated explicitly
@@ -160,6 +172,257 @@ async def check_environment() -> str | None:
         await orchestrator.stop()
 
     return None
+
+
+# --------------------------------------------------------------------------
+# CAD platform detection & selection
+# --------------------------------------------------------------------------
+
+
+def _detect_solidworks() -> bool:
+    return SolidWorksAdapter.is_running()
+
+
+def _detect_fusion360() -> bool:
+    return FusionAdapter.is_running()
+
+
+async def detect_platforms() -> dict[str, bool]:
+    """Quick, side-effect-free "is it running" check for both platforms,
+    run in parallel off the UI thread so a platform that isn't running
+    (which each is_running() still has to wait out a short timeout for)
+    doesn't double the total wait.
+    """
+    sw_running, fusion_running = await asyncio.gather(
+        asyncio.to_thread(_detect_solidworks),
+        asyncio.to_thread(_detect_fusion360),
+    )
+    return {PLATFORM_SOLIDWORKS: sw_running, PLATFORM_FUSION: fusion_running}
+
+
+def _try_connect_platform(platform: str) -> tuple[bool, str]:
+    """Actually attempt adapter.connect() for `platform` (unlike
+    detect_platforms(), which only pings/probes) -- this is a real
+    connection attempt, e.g. it will fail with a specific message if
+    SolidWorks is running but has no document open. Returns (success,
+    error_message); error_message is "" on success. Never raises: every
+    adapter's connect() already carries a clear, specific message on its
+    own exception, and reusing str(exc) here keeps this one place from
+    duplicating/drifting from that wording.
+    """
+    try:
+        if platform == PLATFORM_SOLIDWORKS:
+            SolidWorksAdapter().connect()
+        elif platform == PLATFORM_FUSION:
+            FusionAdapter().connect()
+        else:
+            return False, f"Unknown CAD platform '{platform}'."
+        return True, ""
+    except Exception as exc:  # noqa: BLE001 - surfaced verbatim to the popup
+        return False, str(exc)
+
+
+def _activate_platform(platform: str, user_id: int) -> None:
+    """Make `platform` the active CAD backend for the whole app and
+    remember it as this user's default for next login.
+
+    mcp_server.set_backend() updates both the in-process `adapter`
+    singleton (used directly by the BOM/report export buttons) and
+    CAD_ADAPTER in os.environ (picked up by every future
+    run_ai_orchestrator() call, which spawns a fresh mcp_server.py
+    subprocess per chat message) -- see that function's docstring for why
+    both need to move together. Only called after a real successful
+    connect(), never after a mere detection ping.
+    """
+    mcp_server.set_backend(platform)
+    chat_db.set_last_used_platform(user_id, platform)
+
+
+async def show_platform_selector(
+    page: ft.Page,
+    user_id: int,
+    initial_detected: dict[str, bool],
+) -> str:
+    """Show the SolidWorks / Fusion 360 selection popup as a page overlay
+    and block until the user successfully connects to one platform, then
+    return its constant (PLATFORM_SOLIDWORKS / PLATFORM_FUSION).
+
+    Built as a plain page.overlay entry (Container scrim + centered card),
+    not ft.AlertDialog -- this project has a documented history in this
+    Flet environment of unreliable rendering for less battle-tested
+    widgets (see the login screen's own avoidance of ft.Tabs), so this
+    reuses only Container/Row/Column/Text/ProgressRing, the same controls
+    already proven to render correctly elsewhere in this file. Works
+    identically whether called during initial login (chat not built yet)
+    or mid-session via "Switch CAD Software" (the existing chat/sidebar
+    underneath is untouched -- this only ever adds/removes one overlay
+    entry).
+    """
+    loop = asyncio.get_running_loop()
+    resolved: asyncio.Future[str] = loop.create_future()
+
+    last_used = chat_db.get_last_used_platform(user_id)
+    detected = dict(initial_detected)
+    card_refs: dict[str, dict] = {}
+
+    def _set_card_status(platform: str, running: bool) -> None:
+        refs = card_refs[platform]
+        refs["status_dot"].bgcolor = COLOR_STATUS_RUNNING if running else COLOR_STATUS_NOT_DETECTED
+        refs["status_label"].value = "Running" if running else "Not detected"
+        refs["status_label"].color = COLOR_STATUS_RUNNING if running else COLOR_STATUS_NOT_DETECTED
+
+    async def attempt_connect(platform: str) -> None:
+        refs = card_refs[platform]
+        refs["connect_btn"].disabled = True
+        refs["spinner"].visible = True
+        refs["connect_text"].value = "Connecting..."
+        refs["error_text"].visible = False
+        page.update()
+
+        success, message = await asyncio.to_thread(_try_connect_platform, platform)
+
+        refs["spinner"].visible = False
+        refs["connect_text"].value = "Connect"
+        refs["connect_btn"].disabled = False
+        _set_card_status(platform, success)
+
+        if success:
+            page.update()
+            _activate_platform(platform, user_id)
+            if overlay in page.overlay:
+                page.overlay.remove(overlay)
+            page.update()
+            if not resolved.done():
+                resolved.set_result(platform)
+        else:
+            refs["error_text"].value = message
+            refs["error_text"].visible = True
+            page.update()
+
+    def build_card(platform: str) -> ft.Container:
+        is_running = detected.get(platform, False)
+        is_preselected = platform == last_used
+
+        status_dot = ft.Container(
+            width=10, height=10, border_radius=5,
+            bgcolor=COLOR_STATUS_RUNNING if is_running else COLOR_STATUS_NOT_DETECTED,
+        )
+        status_label = ft.Text(
+            "Running" if is_running else "Not detected",
+            size=12,
+            color=COLOR_STATUS_RUNNING if is_running else COLOR_STATUS_NOT_DETECTED,
+            weight=ft.FontWeight.W_600,
+            font_family=FONT_FAMILY,
+        )
+        spinner = ft.ProgressRing(width=14, height=14, stroke_width=2, color="#FFFFFF", visible=False)
+        connect_text = ft.Text("Connect", size=13, weight=ft.FontWeight.W_600, color="#FFFFFF", font_family=FONT_FAMILY)
+        error_text = ft.Text("", size=11, color=COLOR_LOGIN_ERROR, font_family=FONT_FAMILY, visible=False)
+
+        connect_btn = ft.Container(
+            content=ft.Row([spinner, connect_text], spacing=6, alignment=ft.MainAxisAlignment.CENTER, tight=True),
+            bgcolor=COLOR_ACCENT,
+            border_radius=8,
+            padding=pad_symmetric(horizontal=14, vertical=10),
+            alignment=ft.Alignment(0, 0),
+            ink=True,
+        )
+
+        async def _on_connect_click(e: ft.ControlEvent, platform: str = platform) -> None:
+            await attempt_connect(platform)
+
+        connect_btn.on_click = _on_connect_click
+
+        card_refs[platform] = {
+            "status_dot": status_dot,
+            "status_label": status_label,
+            "spinner": spinner,
+            "connect_text": connect_text,
+            "connect_btn": connect_btn,
+            "error_text": error_text,
+        }
+
+        return ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Text(
+                                PLATFORM_LABELS[platform], size=15, weight=ft.FontWeight.BOLD,
+                                color=COLOR_LOGIN_TITLE, font_family=FONT_FAMILY, expand=True,
+                            ),
+                            ft.Row([status_dot, status_label], spacing=6),
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    ),
+                    connect_btn,
+                    error_text,
+                ],
+                spacing=12,
+                tight=True,
+            ),
+            bgcolor=COLOR_LOGIN_FIELD_BG,
+            border=ft.Border.all(2 if is_preselected else 1, COLOR_ACCENT if is_preselected else COLOR_SIDEBAR_DIVIDER),
+            border_radius=12,
+            padding=pad_all(16),
+            width=220,
+        )
+
+    async def retry_detection(e: ft.ControlEvent | None = None) -> None:
+        nonlocal detected
+        retry_btn.disabled = True
+        retry_text.value = "Checking..."
+        page.update()
+
+        detected = await detect_platforms()
+        for platform in (PLATFORM_SOLIDWORKS, PLATFORM_FUSION):
+            _set_card_status(platform, detected[platform])
+            card_refs[platform]["error_text"].visible = False
+
+        retry_btn.disabled = False
+        retry_text.value = "Retry Detection"
+        page.update()
+
+    retry_text = ft.Text("Retry Detection", size=13, weight=ft.FontWeight.W_600, color=COLOR_LOGIN_SUBTEXT, font_family=FONT_FAMILY)
+    retry_btn = ft.Container(
+        content=retry_text,
+        bgcolor="transparent",
+        border=ft.Border.all(1, COLOR_SIDEBAR_DIVIDER),
+        border_radius=8,
+        padding=pad_symmetric(horizontal=14, vertical=10),
+        alignment=ft.Alignment(0, 0),
+        ink=True,
+        on_click=retry_detection,
+    )
+
+    card_row = ft.Row([build_card(PLATFORM_SOLIDWORKS), build_card(PLATFORM_FUSION)], spacing=16)
+
+    popup_card = ft.Container(
+        content=ft.Column(
+            [
+                ft.Text("Connect to CAD Software", size=18, weight=ft.FontWeight.BOLD, color=COLOR_LOGIN_TITLE, font_family=FONT_FAMILY),
+                ft.Text(
+                    "Choose which CAD platform to connect to for this session.",
+                    size=12, color=COLOR_LOGIN_SUBTEXT, font_family=FONT_FAMILY,
+                ),
+                card_row,
+                retry_btn,
+            ],
+            spacing=16,
+            tight=True,
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+        ),
+        bgcolor=COLOR_LOGIN_CARD_BG,
+        border_radius=16,
+        padding=pad_all(28),
+        shadow=ft.BoxShadow(spread_radius=0, blur_radius=24, color="#40000000", offset=ft.Offset(0, 8)),
+    )
+
+    overlay = ft.Container(content=popup_card, alignment=ft.Alignment(0, 0), expand=True, bgcolor="#B3000000")
+
+    page.overlay.append(overlay)
+    page.update()
+
+    return await resolved
 
 
 # --------------------------------------------------------------------------
@@ -492,7 +755,7 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
     page.bgcolor = COLOR_CHAT_BG
     page.controls.clear()
 
-    state = {"conversation_id": None, "is_sending": False, "user_id": user_id}
+    state = {"conversation_id": None, "is_sending": False, "user_id": user_id, "platform": None}
 
     # ---- controls that get referenced/updated across handlers ----
 
@@ -559,6 +822,46 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
 
     def timestamp_now() -> str:
         return chat_db.relative_time(__import__("datetime").datetime.now().isoformat())
+
+    def update_platform_badge() -> None:
+        platform = state.get("platform")
+        platform_badge.visible = platform is not None
+        if platform is not None:
+            platform_badge_text.value = PLATFORM_LABELS[platform]
+        page.update()
+
+    async def show_toast(message: str, success: bool = True) -> None:
+        """Brief status banner -- auto-hides after a couple seconds on
+        success (a connection confirmation), stays up on failure so the
+        user has time to read it. Reuses status_banner (also used by the
+        startup Ollama/MCP check below) rather than a second widget, since
+        only one of these is ever relevant at a time.
+        """
+        status_banner.content = ft.Row(
+            [
+                ft.Icon(
+                    ft.Icons.CHECK_CIRCLE_OUTLINE if success else ft.Icons.WARNING_AMBER_ROUNDED,
+                    color=COLOR_STATUS_RUNNING if success else COLOR_ERROR_TEXT,
+                    size=18,
+                ),
+                ft.Text(
+                    message,
+                    color=COLOR_STATUS_RUNNING if success else COLOR_ERROR_TEXT,
+                    size=FONT_SIZE_MESSAGE,
+                    font_family=FONT_FAMILY,
+                    expand=True,
+                ),
+            ],
+            spacing=8,
+        )
+        status_banner.bgcolor = "#E8F5E9" if success else COLOR_ERROR_BUBBLE
+        status_banner.padding = pad_symmetric(horizontal=20, vertical=10)
+        status_banner.visible = True
+        page.update()
+        if success:
+            await asyncio.sleep(2.5)
+            status_banner.visible = False
+            page.update()
 
     def bubble_width_hint() -> int:
         width = page.window.width or WINDOW_WIDTH
@@ -867,12 +1170,15 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
         page.update()
 
         def _build_bom_file() -> str:
-            if not adapter.is_assembly():
+            # Read live off mcp_server.adapter (not a name captured at
+            # import time) so a mid-session platform switch via
+            # mcp_server.set_backend() is reflected immediately.
+            if not mcp_server.adapter.is_assembly():
                 raise RuntimeError(
                     "The currently open document is not an assembly -- "
-                    "open an assembly in SOLIDWORKS to export a BOM."
+                    "open an assembly to export a BOM."
                 )
-            bom_result = adapter.get_assembly_bom(
+            bom_result = mcp_server.adapter.get_assembly_bom(
                 _DEFAULT_BOM_MANUFACTURING_PROCESS, _DEFAULT_BOM_QUANTITY
             )
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -916,6 +1222,17 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
             return
         on_logout()
 
+    async def handle_switch_platform(e: ft.ControlEvent | None = None) -> None:
+        # Same is_sending guard as do_logout/start_new_chat -- switching
+        # backends mid-send would race the in-flight tool call.
+        if state["is_sending"]:
+            return
+        detected = await detect_platforms()
+        new_platform = await show_platform_selector(page, state["user_id"], detected)
+        state["platform"] = new_platform
+        update_platform_badge()
+        await show_toast(f"Switched to {PLATFORM_LABELS[new_platform]}")
+
     user_footer = ft.Container(
         content=ft.Column(
             [
@@ -942,6 +1259,19 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
                 ft.Container(
                     content=ft.Row(
                         [
+                            ft.Icon(ft.Icons.SYNC_ALT_ROUNDED, size=14, color=COLOR_SIDEBAR_TEXT_MUTED),
+                            ft.Text("Switch CAD Software", color=COLOR_SIDEBAR_TEXT_MUTED, size=12, font_family=FONT_FAMILY),
+                        ],
+                        spacing=6,
+                    ),
+                    on_click=handle_switch_platform,
+                    ink=True,
+                    border_radius=6,
+                    padding=pad_symmetric(horizontal=4, vertical=6),
+                ),
+                ft.Container(
+                    content=ft.Row(
+                        [
                             ft.Icon(ft.Icons.LOGOUT_ROUNDED, size=14, color=COLOR_SIDEBAR_TEXT_MUTED),
                             ft.Text("Log Out", color=COLOR_SIDEBAR_TEXT_MUTED, size=12, font_family=FONT_FAMILY),
                         ],
@@ -961,24 +1291,47 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
 
     # ---- layout ----
 
-    header = ft.Container(
-        content=ft.Column(
+    platform_badge_text = ft.Text("", size=12, weight=ft.FontWeight.W_600, color=COLOR_HEADER_TEXT, font_family=FONT_FAMILY)
+    platform_badge = ft.Container(
+        content=ft.Row(
             [
-                ft.Text(
-                    APP_TITLE,
-                    color=COLOR_HEADER_TEXT,
-                    size=FONT_SIZE_TITLE,
-                    weight=ft.FontWeight.BOLD,
-                    font_family=FONT_FAMILY,
-                ),
-                ft.Text(
-                    APP_SUBTITLE,
-                    color=COLOR_HEADER_SUBTEXT,
-                    size=FONT_SIZE_SUBTITLE,
-                    font_family=FONT_FAMILY,
-                ),
+                ft.Container(width=8, height=8, border_radius=4, bgcolor=COLOR_STATUS_RUNNING),
+                platform_badge_text,
             ],
-            spacing=4,
+            spacing=6,
+        ),
+        bgcolor="#22314A",
+        border_radius=20,
+        padding=pad_symmetric(horizontal=12, vertical=6),
+        visible=False,
+    )
+
+    header = ft.Container(
+        content=ft.Row(
+            [
+                ft.Column(
+                    [
+                        ft.Text(
+                            APP_TITLE,
+                            color=COLOR_HEADER_TEXT,
+                            size=FONT_SIZE_TITLE,
+                            weight=ft.FontWeight.BOLD,
+                            font_family=FONT_FAMILY,
+                        ),
+                        ft.Text(
+                            APP_SUBTITLE,
+                            color=COLOR_HEADER_SUBTEXT,
+                            size=FONT_SIZE_SUBTITLE,
+                            font_family=FONT_FAMILY,
+                        ),
+                    ],
+                    spacing=4,
+                    expand=True,
+                ),
+                platform_badge,
+            ],
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
         ),
         bgcolor=COLOR_HEADER_BG,
         padding=pad_symmetric(horizontal=28, vertical=22),
@@ -1038,11 +1391,39 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
     )
     page.update()
 
-    # ---- startup environment check ----
+    # ---- CAD platform selection ----
 
     message_input.disabled = True
     send_button.disabled = True
     page.update()
+
+    detected = await detect_platforms()
+    running_platforms = [p for p, ok in detected.items() if ok]
+
+    chosen_platform = None
+    if len(running_platforms) == 1:
+        candidate = running_platforms[0]
+        success, _error = await asyncio.to_thread(_try_connect_platform, candidate)
+        if success:
+            _activate_platform(candidate, state["user_id"])
+            chosen_platform = candidate
+        else:
+            # Detected as running but a real connect() still failed (e.g.
+            # SolidWorks is open but has no document loaded yet) -- fall
+            # through to the popup instead of leaving the user stuck with a
+            # permanently-disabled chat and no explanation. The popup's own
+            # Connect button will re-surface this same error.
+            detected[candidate] = False
+
+    if chosen_platform is None:
+        chosen_platform = await show_platform_selector(page, state["user_id"], detected)
+
+    state["platform"] = chosen_platform
+    update_platform_badge()
+    if len(running_platforms) == 1 and chosen_platform in running_platforms:
+        await show_toast(f"Connected to {PLATFORM_LABELS[chosen_platform]}")
+
+    # ---- startup environment check ----
 
     render_sidebar()
 

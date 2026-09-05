@@ -4,11 +4,15 @@ open CAD part: identity, mass, material, feature tree, a viewport
 screenshot, a cost estimate (material + production cost breakdown, see
 production_cost.py), a carbon estimate, and DFM check results.
 
-Reuses mcp_server.py's already-built `adapter` and its `estimate_cost`
-tool function directly (both are plain, directly-callable objects even
-though `estimate_cost` is also MCP-tool-decorated -- see mcp_server.py),
-rather than re-implementing cost-model feature assembly here, so the
-report always reflects exactly the same numbers a chat answer would show.
+Reuses mcp_server.py's `adapter` and `estimate_cost` directly (both are
+plain, directly-callable objects even though `estimate_cost` is also
+MCP-tool-decorated -- see mcp_server.py), accessed as `mcp_server.adapter`/
+`mcp_server.estimate_cost` (not imported by name) so a platform switch via
+mcp_server.set_backend() mid-session is picked up immediately -- a `from
+mcp_server import adapter` binding would freeze on whatever adapter existed
+at import time. This module never re-implements cost-model feature
+assembly itself, so the report always reflects exactly the same numbers a
+chat answer would show.
 
 Built with reportlab (see requirements.txt).
 """
@@ -30,7 +34,7 @@ from reportlab.platypus import (
     TableStyle,
 )
 
-from mcp_server import adapter, estimate_cost
+import mcp_server
 
 _ASSEMBLY_BOM_COL_WIDTHS = [26 * mm, 20 * mm, 20 * mm, 32 * mm, 12 * mm, 22 * mm, 22 * mm]
 
@@ -143,7 +147,7 @@ def _cost_section(styles, manufacturing_process: str, quantity: int, process_is_
     )
     flowables.append(Paragraph(assumption_note, styles["Note"]))
 
-    result = estimate_cost(manufacturing_process=manufacturing_process, quantity=quantity)
+    result = mcp_server.estimate_cost(manufacturing_process=manufacturing_process, quantity=quantity)
     if not result.get("found"):
         flowables.append(
             Paragraph(f"Cost estimate unavailable: {result.get('message', 'unknown error')}", styles["Normal"])
@@ -167,7 +171,7 @@ def _cost_section(styles, manufacturing_process: str, quantity: int, process_is_
 
 def _carbon_section(styles) -> list:
     flowables = [Paragraph("Carbon Estimate", styles["SectionHeading"])]
-    result = adapter.estimate_carbon()
+    result = mcp_server.adapter.estimate_carbon()
     if not result.get("found"):
         flowables.append(
             Paragraph(f"Carbon estimate unavailable: {result.get('message', 'unknown error')}", styles["Normal"])
@@ -187,7 +191,7 @@ def _carbon_section(styles) -> list:
 
 def _dfm_section(styles) -> list:
     flowables = [Paragraph("DFM Check Results", styles["SectionHeading"])]
-    findings = adapter.run_dfm_check()
+    findings = mcp_server.adapter.run_dfm_check()
 
     rows = [["Check", "Status", "Feature", "Message"]]
     for finding in findings:
@@ -252,7 +256,7 @@ def _assembly_bom_section(
     )
     flowables.append(Paragraph(assumption_note, styles["Note"]))
 
-    bom_result = adapter.get_assembly_bom(manufacturing_process, quantity)
+    bom_result = mcp_server.adapter.get_assembly_bom(manufacturing_process, quantity)
 
     rows = [["Part", "Config", "Make/Buy", "Material", "Qty", "Unit Cost", "Total Cost"]]
     for row in bom_result["bom"]:
@@ -332,8 +336,8 @@ def _generate_assembly_report(
     process_is_default: bool,
     quantity_is_default: bool,
 ) -> str:
-    part_info = adapter.get_current_part_info()
-    screenshot_path = adapter.capture_screenshot()
+    part_info = mcp_server.adapter.get_current_part_info()
+    screenshot_path = mcp_server.adapter.capture_screenshot()
 
     styles = _styles()
     doc = SimpleDocTemplate(
@@ -398,7 +402,7 @@ def generate_manufacturing_report(
     manufacturing_process = manufacturing_process or _DEFAULT_MANUFACTURING_PROCESS
     quantity = quantity or _DEFAULT_QUANTITY
 
-    if adapter.is_assembly():
+    if mcp_server.adapter.is_assembly():
         # Assembly documents don't have a single mass/material/feature
         # tree the way a part does -- get_mass()/get_material()/
         # get_features() either raise or aren't meaningful at the
@@ -410,11 +414,11 @@ def generate_manufacturing_report(
             output_path, manufacturing_process, quantity, process_is_default, quantity_is_default
         )
 
-    part_info = adapter.get_current_part_info()
-    mass_kg = adapter.get_mass()
-    material = adapter.get_material()
-    features = adapter.get_features()
-    screenshot_path = adapter.capture_screenshot()
+    part_info = mcp_server.adapter.get_current_part_info()
+    mass_kg = mcp_server.adapter.get_mass()
+    material = mcp_server.adapter.get_material()
+    features = mcp_server.adapter.get_features()
+    screenshot_path = mcp_server.adapter.capture_screenshot()
 
     styles = _styles()
     doc = SimpleDocTemplate(

@@ -33,16 +33,18 @@ _DEFAULT_MACHINE_TYPE = "CNC_3axis"
 _DEFAULT_SUPPLIER = "Supplier_A"
 
 
-def _build_adapter() -> CadAdapter:
-    """Construct the CadAdapter to use, based on the CAD_ADAPTER env var.
+def _build_adapter(backend: str | None = None) -> CadAdapter:
+    """Construct the CadAdapter to use.
 
-    Defaults to SolidWorksAdapter, targeting a running SolidWorks instance.
-    Set CAD_ADAPTER=mock to use MockAdapter instead — synthetic aluminum
-    bracket data, no CAD software required. This is the only place that
-    needs to change to swap CAD platforms; every tool below is written
-    purely against the CadAdapter interface.
+    `backend` defaults to the CAD_ADAPTER env var (itself defaulting to
+    "solidworks") when not given explicitly -- explicit callers (see
+    set_backend() below) can pick a platform at runtime without touching
+    the environment first. Set CAD_ADAPTER=mock to use MockAdapter instead
+    — synthetic aluminum bracket data, no CAD software required. Every tool
+    below is written purely against the CadAdapter interface, so adding a
+    platform only ever means adding a branch here.
     """
-    backend = os.environ.get("CAD_ADAPTER", "solidworks").lower()
+    backend = (backend or os.environ.get("CAD_ADAPTER", "solidworks")).lower()
     if backend == "mock":
         return MockAdapter()
     if backend == "mock_assembly":
@@ -51,6 +53,10 @@ def _build_adapter() -> CadAdapter:
         # rollup feature be demoed and tested without a real SolidWorks
         # assembly open.
         return MockAdapter(simulate_assembly=True)
+    if backend in ("fusion360", "fusion"):
+        from cad_adapters.fusion_adapter import FusionAdapter
+
+        return FusionAdapter()
 
     from cad_adapters.solidworks_adapter import SolidWorksAdapter
 
@@ -65,6 +71,26 @@ def _build_adapter() -> CadAdapter:
 # individual tool invocation — a bad connection then surfaces as one failed
 # tool call with a clear message, not a dead server.
 adapter = _build_adapter()
+
+
+def set_backend(backend: str) -> CadAdapter:
+    """Switch the live CAD backend for this process, in place.
+
+    Rebuilds and reassigns the module-level `adapter` singleton that every
+    tool function below reads as a global (so an in-process caller like
+    desktop_app.py, which imports this whole module to drive the BOM/report
+    buttons directly, sees the new adapter immediately) AND sets
+    CAD_ADAPTER in os.environ (so any *new* mcp_server.py subprocess spawned
+    afterwards -- ai_orchestrator.run_ai_orchestrator() spawns a fresh one
+    per call, reading CAD_ADAPTER at that moment -- picks up the same
+    backend). This is the one place both code paths' notion of "current CAD
+    platform" gets updated together, so chat answers and the BOM/report
+    buttons can never drift onto different platforms mid-session.
+    """
+    global adapter
+    adapter = _build_adapter(backend)
+    os.environ["CAD_ADAPTER"] = backend
+    return adapter
 
 mcp = MCPServer(
     name="cad-copilot",

@@ -157,6 +157,20 @@ class FusionAdapter(CadAdapter):
         self._request("/ping")
         return True
 
+    @staticmethod
+    def is_running(base_url: str = BRIDGE_BASE_URL, timeout: float = 1.5) -> bool:
+        """Quick check for whether the bridge Add-In is reachable, with a
+        short timeout so a background "is it running" detection check
+        doesn't stall the UI waiting out the full default 3s request
+        timeout when Fusion (or the Add-In) simply isn't up. Never raises
+        -- callers only care True/False.
+        """
+        try:
+            FusionAdapter(base_url)._request("/ping", timeout=timeout)
+            return True
+        except FusionBridgeConnectionError:
+            return False
+
     def get_current_part_info(self) -> PartInfo:
         """Fetch basic info about Fusion's currently active document via
         the bridge's /part_info endpoint.
