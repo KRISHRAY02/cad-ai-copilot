@@ -25,8 +25,14 @@ _REQUIRED_COLUMNS = {
     "material_name",
     "cost_per_kg",
     "carbon_factor_kg_co2_per_kg",
-    "density_kg_m3",
 }
+# Present in materials.csv (extracted from SolidWorks' own .sldmat
+# density values); absent from materials_fusion.csv, since Fusion
+# already returns each material's real density live from its own API
+# (see FusionAdapter.get_material()) rather than needing it from a
+# spreadsheet. Optional, not required -- missing means every row's
+# density_kg_m3 is None, same as a blank cell would be.
+_OPTIONAL_DENSITY_COLUMN = "density_kg_m3"
 _FUZZY_MATCH_CUTOFF = 0.75
 
 
@@ -51,18 +57,20 @@ def _to_float_or_none(value: str):
 def load_materials(csv_path: Path | str = _DEFAULT_CSV_PATH) -> dict:
     """Read a materials CSV into a dict keyed by normalized material name.
 
-    Works against either materials.csv (SolidWorks) or
-    materials_fusion.csv (Fusion) -- the only difference between them is
-    which platform's material names/values are in it; both share the
-    same 4 required columns.
+    Works against either materials.csv (SolidWorks, has a density_kg_m3
+    column) or materials_fusion.csv (Fusion, no density column -- Fusion
+    reads real density live from its own API instead). Both share the
+    same 3 required columns; density_kg_m3 is read if present, else
+    every entry's density_kg_m3 is None.
 
     Each value is a dict with the CSV's canonical (un-normalized)
     material_name plus cost_per_kg, carbon_factor_kg_co2_per_kg, and
-    density_kg_m3 as floats (or None for blank cells). If the CSV has
-    exactly one extra column beyond the 4 required ones (e.g. Fusion's
-    material library's "Family/Basis" notes column), its value is kept
-    under "notes" -- not used for matching, only carried through so
-    get_material_cost_and_carbon() can surface it as "cost_basis".
+    density_kg_m3 as floats (or None for blank cells/a missing column).
+    If the CSV has exactly one extra column beyond the required ones and
+    density_kg_m3 (e.g. Fusion's material library's "Family/Basis" notes
+    column), its value is kept under "notes" -- not used for matching,
+    only carried through so get_material_cost_and_carbon() can surface
+    it as "cost_basis".
 
     Raises FileNotFoundError with a message telling the user how to fix
     it, rather than a bare traceback, since this is meant to fail loudly
@@ -73,7 +81,7 @@ def load_materials(csv_path: Path | str = _DEFAULT_CSV_PATH) -> dict:
         raise FileNotFoundError(
             f"{csv_path.name} not found at {csv_path}. Create it with these "
             f"exact columns: material_name, cost_per_kg, "
-            f"carbon_factor_kg_co2_per_kg, density_kg_m3 (see "
+            f"carbon_factor_kg_co2_per_kg (density_kg_m3 optional; see "
             f"extract_materials_library.py to generate one from SolidWorks)."
         )
 
@@ -86,7 +94,11 @@ def load_materials(csv_path: Path | str = _DEFAULT_CSV_PATH) -> dict:
                 f"{', '.join(sorted(_REQUIRED_COLUMNS))}. Found: "
                 f"{', '.join(fieldnames)}."
             )
-        extra_columns = [c for c in fieldnames if c not in _REQUIRED_COLUMNS]
+        has_density_column = _OPTIONAL_DENSITY_COLUMN in fieldnames
+        known_columns = _REQUIRED_COLUMNS | (
+            {_OPTIONAL_DENSITY_COLUMN} if has_density_column else set()
+        )
+        extra_columns = [c for c in fieldnames if c not in known_columns]
         notes_column = extra_columns[0] if len(extra_columns) == 1 else None
 
         materials = {}
@@ -100,7 +112,11 @@ def load_materials(csv_path: Path | str = _DEFAULT_CSV_PATH) -> dict:
                 "carbon_factor_kg_co2_per_kg": _to_float_or_none(
                     row["carbon_factor_kg_co2_per_kg"]
                 ),
-                "density_kg_m3": _to_float_or_none(row["density_kg_m3"]),
+                "density_kg_m3": (
+                    _to_float_or_none(row[_OPTIONAL_DENSITY_COLUMN])
+                    if has_density_column
+                    else None
+                ),
             }
             if notes_column is not None:
                 entry["notes"] = (row.get(notes_column) or "").strip() or None

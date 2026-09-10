@@ -1,0 +1,184 @@
+material_name,cost_per_kg,carbon_factor_kg_co2_per_kg,notes
+Aluminum,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 1100-H14,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 1100-H18,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 1100-O,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 2014-T4,480,9.5,"Aluminum (aerospace/high-strength grades, e.g. 2014, 7075, 7175, A356 cast)"
+Aluminum 2014-T6,480,9.5,"Aluminum (aerospace/high-strength grades, e.g. 2014, 7075, 7175, A356 cast)"
+Aluminum 3003-H12,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 3003-H14,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 3003-H16,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 3003-O,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 3004-H32,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 3004-H34,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 3004-H38,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 3004-O,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 3105-H12,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 3105-H14,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 3105-H16,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 3105-H18,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 3105-O,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 5005,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 5005-H12,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 5005-H14,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 5005-H16,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 5005-H18,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 5005-H38,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 5005-O,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 5052,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 5052 H32,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 5052 H34,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 5052-H36,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 5052-H38,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 5052-O,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 5083 87 Cold Formed,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 6061,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 6061 T6 0 Cold Formed,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 6061 T6 80 Hot Formed,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+"Aluminum 6061, Welded",300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 6061-AHC,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 6061-O,300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Aluminum 7075,480,9.5,"Aluminum (aerospace/high-strength grades, e.g. 2014, 7075, 7175, A356 cast)"
+Aluminum 7175 T73 0 Hot Formed,480,9.5,"Aluminum (aerospace/high-strength grades, e.g. 2014, 7075, 7175, A356 cast)"
+Aluminum A356 T6,480,9.5,"Aluminum (aerospace/high-strength grades, e.g. 2014, 7075, 7175, A356 cast)"
+"Aluminum, Anodized Blue",300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+"Aluminum, Anodized Red",300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+"Aluminum, Anodized Silver",300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Brass,520,3.8,Brass (copper-zinc alloy)
+"Brass, Soft Yellow",520,3.8,Brass (copper-zinc alloy)
+"Brass, Soft Yellow, Welded",520,3.8,Brass (copper-zinc alloy)
+Bronze,560,4,Bronze (copper-tin alloy)
+"Bronze, Architectural",560,4,Bronze (copper-tin alloy)
+"Bronze, Cast",560,4,Bronze (copper-tin alloy)
+"Bronze, Soft Tin",560,4,Bronze (copper-tin alloy)
+Copper,850,3.3,Copper (wrought/cast/alloy)
+"Copper, Alloy",850,3.3,Copper (wrought/cast/alloy)
+"Copper, Cast",850,3.3,Copper (wrought/cast/alloy)
+"Copper, Patina",850,3.3,Copper (wrought/cast/alloy)
+"Copper, Wrought",850,3.3,Copper (wrought/cast/alloy)
+Gold,11500000,15000,Gold (precious metal — rarely used structurally; placeholder)
+Inconel 718 Plus,3200,13,Nickel-based alloys / Inconel superalloys
+"Iron, Cast",60,1.7,Cast/Wrought/Ductile/Malleable/Gray Iron
+"Iron, Ductile",60,1.7,Cast/Wrought/Ductile/Malleable/Gray Iron
+"Iron, Gray",60,1.7,Cast/Wrought/Ductile/Malleable/Gray Iron
+"Iron, Gray Cast ASTM A48 Grade 20",60,1.7,Cast/Wrought/Ductile/Malleable/Gray Iron
+"Iron, Gray Cast ASTM A48 Grade 25",60,1.7,Cast/Wrought/Ductile/Malleable/Gray Iron
+"Iron, Gray Cast ASTM A48 Grade 30",60,1.7,Cast/Wrought/Ductile/Malleable/Gray Iron
+"Iron, Gray Cast ASTM A48 Grade 35",60,1.7,Cast/Wrought/Ductile/Malleable/Gray Iron
+"Iron, Gray Cast ASTM A48 Grade 40",60,1.7,Cast/Wrought/Ductile/Malleable/Gray Iron
+"Iron, Gray Cast ASTM A48 Grade 50",60,1.7,Cast/Wrought/Ductile/Malleable/Gray Iron
+"Iron, Gray Cast ASTM A48 Grade 60",60,1.7,Cast/Wrought/Ductile/Malleable/Gray Iron
+"Iron, Malleable",60,1.7,Cast/Wrought/Ductile/Malleable/Gray Iron
+"Iron, Wrought",60,1.7,Cast/Wrought/Ductile/Malleable/Gray Iron
+Lead,220,1.8,Lead
+Magnesium,480,36,Magnesium alloys
+Magnesium AZ63A,480,36,Magnesium alloys
+Magnesium AZ91E T6,480,36,Magnesium alloys
+Nickel-Copper Alloy 400,850,3.3,Copper (wrought/cast/alloy)
+Palladium,4000000,35000,Palladium (precious metal — rarely used structurally; placeholder)
+Platinum,2400,8,Tin / tin-based solder alloys
+Silver,125000,1500,Silver (precious metal — rarely used structurally; placeholder)
+Stainless Steel,300,5,"Stainless Steel (austenitic/ferritic general, e.g. 304, 316, 302)"
+Stainless Steel 17-4 PH,550,5.5,"Stainless Steel (precipitation-hardening/tool-grade, e.g. 17-4PH, 440C)"
+Stainless Steel AISI 202,300,5,"Stainless Steel (austenitic/ferritic general, e.g. 304, 316, 302)"
+Stainless Steel 316L,300,5,"Stainless Steel (austenitic/ferritic general, e.g. 304, 316, 302)"
+Stainless Steel AISI 302,300,5,"Stainless Steel (austenitic/ferritic general, e.g. 304, 316, 302)"
+Stainless Steel AISI 304,300,5,"Stainless Steel (austenitic/ferritic general, e.g. 304, 316, 302)"
+Stainless Steel AISI 309,300,5,"Stainless Steel (austenitic/ferritic general, e.g. 304, 316, 302)"
+Stainless Steel AISI 310,300,5,"Stainless Steel (austenitic/ferritic general, e.g. 304, 316, 302)"
+Stainless Steel AISI 317,300,5,"Stainless Steel (austenitic/ferritic general, e.g. 304, 316, 302)"
+Stainless Steel AISI 405,300,5,"Stainless Steel (austenitic/ferritic general, e.g. 304, 316, 302)"
+Stainless Steel AISI 430,300,5,"Stainless Steel (austenitic/ferritic general, e.g. 304, 316, 302)"
+"Stainless Steel AISI 440C, Welded",550,5.5,"Stainless Steel (precipitation-hardening/tool-grade, e.g. 17-4PH, 440C)"
+Stainless Steel AISI 446,550,5.5,"Stainless Steel (precipitation-hardening/tool-grade, e.g. 17-4PH, 440C)"
+"Stainless Steel, 440C",550,5.5,"Stainless Steel (precipitation-hardening/tool-grade, e.g. 17-4PH, 440C)"
+"Stainless Steel, Austenitic",300,5,"Stainless Steel (austenitic/ferritic general, e.g. 304, 316, 302)"
+"Stainless Steel, Brushed",300,5,"Stainless Steel (austenitic/ferritic general, e.g. 304, 316, 302)"
+"Stainless Steel, Polished",300,5,"Stainless Steel (austenitic/ferritic general, e.g. 304, 316, 302)"
+Steel,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1006 85 HR,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1006 85B HR,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1008 91 HR,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1015,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1015 80 NORM,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1018 106 HR,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1018 118 QT,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1018 209 QT,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1020 107 HR,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1020 108 ANLD,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1022,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1030 128 HR,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1030 128A HR,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1045 225 ANLD,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1045 390 QT,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1045 450 QT,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1045 500 QT,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1045 595 QT,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1045 705 QT,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1045 HV HR,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1050,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1051,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1052,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1053,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1054,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1055,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1056,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1057,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1058,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1059,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1060,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1061,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1080 371 QT,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1080 410 QT,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1080 421 AUST,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel AISI 1522 289 HR,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 1522 304 HR,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 1541 362 QT,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 1561 234 HR,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 4130 259 QT,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 4130 366 QT,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 4142 380 QT,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 4142 380 QT,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 4142 450 QT,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 4142 450A QT,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 4142 475 QT,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 4142 475A QT,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 4142 560 QT,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 4142 670 QT,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 4340 242 HR,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 4340 350A QT,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 4340 350B QT,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 4340 350C QT,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 4340 409 QT,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 5160 434 QT,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 5210 517 H,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 8630 254 NORM,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 8640 361 QT,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 9262 260 NORM,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel AISI 9262 271 QT,130,2.3,"Alloy Steel (e.g. 4140, 4340, 8630, 9262, quenched & tempered grades)"
+Steel ASTM A242,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel ASTM A36,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel ASTM A53,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel ASTM A572,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Steel ASTM A913,75,2,Carbon/Mild Steel (general structural/bar stock grades)
+"Steel, Alloy",75,2,Carbon/Mild Steel (general structural/bar stock grades)
+"Steel, Carbon",75,2,Carbon/Mild Steel (general structural/bar stock grades)
+"Steel, Cast",75,2,Carbon/Mild Steel (general structural/bar stock grades)
+"Steel, Chrome Plated",75,2,Carbon/Mild Steel (general structural/bar stock grades)
+"Steel, Galvanized",75,2,Carbon/Mild Steel (general structural/bar stock grades)
+"Steel, High Strength, Low Alloy",75,2,Carbon/Mild Steel (general structural/bar stock grades)
+"Steel, MAN-TEN",75,2,Carbon/Mild Steel (general structural/bar stock grades)
+"Steel, Mild",75,2,Carbon/Mild Steel (general structural/bar stock grades)
+"Steel, Mild, Welded",75,2,Carbon/Mild Steel (general structural/bar stock grades)
+"Steel, Non-Alloy",75,2,Carbon/Mild Steel (general structural/bar stock grades)
+"Steel, Paint Finish, Blue",75,2,Carbon/Mild Steel (general structural/bar stock grades)
+"Steel, Paint Finish, Blue",75,2,Carbon/Mild Steel (general structural/bar stock grades)
+"Steel, Paint Finish, Dark Gray",75,2,Carbon/Mild Steel (general structural/bar stock grades)
+"Steel, Paint Finish, Red",75,2,Carbon/Mild Steel (general structural/bar stock grades)
+"Steel, RQC100",75,2,Carbon/Mild Steel (general structural/bar stock grades)
+"Steel, Wrought",75,2,Carbon/Mild Steel (general structural/bar stock grades)
+Tin (Sn),2400,8,Tin / tin-based solder alloys
+Tin-Aluminium-Copper (Sn-Ag-Cu),300,8.24,"Aluminum (general wrought grades, 1xxx/3xxx/5xxx/6xxx series, incl. anodized)"
+Titanium,4200,38,Titanium (commercially pure / Ti-6Al-4V)
+Titanium 6Al-4V,4200,38,Titanium (commercially pure / Ti-6Al-4V)
+Zinc,260,4.6,Zinc
