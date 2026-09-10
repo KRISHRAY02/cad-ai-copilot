@@ -21,7 +21,8 @@ from mcp.types import CallToolResult
 from ollama import AsyncClient
 
 DEFAULT_MODEL = "qwen2.5:7b-instruct"
-MAX_TOOL_CALL_ROUNDS = 5
+MAX_TOOL_CALL_ROUNDS = 8
+_MAX_EMPTY_RESPONSE_RETRIES = 3
 
 
 class OllamaUnavailableError(RuntimeError):
@@ -31,13 +32,78 @@ class OllamaUnavailableError(RuntimeError):
 class McpServerUnavailableError(RuntimeError):
     """Raised when the mcp_server.py subprocess can't be started or reached."""
 
+
+def _format_list_assembly_components_answer(tool_result_json: str) -> str | None:
+    """Turn list_assembly_components' JSON straight into a plain-language
+    answer, without asking the LLM to re-express it.
+
+    Why this exists: observed live with qwen2.5:7b-instruct that the model
+    reliably picks the right tool for this question, but then either loops
+    re-requesting a cost tool nobody asked for, returns a genuinely empty
+    response, or -- worst -- hallucinates a fabricated answer unrelated to
+    the real tool data (fake part names, fake report paths) instead of
+    just reading the JSON that's already in its context. Since this tool's
+    output is already exactly the shape a "list the components" answer
+    needs, formatting it in plain Python is strictly more reliable than
+    routing it back through a 7B model for restating.
+
+    Returns None (caller falls through to the normal LLM path) if the
+    JSON doesn't parse or found=False, so the "not an assembly" case still
+    gets a model-composed answer from its message field.
+    """
+    try:
+        data = json.loads(tool_result_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict) or not data.get("found"):
+        return None
+
+    components = data.get("components", [])
+    lines = [
+        f"This assembly has {data.get('unique_part_count', len(components))} "
+        f"unique component(s), {data.get('total_instance_count', '?')} "
+        "total instance(s):",
+        "",
+    ]
+    for c in components:
+        material = c.get("material") or {}
+        material_name = material.get("name", "unknown") if isinstance(material, dict) else material
+        mass = c.get("mass_kg")
+        mass_str = f"{mass:.3f} kg each" if isinstance(mass, (int, float)) else "mass unknown"
+        lines.append(
+            f"- {c.get('part_name', 'unnamed')}: quantity {c.get('quantity', '?')}, "
+            f"{mass_str}, material {material_name}"
+        )
+    return "\n".join(lines)
+
+
+# Tool name -> formatter, for tools whose output is reliable to render
+# directly rather than routing back through the LLM. See
+# _format_list_assembly_components_answer's docstring for why this exists.
+_DETERMINISTIC_ANSWER_FORMATTERS = {
+    "list_assembly_components": _format_list_assembly_components_answer,
+}
+
+
+def _format_deterministic_answer(tool_name: str, tool_result_json: str) -> str | None:
+    formatter = _DETERMINISTIC_ANSWER_FORMATTERS.get(tool_name)
+    if formatter is None:
+        return None
+    return formatter(tool_result_json)
+
 SYSTEM_PROMPT = (
     "You are a CAD design copilot. You answer questions about the CAD "
     "model that is currently open, using the tools provided. Always call "
     "a tool to fetch part data rather than guessing or relying on prior "
     "conversation turns for numbers. Keep answers concise, cite units, "
     "and mention when an estimate (cost, carbon, DFM) is a rough "
-    "approximation rather than an authoritative figure."
+    "approximation rather than an authoritative figure. "
+    "Only call the tools needed to answer exactly what was asked -- do "
+    "NOT follow up a successful tool call with a cost/pricing/BOM tool "
+    "'to be thorough' unless the user's question actually asked about "
+    "cost, price, or manufacturing process. Once a tool has given you "
+    "enough information to answer the question, stop calling tools and "
+    "answer directly."
 )
 
 
@@ -111,18 +177,22 @@ class AiOrchestrator:
         await self._exit_stack.aclose()
         self._session = None
 
-    async def ask(self, question: str) -> str:
-        """Answer a natural-language question, calling MCP tools as needed.
+    async def _chat_retrying_empty(self):
+        """Call Ollama's chat endpoint, retrying if the model comes back
+        with neither text nor a tool call.
 
-        Appends to the running conversation history so follow-up questions
-        retain context.
+        Observed live with qwen2.5:7b-instruct: occasionally the response
+        has done_reason='stop' and a nonzero eval_count (so it genuinely
+        generated tokens), but both message.content and message.tool_calls
+        are empty -- the model's output apparently failed to parse into
+        either shape and was silently dropped, with nothing recoverable
+        from the response object. Retrying the identical request (same
+        history, nothing appended in between) is NOT deterministic and
+        often succeeds on the next attempt, so this just re-rolls instead
+        of surfacing a blank answer to the user.
         """
-        if self._session is None:
-            raise RuntimeError("AiOrchestrator.start() must be called before ask().")
-
-        self._history.append({"role": "user", "content": question})
-
-        for _ in range(MAX_TOOL_CALL_ROUNDS):
+        last_message = None
+        for _ in range(_MAX_EMPTY_RESPONSE_RETRIES):
             try:
                 response = await self._ollama.chat(
                     model=self._model,
@@ -137,15 +207,69 @@ class AiOrchestrator:
                     "Could not reach Ollama. Make sure it's running locally "
                     "(`ollama serve`) and try again."
                 ) from e
-            message = response.message
+            last_message = response.message
+            if last_message.tool_calls or last_message.content:
+                return last_message
+        return last_message
+
+    async def ask(self, question: str) -> str:
+        """Answer a natural-language question, calling MCP tools as needed.
+
+        Appends to the running conversation history so follow-up questions
+        retain context.
+        """
+        if self._session is None:
+            raise RuntimeError("AiOrchestrator.start() must be called before ask().")
+
+        self._history.append({"role": "user", "content": question})
+
+        # (tool_name, sorted-args-json) signatures already executed in this
+        # ask() call -- see _execute_tool_call_deduped's docstring for why
+        # this exists: qwen2.5:7b-instruct was observed live re-issuing the
+        # exact same tool call (same name, same arguments) round after
+        # round instead of ever producing a final answer, burning the whole
+        # MAX_TOOL_CALL_ROUNDS budget on repeats of a call whose result it
+        # already has.
+        called_signatures: set[tuple[str, str]] = set()
+
+        for _ in range(MAX_TOOL_CALL_ROUNDS):
+            message = await self._chat_retrying_empty()
             self._history.append(message.model_dump(exclude_none=True))
 
-            if not message.tool_calls:
-                return message.content or ""
+            tool_calls = message.tool_calls
+            if not tool_calls:
+                leaked = self._parse_leaked_tool_call(message.content)
+                if leaked is None:
+                    return message.content or (
+                        "The model didn't return a readable answer for that "
+                        "question. Try rephrasing it."
+                    )
+                # qwen2.5:7b-instruct occasionally emits a tool call as
+                # plain JSON text in `content` instead of Ollama's
+                # structured `tool_calls` field (observed live: after a
+                # tool result it wants to follow up with, e.g.
+                # get_assembly_bom, but fails to format it as a real
+                # tool_calls entry) -- without this, that leaked JSON is
+                # mistaken for the final answer and shown to the user
+                # verbatim (or as a blank bubble, if content was empty
+                # instead). Treat it as the tool call it clearly meant to
+                # be, rather than surfacing raw JSON as if it were a reply.
+                name, arguments = leaked
+                tool_result = await self._execute_tool_call_deduped(
+                    name, arguments, called_signatures
+                )
+                self._history.append(
+                    {"role": "tool", "tool_name": name, "content": tool_result}
+                )
+                deterministic = _format_deterministic_answer(name, tool_result)
+                if deterministic is not None:
+                    self._history.append({"role": "assistant", "content": deterministic})
+                    return deterministic
+                continue
 
-            for tool_call in message.tool_calls:
-                tool_result = await self._call_mcp_tool(
-                    tool_call.function.name, tool_call.function.arguments
+            for tool_call in tool_calls:
+                tool_result = await self._execute_tool_call_deduped(
+                    tool_call.function.name, tool_call.function.arguments, called_signatures
                 )
                 self._history.append(
                     {
@@ -154,11 +278,44 @@ class AiOrchestrator:
                         "content": tool_result,
                     }
                 )
+                deterministic = _format_deterministic_answer(
+                    tool_call.function.name, tool_result
+                )
+                if deterministic is not None:
+                    self._history.append({"role": "assistant", "content": deterministic})
+                    return deterministic
 
         return (
             "I wasn't able to reach a final answer after several tool calls. "
             "Try rephrasing the question."
         )
+
+    async def _execute_tool_call_deduped(
+        self, name: str, arguments: dict, called_signatures: set[tuple[str, str]]
+    ) -> str:
+        """Run an MCP tool call, unless this exact (name, arguments) pair
+        was already executed earlier in this same ask() turn.
+
+        Observed live: after a tool already answered the question, the
+        model sometimes re-requests the identical call (or a different
+        tool it doesn't need) repeatedly instead of stopping, exhausting
+        MAX_TOOL_CALL_ROUNDS without ever producing text. A duplicate call
+        can never return different data (nothing about the CAD document
+        changed between rounds), so re-running it is pure waste; refusing
+        it and telling the model so directly is a stronger, non-optional
+        nudge than the system prompt's "stop calling tools" instruction,
+        which the model doesn't reliably follow on its own.
+        """
+        signature = (name, json.dumps(arguments, sort_keys=True))
+        if signature in called_signatures:
+            return (
+                "You already called this exact tool with these exact "
+                "arguments earlier in this conversation -- its result is "
+                "unchanged and is already above. Do not call it again. "
+                "Answer the user's question now using that result."
+            )
+        called_signatures.add(signature)
+        return await self._call_mcp_tool(name, arguments)
 
     async def _call_mcp_tool(self, name: str, arguments: dict) -> str:
         """Invoke an MCP tool and flatten its result to a string for the LLM.
@@ -179,6 +336,30 @@ class AiOrchestrator:
         return "\n".join(
             block.text for block in result.content if hasattr(block, "text")
         )
+
+    def _parse_leaked_tool_call(self, content: str | None) -> tuple[str, dict] | None:
+        """If `content` is actually a tool call the model failed to put in
+        the structured `tool_calls` field, return (name, arguments);
+        otherwise None. Only matches a name from `self._tools_schema`, so
+        an ordinary text answer that happens to look JSON-ish is never
+        misread as a tool call.
+        """
+        if not content:
+            return None
+        try:
+            parsed = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        name = parsed.get("name")
+        arguments = parsed.get("arguments", {})
+        if not isinstance(name, str) or not isinstance(arguments, dict):
+            return None
+        known_names = {t["function"]["name"] for t in self._tools_schema}
+        if name not in known_names:
+            return None
+        return name, arguments
 
     @staticmethod
     def _to_ollama_tool(tool) -> dict:

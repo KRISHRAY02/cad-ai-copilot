@@ -544,6 +544,46 @@ def highlight_cost_driver(manufacturing_process: str | None = None, quantity: in
 
 
 @mcp.tool()
+def list_assembly_components() -> dict:
+    """List the CURRENTLY OPEN ASSEMBLY's unique components and their
+    quantities -- part name, quantity, mass, material, and where it sits
+    in the tree, with NO cost/manufacturing-process involved.
+
+    Use this for purely structural/quantity questions like "list the
+    components in this assembly", "how many unique parts are there",
+    "what quantity of [part] does this assembly use", or "what's this
+    assembly made of" -- anything that doesn't ask about cost. Do NOT ask
+    the user for a manufacturing process to answer this kind of question;
+    only get_assembly_bom/get_assembly_cost_drivers/export_bom (which
+    compute Make-part production cost) need one.
+
+    This tool's result is COMPLETE on its own for these questions -- do
+    NOT follow it up by calling get_assembly_bom, get_assembly_cost_drivers,
+    or any other tool "to be thorough". If the user didn't ask about cost,
+    answer directly from this tool's output and stop.
+
+    Returns found=False if the currently open document isn't an assembly
+    (call get_current_part_info() first if you're not sure).
+    """
+    if not adapter.is_assembly():
+        return {
+            "found": False,
+            "message": (
+                "The currently open document is not an assembly. Open an "
+                "assembly to list its components."
+            ),
+        }
+
+    components = adapter.get_assembly_components()
+    return {
+        "found": True,
+        "unique_part_count": len(components),
+        "total_instance_count": sum(c.quantity for c in components),
+        "components": [dataclasses.asdict(c) for c in components],
+    }
+
+
+@mcp.tool()
 def get_assembly_bom(manufacturing_process: str | None = None, quantity: int = 1) -> dict:
     """Roll up the CURRENTLY OPEN ASSEMBLY into a structured Bill of
     Materials: one row per unique (part, configuration) combination found
@@ -556,11 +596,12 @@ def get_assembly_bom(manufacturing_process: str | None = None, quantity: int = 1
     and a list of any components with missing material/pricing data.
 
     Use this for questions like "what's the total cost/mass of this
-    assembly for a production run of N", "how many unique parts vs. total
-    parts does this assembly have", or "which parts are missing
+    assembly for a production run of N" or "which parts are missing
     material/pricing" -- this tool answers all of those directly from one
     call, rather than needing several get_mass/estimate_cost calls on
-    individual parts.
+    individual parts. For a plain list of components/quantities with NO
+    cost involved, use list_assembly_components() instead -- it needs no
+    manufacturing_process.
 
     `manufacturing_process` MUST be one of "CNC Machining", "Injection
     Molding", or "Sheet Metal" -- same as estimate_cost(), since it drives
