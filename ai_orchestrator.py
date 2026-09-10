@@ -77,11 +77,100 @@ def _format_list_assembly_components_answer(tool_result_json: str) -> str | None
     return "\n".join(lines)
 
 
+def _format_bom_rows(rows: list[dict]) -> list[str]:
+    lines = []
+    for row in rows:
+        mass = row.get("total_mass_kg")
+        mass_str = f"{mass:.3f} kg total" if isinstance(mass, (int, float)) else "mass unknown"
+        cost = row.get("total_cost_inr")
+        cost_str = f"Rs {cost:,.2f} total" if isinstance(cost, (int, float)) else "cost unknown"
+        lines.append(
+            f"- {row.get('part_name', 'unnamed')} x{row.get('quantity_per_assembly', '?')} "
+            f"({row.get('classification', '?')}): {mass_str}, {cost_str}"
+        )
+    return lines
+
+
+def _format_missing_data(missing_data: list[dict]) -> list[str]:
+    if not missing_data:
+        return []
+    lines = ["", "Missing data:"]
+    for item in missing_data:
+        lines.append(f"- {item.get('part_name', 'unnamed')}: {item.get('reason', 'unknown reason')}")
+    return lines
+
+
+def _format_get_assembly_bom_answer(tool_result_json: str) -> str | None:
+    """Turn get_assembly_bom's JSON straight into a plain-language answer,
+    without asking the LLM to re-express it.
+
+    Same rationale as _format_list_assembly_components_answer: observed
+    live with qwen2.5:7b-instruct that this tool's larger, nested JSON
+    (bom rows + totals + missing_data) is where the model reliably fails
+    to restate correctly -- looping on repeat calls until the dedup guard
+    fires, or fabricating entirely fictitious parts/costs instead of
+    reading the real data sitting in its context. Formatting it in plain
+    Python sidesteps that restating step entirely.
+    """
+    try:
+        data = json.loads(tool_result_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict) or not data.get("found"):
+        return None
+
+    totals = data.get("totals", {})
+    lines = [
+        f"Bill of Materials for {data.get('manufacturing_process', '?')}, "
+        f"quantity {data.get('quantity', '?')}:",
+        "",
+        *_format_bom_rows(data.get("bom", [])),
+        "",
+        f"Totals: {totals.get('unique_part_count', '?')} unique part(s), "
+        f"{totals.get('total_instance_count', '?')} total instance(s), "
+        f"{totals.get('total_assembly_mass_kg', '?')} kg, "
+        f"Rs {totals.get('total_assembly_cost_one_unit_inr', '?')} per assembly, "
+        f"Rs {totals.get('total_assembly_cost_for_quantity_inr', '?')} for "
+        f"{data.get('quantity', '?')} assemblies.",
+    ]
+    lines.extend(_format_missing_data(data.get("missing_data", [])))
+    return "\n".join(lines)
+
+
+def _format_get_assembly_cost_drivers_answer(tool_result_json: str) -> str | None:
+    """Same rationale/pattern as _format_get_assembly_bom_answer, for the
+    cost-drivers tool's near-identical JSON shape (rows under
+    "cost_drivers" instead of "bom", already pre-sorted highest-cost-first
+    by the tool itself)."""
+    try:
+        data = json.loads(tool_result_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict) or not data.get("found"):
+        return None
+
+    totals = data.get("totals", {})
+    lines = [
+        f"Cost drivers for {data.get('manufacturing_process', '?')}, "
+        f"quantity {data.get('quantity', '?')} (highest cost first):",
+        "",
+        *_format_bom_rows(data.get("cost_drivers", [])),
+        "",
+        f"Totals: Rs {totals.get('total_assembly_cost_one_unit_inr', '?')} per assembly, "
+        f"Rs {totals.get('total_assembly_cost_for_quantity_inr', '?')} for "
+        f"{data.get('quantity', '?')} assemblies.",
+    ]
+    lines.extend(_format_missing_data(data.get("missing_data", [])))
+    return "\n".join(lines)
+
+
 # Tool name -> formatter, for tools whose output is reliable to render
 # directly rather than routing back through the LLM. See
 # _format_list_assembly_components_answer's docstring for why this exists.
 _DETERMINISTIC_ANSWER_FORMATTERS = {
     "list_assembly_components": _format_list_assembly_components_answer,
+    "get_assembly_bom": _format_get_assembly_bom_answer,
+    "get_assembly_cost_drivers": _format_get_assembly_cost_drivers_answer,
 }
 
 
