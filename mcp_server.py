@@ -115,11 +115,17 @@ def get_current_part_info() -> dict:
 
 @mcp.tool()
 def get_mass() -> dict:
-    """Get the mass of the currently open part, in kilograms.
+    """Get the mass of the currently open document, in kilograms.
 
     Returns {"mass_kg": <float>}. Use this for any question about how
-    heavy, light, or massive the current part is, or as an input to
-    cost/weight calculations.
+    heavy, light, or massive the current part IS -- and also for the
+    TOTAL mass of the currently open assembly ("what's the mass of the
+    whole assembly") if one is open, since this returns the whole active
+    document's mass either way, with NO manufacturing process or cost
+    involved. Do NOT use get_assembly_bom for a pure mass question -- that
+    tool exists for cost, and will unnecessarily ask for a manufacturing
+    process it doesn't need just to report mass. Also usable as an input
+    to cost/weight calculations.
     """
     return {"mass_kg": adapter.get_mass()}
 
@@ -595,13 +601,16 @@ def get_assembly_bom(manufacturing_process: str | None = None, quantity: int = 1
     total mass, total cost for one assembly and for `quantity` assemblies)
     and a list of any components with missing material/pricing data.
 
-    Use this for questions like "what's the total cost/mass of this
-    assembly for a production run of N" or "which parts are missing
+    Use this for questions like "what's the total cost of this assembly
+    for a production run of N" or "which parts are missing
     material/pricing" -- this tool answers all of those directly from one
     call, rather than needing several get_mass/estimate_cost calls on
     individual parts. For a plain list of components/quantities with NO
     cost involved, use list_assembly_components() instead -- it needs no
-    manufacturing_process.
+    manufacturing_process. **For a pure mass question with no cost
+    involved ("what's the mass of the complete assembly"), use get_mass()
+    instead -- it returns the whole open document's total mass without
+    ever needing a manufacturing_process.**
 
     `manufacturing_process` MUST be one of "CNC Machining", "Injection
     Molding", or "Sheet Metal" -- same as estimate_cost(), since it drives
