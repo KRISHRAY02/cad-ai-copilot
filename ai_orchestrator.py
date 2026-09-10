@@ -164,6 +164,41 @@ def _format_get_assembly_cost_drivers_answer(tool_result_json: str) -> str | Non
     return "\n".join(lines)
 
 
+def _format_missing_manufacturing_process_answer(tool_result_json: str) -> str | None:
+    """Ask the user for a manufacturing process directly, in plain Python,
+    instead of leaving that decision to the LLM's next round.
+
+    Every cost-related tool (estimate_cost, get_assembly_bom,
+    get_assembly_cost_drivers, export_bom) returns this exact found=False
+    shape when called without a valid manufacturing_process, with a
+    message instructing the model to ask the user then retry. Observed
+    live: when the question didn't mention a process, the model
+    sometimes re-calls the same tool with the same (missing) argument
+    instead of asking -- which trips the dedup guard, and the model then
+    produces a garbled non-answer ("it seems the previous call already
+    provided the necessary information... could you specify which tool")
+    because it's being told to "answer using that result" when the
+    result was actually just an error asking for more input, not real
+    data. Short-circuiting this specific found=False shape into a clean
+    question is strictly more reliable than hoping the model asks
+    correctly on its own.
+    """
+    try:
+        data = json.loads(tool_result_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict) or data.get("found") is not False:
+        return None
+    message = data.get("message", "")
+    if "manufacturing_process must be one of" not in message:
+        return None
+    return (
+        "Which manufacturing process should I assume for this part/"
+        "assembly's cost estimate -- CNC Machining, Injection Molding, "
+        "or Sheet Metal?"
+    )
+
+
 # Tool name -> formatter, for tools whose output is reliable to render
 # directly rather than routing back through the LLM. See
 # _format_list_assembly_components_answer's docstring for why this exists.
@@ -175,6 +210,11 @@ _DETERMINISTIC_ANSWER_FORMATTERS = {
 
 
 def _format_deterministic_answer(tool_name: str, tool_result_json: str) -> str | None:
+    # Checked for every cost-capable tool regardless of name -- see
+    # _format_missing_manufacturing_process_answer's docstring.
+    missing_process = _format_missing_manufacturing_process_answer(tool_result_json)
+    if missing_process is not None:
+        return missing_process
     formatter = _DETERMINISTIC_ANSWER_FORMATTERS.get(tool_name)
     if formatter is None:
         return None
