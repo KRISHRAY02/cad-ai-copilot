@@ -20,7 +20,7 @@ from mcp.server.mcpserver import MCPServer
 from cad_adapters.base_adapter import CadAdapter
 from cad_adapters.mock_adapter import MockAdapter
 from cost_model.features import infer_material_type
-from materials_db import get_material_cost_and_carbon
+from materials_db import csv_path_for_platform, get_material_cost_and_carbon
 from production_cost import PROCESSES
 
 _MIN_FILLET_RADIUS_MM = 1.0
@@ -231,14 +231,15 @@ def estimate_cost(
             ),
         }
 
-    material_lookup = get_material_cost_and_carbon(material.name)
+    material_lookup = get_material_cost_and_carbon(material.name, platform=adapter.PLATFORM_ID)
     if not material_lookup["found"] or material_lookup["cost_per_kg"] is None:
         return {
             "found": False,
             "message": (
                 f"Material '{material.name}' cost_per_kg is unavailable in "
-                "materials.csv -- material cost (and therefore total cost) "
-                "cannot be estimated."
+                f"{csv_path_for_platform(adapter.PLATFORM_ID).name} -- "
+                "material cost (and therefore total cost) cannot be "
+                "estimated."
             ),
         }
 
@@ -283,6 +284,7 @@ def estimate_cost(
         "quantity": quantity,
         "material_used": material.name,
         "material_cost_per_kg_inr": material_lookup["cost_per_kg"],
+        "cost_basis": material_lookup.get("cost_basis"),
         "production_cost_breakdown": prediction["production_cost_breakdown"],
         "production_cost_assumptions": prediction["production_cost_assumptions"],
         "inputs_used": prediction["features_used"],

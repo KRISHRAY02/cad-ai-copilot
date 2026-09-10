@@ -88,6 +88,8 @@ class FusionAdapter(CadAdapter):
     necessary).
     """
 
+    PLATFORM_ID = "fusion360"  # routes cost/carbon lookups to materials_fusion.csv
+
     def __init__(self, base_url: str = BRIDGE_BASE_URL) -> None:
         self._base_url = base_url
 

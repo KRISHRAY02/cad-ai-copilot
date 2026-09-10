@@ -13,31 +13,43 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from hardware_db import classify_component, load_hardware
-from materials_db import get_material_cost_and_carbon, load_materials
+from materials_db import (
+    csv_path_for_platform,
+    get_material_cost_and_carbon,
+    load_materials,
+)
 from production_cost import PROCESSES, estimate_production_cost
 
-_materials_cache = None
-_materials_load_error = None
-_materials_loaded = False
+# platform -> loaded materials dict (or None if that platform's CSV
+# failed to load), cached lazily per platform so switching the active
+# adapter mid-process (see mcp_server.set_backend()) doesn't require a
+# restart to see the other platform's materials CSV.
+_materials_cache: dict[str, dict | None] = {}
+_materials_load_errors: dict[str, str] = {}
 
 
-def _get_materials():
-    """Lazily load and cache materials.csv (via materials_db.load_materials).
+def _get_materials(platform: str = "solidworks"):
+    """Lazily load and cache a platform's materials CSV (via
+    materials_db.load_materials()).
 
     Deferred until first use, same reasoning as why SolidWorksAdapter
-    doesn't connect() at import time: a missing/broken materials.csv
+    doesn't connect() at import time: a missing/broken materials CSV
     shouldn't prevent importing this module, only estimate_carbon()
     calls that actually need it.
     """
-    global _materials_cache, _materials_load_error, _materials_loaded
-    if not _materials_loaded:
+    if platform not in _materials_cache:
         try:
-            _materials_cache = load_materials()
+            _materials_cache[platform] = load_materials(csv_path_for_platform(platform))
         except (FileNotFoundError, ValueError) as e:
-            _materials_cache = None
-            _materials_load_error = str(e)
-        _materials_loaded = True
-    return _materials_cache
+            _materials_cache[platform] = None
+            _materials_load_errors[platform] = str(e)
+    return _materials_cache[platform]
+
+
+def _materials_unavailable_message(platform: str) -> str:
+    csv_name = csv_path_for_platform(platform).name
+    error = _materials_load_errors.get(platform)
+    return f"{csv_name} is unavailable" + (f" ({error})" if error else "")
 
 
 @dataclass
@@ -118,6 +130,14 @@ class CadAdapter(ABC):
     application can be extended to new CAD platforms without touching
     the AI/MCP/UI layers.
     """
+
+    # Identifies which materials CSV (see materials_db.py's
+    # _PLATFORM_CSV_PATHS) this adapter's cost/carbon methods below
+    # should read from. Defaults to "solidworks" (materials.csv) --
+    # FusionAdapter overrides this to "fusion360"; MockAdapter
+    # intentionally keeps the default since there's no separate mock
+    # materials file.
+    PLATFORM_ID: str = "solidworks"
 
     @abstractmethod
     def connect(self) -> bool:
@@ -320,7 +340,7 @@ class CadAdapter(ABC):
                 f"manufacturing_process must be one of {list(PROCESSES)}"
             )
 
-        materials = _get_materials()
+        materials = _get_materials(self.PLATFORM_ID)
         try:
             hardware = load_hardware()
         except (FileNotFoundError, ValueError):
@@ -359,10 +379,7 @@ class CadAdapter(ABC):
 
             else:  # "Make"
                 if materials is None:
-                    row_missing_reason = (
-                        "materials.csv is unavailable"
-                        + (f" ({_materials_load_error})" if _materials_load_error else "")
-                    )
+                    row_missing_reason = _materials_unavailable_message(self.PLATFORM_ID)
                 elif component.material is None:
                     row_missing_reason = (
                         f"Could not read material for '{component.part_name}' "
@@ -471,13 +488,12 @@ class CadAdapter(ABC):
         guessing if materials.csv is unavailable, the material isn't in
         it, or its carbon_factor cell is blank.
         """
-        materials = _get_materials()
+        materials = _get_materials(self.PLATFORM_ID)
         if materials is None:
             return {
                 "found": False,
                 "message": (
-                    "materials.csv is unavailable"
-                    + (f" ({_materials_load_error})" if _materials_load_error else "")
+                    _materials_unavailable_message(self.PLATFORM_ID)
                     + " -- carbon footprint cannot be estimated."
                 ),
             }
@@ -492,9 +508,10 @@ class CadAdapter(ABC):
             return {
                 "found": False,
                 "message": (
-                    f"'{lookup['matched_from']}' was matched in materials.csv "
-                    f"but its carbon_factor_kg_co2_per_kg cell is blank -- "
-                    f"please fill it in."
+                    f"'{lookup['matched_from']}' was matched in "
+                    f"{csv_path_for_platform(self.PLATFORM_ID).name} but its "
+                    f"carbon_factor_kg_co2_per_kg cell is blank -- please "
+                    f"fill it in."
                 ),
             }
 
@@ -507,11 +524,13 @@ class CadAdapter(ABC):
             "carbon_factor_kg_co2_per_kg": carbon_factor,
             "material_matched": lookup["matched_from"],
             "is_fuzzy_match": lookup["is_fuzzy_match"],
+            "cost_basis": lookup.get("cost_basis"),
             "assumptions": (
                 f"{carbon_factor} kg CO2e/kg for '{lookup['matched_from']}'"
                 + (" (fuzzy match)" if lookup["is_fuzzy_match"] else "")
                 + ", cradle-to-gate only (excludes machining energy and "
                 "transport)"
+                + (f". Basis: {lookup['cost_basis']}" if lookup.get("cost_basis") else "")
             ),
         }
 
@@ -554,16 +573,13 @@ class CadAdapter(ABC):
                 f"manufacturing_process must be one of {list(PROCESSES)}"
             )
 
-        materials = _get_materials()
+        materials = _get_materials(self.PLATFORM_ID)
         if materials is None:
             return [
                 {
                     "material_name_queried": name,
                     "found": False,
-                    "message": (
-                        "materials.csv is unavailable"
-                        + (f" ({_materials_load_error})" if _materials_load_error else "")
-                    ),
+                    "message": _materials_unavailable_message(self.PLATFORM_ID),
                 }
                 for name in material_names
             ]
