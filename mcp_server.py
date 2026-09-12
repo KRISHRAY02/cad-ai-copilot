@@ -169,6 +169,16 @@ def estimate_cost(
     cost and production cost computed directly from real data (see
     production_cost.py).
 
+    **This is a single-part tool only.** If the currently open document is
+    an assembly (check with is_assembly(), or just remember if you already
+    called get_assembly_bom() in this conversation), call
+    get_assembly_bom() or get_assembly_cost_drivers() instead -- an
+    assembly's root document has no solid bodies/material of its own, so
+    this tool will return found=False if called against one. This applies
+    to *any* follow-up question about the same assembly, including "what
+    if I used a different process/quantity" -- don't switch to this tool
+    for those just because the phrasing sounds like a single-part question.
+
     `manufacturing_process` MUST be one of "CNC Machining", "Injection
     Molding", or "Sheet Metal" -- it drives which production cost formula
     is used (machining time for CNC, cycle time + tooling amortization for
@@ -213,12 +223,45 @@ def estimate_cost(
             ),
         }
 
+    if adapter.is_assembly():
+        return {
+            "found": False,
+            "message": (
+                "The currently open document is an assembly, not a single "
+                "part -- estimate_cost() only reads geometry/material off "
+                "the root document and will fail (assemblies have no "
+                "solid bodies/material of their own; those live on the "
+                "sub-components). Call get_assembly_bom() or "
+                "get_assembly_cost_drivers() instead, with the same "
+                "manufacturing_process/quantity."
+            ),
+        }
+
     mass_kg = adapter.get_mass()
     material = adapter.get_material()
     mass_properties = adapter.get_mass_properties()
     face_count = adapter.get_face_count()
     bend_count = adapter.get_bend_count()
-    bounding_box_mm = adapter.get_bounding_box_mm()
+    try:
+        bounding_box_mm = adapter.get_bounding_box_mm()
+    except NotImplementedError:
+        # Only Sheet Metal's formula actually needs bounding box (see
+        # production_cost.estimate_production_cost's dispatch) -- adapters
+        # that haven't wired this up yet (e.g. FusionAdapter) shouldn't
+        # block CNC Machining/Injection Molding cost estimates over it. For
+        # Sheet Metal specifically, a silent (0.0, 0.0, 0.0) fallback would
+        # produce a wrong-but-plausible-looking zero cutting cost, so fail
+        # loudly there instead of guessing.
+        if manufacturing_process == "Sheet Metal":
+            return {
+                "found": False,
+                "message": (
+                    f"{type(adapter).__name__} does not implement "
+                    "get_bounding_box_mm() yet, which Sheet Metal cost "
+                    "estimation requires for cutting-length approximation."
+                ),
+            }
+        bounding_box_mm = (0.0, 0.0, 0.0)
 
     volume_m3 = mass_properties.get("volume_m3")
     surface_area_m2 = mass_properties.get("surface_area_m2")
