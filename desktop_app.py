@@ -564,7 +564,36 @@ def _card_container(children: list[ft.Control]) -> ft.Container:
     )
 
 
-def build_bom_totals_footer(totals: dict, manufacturing_process, quantity, missing_data: list[dict]) -> ft.Container:
+COLOR_WARNING_TEXT = "#B26A00"
+COLOR_WARNING_ICON = "#B26A00"
+
+
+def build_material_warning_icon(material_name) -> ft.Icon:
+    """Small warning triangle for a BOM row whose material_verified is
+    False -- see AssemblyComponent.material_verified's docstring
+    (base_adapter.py) for what this actually means: the material shown
+    isn't necessarily wrong, but the adapter can't confirm it was a real
+    designer assignment rather than the CAD platform's own untouched
+    default (diagnosed live for Fusion: a body that was never given a
+    material explicitly still resolves to Fusion's built-in "Steel").
+    Tooltip names the actual material so the warning is specific, not
+    just a generic "something's off" flag.
+    """
+    material_label = material_name if material_name else "this component"
+    return ft.Icon(
+        ft.Icons.WARNING_AMBER_ROUNDED,
+        size=15,
+        color=COLOR_WARNING_ICON,
+        tooltip=(
+            f"Material \"{material_label}\" could not be confirmed as a "
+            "deliberate assignment -- it may just be the CAD platform's "
+            "own default for a part nobody set a material on. Verify in "
+            "the CAD tool before relying on this for cost/carbon figures."
+        ),
+    )
+
+
+def build_bom_totals_footer(totals: dict, manufacturing_process, quantity, missing_data: list[dict], unverified_count: int) -> ft.Container:
     stats = ft.Row(
         [
             _stat("Unique parts", str(totals.get("unique_part_count", "?"))),
@@ -580,6 +609,22 @@ def build_bom_totals_footer(totals: dict, manufacturing_process, quantity, missi
         ft.Text(f"{manufacturing_process} · quantity {quantity}", size=11, color=COLOR_TIMESTAMP),
         stats,
     ]
+    if unverified_count:
+        footer_children.append(
+            ft.Row(
+                [
+                    ft.Icon(ft.Icons.WARNING_AMBER_ROUNDED, size=13, color=COLOR_WARNING_ICON),
+                    ft.Text(
+                        f"{unverified_count} component(s) have an unverified material "
+                        "(⚠ icon above) -- may be the CAD platform's untouched default, "
+                        "not a real assignment.",
+                        size=11,
+                        color=COLOR_WARNING_TEXT,
+                    ),
+                ],
+                spacing=6,
+            )
+        )
     if missing_data:
         footer_children.append(
             ft.Text(
@@ -623,20 +668,19 @@ def build_bom_rows_table(rows: list[dict], total_cost_one_unit) -> ft.Column:
             if isinstance(total_cost, (int, float)) and total_cost_one_unit
             else 0.0
         )
-        name_cell = ft.Row(
-            [
-                ft.Text(
-                    row.get("part_name", "unnamed"),
-                    size=13,
-                    color=COLOR_AI_TEXT,
-                    weight=ft.FontWeight.W_500,
-                    overflow=ft.TextOverflow.ELLIPSIS,
-                ),
-                build_classification_chip(row.get("classification", "Make")),
-            ],
-            spacing=8,
-            tight=True,
-        )
+        name_cell_children = [
+            ft.Text(
+                row.get("part_name", "unnamed"),
+                size=13,
+                color=COLOR_AI_TEXT,
+                weight=ft.FontWeight.W_500,
+                overflow=ft.TextOverflow.ELLIPSIS,
+            ),
+            build_classification_chip(row.get("classification", "Make")),
+        ]
+        if row.get("material_verified") is False:
+            name_cell_children.append(build_material_warning_icon(row.get("material")))
+        name_cell = ft.Row(name_cell_children, spacing=8, tight=True)
         cost_cell = ft.Column(
             [
                 ft.Text(_fmt_money(total_cost), size=13, color=COLOR_AI_TEXT, weight=ft.FontWeight.W_600),
@@ -678,9 +722,10 @@ def build_bom_card(data: dict, rows_key: str) -> ft.Control:
     quantity = data.get("quantity", "?")
     missing_data = data.get("missing_data", [])
     total_cost_one_unit = totals.get("total_assembly_cost_one_unit_inr")
+    unverified_count = sum(1 for row in rows if row.get("material_verified") is False)
 
     table = build_bom_rows_table(rows, total_cost_one_unit)
-    footer = build_bom_totals_footer(totals, manufacturing_process, quantity, missing_data)
+    footer = build_bom_totals_footer(totals, manufacturing_process, quantity, missing_data, unverified_count)
     card = _card_container([table, footer])
 
     if len(rows) <= BOM_SUMMARY_ROW_THRESHOLD:
@@ -689,15 +734,20 @@ def build_bom_card(data: dict, rows_key: str) -> ft.Control:
     # Step 5: summary-first for large BOMs, expandable in place.
     card.visible = False
     view_button = ft.TextButton("View Full BOM")
+    summary_text = (
+        f"BOM generated — {totals.get('unique_part_count', '?')} unique parts, "
+        f"{totals.get('total_instance_count', '?')} total instances, "
+        f"{_fmt_money(total_cost_one_unit)} per assembly."
+    )
+    if unverified_count:
+        summary_text += f" ⚠ {unverified_count} unverified material(s)."
     summary_container = ft.Container(
         content=ft.Row(
             [
                 ft.Text(
-                    f"BOM generated — {totals.get('unique_part_count', '?')} unique parts, "
-                    f"{totals.get('total_instance_count', '?')} total instances, "
-                    f"{_fmt_money(total_cost_one_unit)} per assembly.",
+                    summary_text,
                     size=13,
-                    color=COLOR_AI_TEXT,
+                    color=COLOR_WARNING_TEXT if unverified_count else COLOR_AI_TEXT,
                     expand=True,
                 ),
                 view_button,
