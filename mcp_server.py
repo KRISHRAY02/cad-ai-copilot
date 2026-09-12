@@ -25,6 +25,26 @@ from production_cost import PROCESSES
 
 _MIN_FILLET_RADIUS_MM = 1.0
 
+# The paragraph below ("On a follow-up question...") is duplicated verbatim
+# into every cost/BOM tool's docstring further down whose signature takes
+# manufacturing_process and/or quantity (estimate_cost, compare_materials,
+# get_cost_drivers, highlight_cost_driver, get_assembly_bom,
+# get_assembly_cost_drivers, export_bom) -- NOT factored into a shared
+# constant, because MCPServer.tool() reads each function's docstring
+# directly off `__doc__` at decoration time, which must be a plain string
+# literal (an f-string or a post-hoc `func.__doc__ = ...` assignment isn't
+# picked up the same way). Added after live testing (with tool-call
+# argument logging in ai_orchestrator.py) showed qwen2.5:7b-instruct
+# calling one of these tools again for a short follow-up question -- e.g.
+# "what about with Injection Molding instead?", "for 10 units" -- but
+# getting the OTHER, unmentioned parameter wrong (reverting it to a stale
+# value, or fabricating a new one) instead of reusing what the most recent
+# related call in the conversation actually used.
+# ai_orchestrator.py's _carry_over_unstated_params() now enforces this
+# deterministically as a safety net regardless of what the model does, but
+# telling the model the rule directly still reduces how often that net has
+# to actually catch something.
+
 # Default machine type/supplier for estimate_cost() when the user doesn't
 # specify one -- CNC 3-axis is the most general-purpose machining process,
 # and Supplier_A is just the first of the synthetic suppliers the cost
@@ -189,6 +209,14 @@ def estimate_cost(
     -- do not silently guess one.** If you call this tool without a
     process anyway (e.g. because the user can't be reached), it returns
     found=False listing the three valid options rather than guessing.
+
+    On a follow-up question that changes only SOME of these parameters
+    (e.g. "what about with Injection Molding instead?", "for 10 units"),
+    you MUST still pass every parameter explicitly in the new call --
+    carry over the unchanged ones from the most recent related call in
+    this conversation exactly as they were, and only change what the user
+    actually asked to change. Never omit a parameter or let it silently
+    default/revert to a different value.
 
     Pulls the part's geometry (volume, surface area, face count, bend
     count, bounding box) and material (name, density, cost_per_kg) live
@@ -475,6 +503,14 @@ def compare_materials(
     if called without one anyway, returns found=False listing the valid
     options.
 
+    On a follow-up question that changes only SOME of these parameters
+    (e.g. "what about with Injection Molding instead?", "for 10 units"),
+    you MUST still pass every parameter explicitly in the new call --
+    carry over the unchanged ones from the most recent related call in
+    this conversation exactly as they were, and only change what the user
+    actually asked to change. Never omit a parameter or let it silently
+    default/revert to a different value.
+
     Returns {"found": True, "comparison": [one dict per material queried,
     each with material_matched, hypothetical_mass_kg, material_cost_inr,
     production_cost_inr, total_cost_per_unit_inr,
@@ -548,6 +584,14 @@ def get_cost_drivers(manufacturing_process: str | None = None, quantity: int = 1
     Molding", "Sheet Metal" -- ASK THE USER if not specified, same as
     estimate_cost(). Returns found=False listing the valid options if
     called without one.
+
+    On a follow-up question that changes only SOME of these parameters
+    (e.g. "what about with Injection Molding instead?", "for 10 units"),
+    you MUST still pass every parameter explicitly in the new call --
+    carry over the unchanged ones from the most recent related call in
+    this conversation exactly as they were, and only change what the user
+    actually asked to change. Never omit a parameter or let it silently
+    default/revert to a different value.
     """
     if manufacturing_process not in PROCESSES:
         return {
@@ -581,6 +625,14 @@ def highlight_cost_driver(manufacturing_process: str | None = None, quantity: in
     Returns {"found", "message" (relay this directly to the user in
     chat), "highlighted" (bool), "top_driver"}. Same
     `manufacturing_process`/`quantity` requirements as get_cost_drivers().
+
+    On a follow-up question that changes only SOME of these parameters
+    (e.g. "what about with Injection Molding instead?", "for 10 units"),
+    you MUST still pass every parameter explicitly in the new call --
+    carry over the unchanged ones from the most recent related call in
+    this conversation exactly as they were, and only change what the user
+    actually asked to change. Never omit a parameter or let it silently
+    default/revert to a different value.
     """
     if manufacturing_process not in PROCESSES:
         return {
@@ -664,6 +716,14 @@ def get_assembly_bom(manufacturing_process: str | None = None, quantity: int = 1
     to assume before calling this tool.** Returns found=False listing the
     three valid options if called without one anyway.
 
+    On a follow-up question that changes only SOME of these parameters
+    (e.g. "what about with Injection Molding instead?", "for 10 units"),
+    you MUST still pass every parameter explicitly in the new call --
+    carry over the unchanged ones from the most recent related call in
+    this conversation exactly as they were, and only change what the user
+    actually asked to change. Never omit a parameter or let it silently
+    default/revert to a different value.
+
     Returns found=False if the currently open document isn't an assembly
     (call get_current_part_info() first if you're not sure).
     """
@@ -707,6 +767,14 @@ def get_assembly_cost_drivers(manufacturing_process: str | None = None, quantity
     Same `manufacturing_process`/`quantity` parameters and found=False
     behavior as get_assembly_bom() -- ask the user for the manufacturing
     process if they haven't specified one.
+
+    On a follow-up question that changes only SOME of these parameters
+    (e.g. "what about with Injection Molding instead?", "for 10 units"),
+    you MUST still pass every parameter explicitly in the new call --
+    carry over the unchanged ones from the most recent related call in
+    this conversation exactly as they were, and only change what the user
+    actually asked to change. Never omit a parameter or let it silently
+    default/revert to a different value.
     """
     if manufacturing_process not in PROCESSES:
         return {
@@ -766,6 +834,14 @@ def export_bom(
     unspecified. `output_path` defaults to a timestamped .xlsx in the
     system temp directory. After this returns found=True, tell the user
     the exact file path.
+
+    On a follow-up question that changes only SOME of these parameters
+    (e.g. "what about with Injection Molding instead?", "for 10 units"),
+    you MUST still pass every parameter explicitly in the new call --
+    carry over the unchanged ones from the most recent related call in
+    this conversation exactly as they were, and only change what the user
+    actually asked to change. Never omit a parameter or let it silently
+    default/revert to a different value.
     """
     from bom_export import export_bom as write_bom_file
 

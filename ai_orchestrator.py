@@ -11,19 +11,46 @@ never imports a CadAdapter subclass directly.
 
 import asyncio
 import json
+import logging
 import os
 import re
 import sys
 from contextlib import AsyncExitStack
+from pathlib import Path
 
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.types import CallToolResult
 from ollama import AsyncClient
 
+from production_cost import PROCESSES
+
 DEFAULT_MODEL = "qwen2.5:7b-instruct"
 MAX_TOOL_CALL_ROUNDS = 8
 _MAX_EMPTY_RESPONSE_RETRIES = 3
+
+# Logs the exact tool name + full argument dict the model decided to send,
+# for every tool call, right before it's executed against the live MCP
+# session -- added specifically to diagnose live reports of follow-up
+# questions ("what about with Injection Molding instead?", "for 10 units")
+# silently landing on the wrong process/quantity. Goes to both the console
+# (for `python desktop_app.py`/`streamlit run` foreground output) and
+# tool_call_log.jsonl (one JSON object per line, so a session run
+# elsewhere -- e.g. inside Streamlit's own process -- can still be
+# inspected afterward without needing console scrollback).
+_TOOL_CALL_LOGGER = logging.getLogger("cad_ai_copilot.tool_calls")
+_TOOL_CALL_LOGGER.setLevel(logging.INFO)
+if not _TOOL_CALL_LOGGER.handlers:
+    _console_handler = logging.StreamHandler()
+    _console_handler.setFormatter(logging.Formatter("%(message)s"))
+    _TOOL_CALL_LOGGER.addHandler(_console_handler)
+
+    _file_handler = logging.FileHandler(
+        Path(__file__).parent / "tool_call_log.jsonl", encoding="utf-8"
+    )
+    _file_handler.setFormatter(logging.Formatter("%(message)s"))
+    _TOOL_CALL_LOGGER.addHandler(_file_handler)
+    _TOOL_CALL_LOGGER.propagate = False
 
 
 class OllamaUnavailableError(RuntimeError):
@@ -302,11 +329,13 @@ class AiOrchestrator:
         self._ollama = AsyncClient()
         self._tools_schema: list[dict] = []
         self._history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
-        # Last `quantity` used in a *successful* (found=True) cost-related
-        # tool call this session, and the question text that triggered the
-        # tool call currently being processed -- see
-        # _carry_over_quantity_if_unstated's docstring for why these exist.
+        # Last `quantity`/`manufacturing_process` used in a *successful*
+        # (found=True) cost-related tool call this session, and the
+        # question text that triggered the tool call currently being
+        # processed -- see _carry_over_unstated_params's docstring for why
+        # these exist.
         self._last_quantity: int | None = None
+        self._last_manufacturing_process: str | None = None
         self._current_question: str = ""
 
     async def start(self) -> None:
@@ -421,18 +450,18 @@ class AiOrchestrator:
                 # instead). Treat it as the tool call it clearly meant to
                 # be, rather than surfacing raw JSON as if it were a reply.
                 name, arguments = leaked
-                arguments = self._carry_over_quantity_if_unstated(name, arguments)
+                arguments = self._carry_over_unstated_params(name, arguments)
                 tool_result = await self._execute_tool_call_deduped(
                     name, arguments, called_signatures
                 )
-                self._remember_quantity_if_successful(name, arguments, tool_result)
+                self._remember_params_if_successful(name, arguments, tool_result)
                 self._history.append(
                     {"role": "tool", "tool_name": name, "content": tool_result}
                 )
                 effective_name = name
                 if name == "estimate_cost" and _is_estimate_cost_assembly_redirect(tool_result):
                     tool_result = await self._auto_redirect_to_assembly_bom(arguments)
-                    self._remember_quantity_if_successful("get_assembly_bom", arguments, tool_result)
+                    self._remember_params_if_successful("get_assembly_bom", arguments, tool_result)
                     self._history.append(
                         {"role": "tool", "tool_name": "get_assembly_bom", "content": tool_result}
                     )
@@ -445,13 +474,13 @@ class AiOrchestrator:
 
             for tool_call in tool_calls:
                 name = tool_call.function.name
-                arguments = self._carry_over_quantity_if_unstated(
+                arguments = self._carry_over_unstated_params(
                     name, tool_call.function.arguments
                 )
                 tool_result = await self._execute_tool_call_deduped(
                     name, arguments, called_signatures
                 )
-                self._remember_quantity_if_successful(name, arguments, tool_result)
+                self._remember_params_if_successful(name, arguments, tool_result)
                 self._history.append(
                     {
                         "role": "tool",
@@ -462,7 +491,7 @@ class AiOrchestrator:
                 effective_name = name
                 if name == "estimate_cost" and _is_estimate_cost_assembly_redirect(tool_result):
                     tool_result = await self._auto_redirect_to_assembly_bom(arguments)
-                    self._remember_quantity_if_successful("get_assembly_bom", arguments, tool_result)
+                    self._remember_params_if_successful("get_assembly_bom", arguments, tool_result)
                     self._history.append(
                         {"role": "tool", "tool_name": "get_assembly_bom", "content": tool_result}
                     )
@@ -477,57 +506,129 @@ class AiOrchestrator:
             "Try rephrasing the question."
         )
 
-    _QUANTITY_TOOLS = {
+    # Every tool whose contract includes "if the question doesn't specify
+    # X, ASK rather than guess" for manufacturing_process/quantity --
+    # see mcp_server.py's docstrings for each. These are exactly the tools
+    # a terse follow-up ("what about Injection Molding instead?", "for 10
+    # units") can land on with a stale/wrong value, per the diagnosis
+    # below.
+    _COST_TOOLS = {
         "estimate_cost",
         "get_assembly_bom",
         "get_assembly_cost_drivers",
         "compare_materials",
         "get_cost_drivers",
         "highlight_cost_driver",
+        "export_bom",
     }
 
-    def _carry_over_quantity_if_unstated(self, name: str, arguments: dict) -> dict:
-        """If `name` is a quantity-taking cost tool and the current
-        question doesn't itself mention a number, override `quantity` with
-        the last quantity a *successful* cost answer in this conversation
-        actually used, instead of trusting whatever the model filled in.
+    def _carry_over_unstated_params(self, name: str, arguments: dict) -> dict:
+        """If `name` is a cost tool, override `quantity`/`manufacturing_process`
+        with the last values a *successful* cost answer in this
+        conversation actually used, for whichever of the two the current
+        question gives no textual basis to change.
 
-        Why this exists: observed live with qwen2.5:7b-instruct -- asked
-        "What would it cost with Injection Molding instead?" (a follow-up
-        to an already-answered "...for 10 quantities..." question, with no
-        new quantity mentioned), the model correctly kept the process the
-        user asked for but silently substituted quantity=1000 for the
-        quantity=10 already established, producing a confidently wrong
-        answer. A question with no digit in it has no textual basis for
-        introducing a new quantity, so it's safe to force the last known
-        one; a question that does mention a number is left alone since the
-        user may genuinely be asking about a new quantity.
+        Why this exists -- diagnosed live with tool-call argument logging
+        (tool_call_log.jsonl) against qwen2.5:7b-instruct: a short
+        follow-up like "What about with Injection Molding instead?" or
+        "For 10 units" only ever changes ONE of the two parameters, but
+        the model's tool call for that follow-up was observed to get the
+        OTHER, unmentioned one wrong -- e.g. keeping the stated new
+        process but reverting quantity to a stale/fabricated value, or
+        vice versa, or (worst case) not calling a tool at all and asking
+        a clarifying question instead. mcp_server.py's tool docstrings
+        already tell the model to carry over unchanged values explicitly,
+        and the system prompt's instructions can't force better adherence
+        out of a 7B model, so this is enforced here instead: a question
+        containing no digit has no textual basis for a new quantity, and
+        a question containing none of PROCESSES's three names has no
+        textual basis for a new process -- in either case, whatever the
+        model put there gets overridden with the session's last known
+        good value rather than trusted.
         """
-        if name not in self._QUANTITY_TOOLS or "quantity" not in arguments:
+        if name not in self._COST_TOOLS:
             return arguments
-        if self._last_quantity is None:
-            return arguments
-        if re.search(r"\d", self._current_question):
-            return arguments
-        if arguments.get("quantity") == self._last_quantity:
-            return arguments
-        return {**arguments, "quantity": self._last_quantity}
 
-    def _remember_quantity_if_successful(self, name: str, arguments: dict, tool_result_json: str) -> None:
-        """Record `quantity` from a quantity-taking cost tool call as the
-        session's "last known quantity" -- but only when the call actually
-        succeeded (found=True), so a rejected/errored call (wrong process,
-        assembly redirect, etc.) never overwrites a good prior value with
-        a bogus or missing one.
+        overrides = {}
+        question_lower = self._current_question.lower()
+
+        if (
+            "quantity" in arguments
+            and self._last_quantity is not None
+            and not re.search(r"\d", self._current_question)
+            and arguments.get("quantity") != self._last_quantity
+        ):
+            overrides["quantity"] = self._last_quantity
+
+        if (
+            "manufacturing_process" in arguments
+            and self._last_manufacturing_process is not None
+            and not any(p.lower() in question_lower for p in PROCESSES)
+            and arguments.get("manufacturing_process") != self._last_manufacturing_process
+        ):
+            overrides["manufacturing_process"] = self._last_manufacturing_process
+
+        if overrides:
+            _TOOL_CALL_LOGGER.info(
+                json.dumps(
+                    {
+                        "question": self._current_question,
+                        "tool": name,
+                        "model_sent_arguments": arguments,
+                        "overrode_to": overrides,
+                        "reason": "question had no textual basis to change this param",
+                    }
+                )
+            )
+            return {**arguments, **overrides}
+        return arguments
+
+    def _remember_params_if_successful(self, name: str, arguments: dict, tool_result_json: str) -> None:
+        """Record `quantity`/`manufacturing_process` from a cost tool call
+        as the session's "last known good" values -- but only when the
+        call actually succeeded (found=True), so a rejected/errored call
+        (wrong process, assembly redirect, etc.) never overwrites a good
+        prior value with a bogus or missing one.
+
+        Also appends a compact system-role note to the conversation
+        history stating those values explicitly (e.g. "Previous cost
+        answer used: manufacturing_process=CNC Machining, quantity=100.").
+        This is grounding for the model's own next tool call, on top of
+        (not instead of) the deterministic override in
+        _carry_over_unstated_params above -- that override is what
+        actually guarantees correctness regardless of what the model
+        does, but giving the model an explicit, easy-to-quote fact to
+        work from (rather than making it infer "100" out of a wall of
+        prior freeform chat text) should also make it less likely to
+        pick a wrong value on tool calls this class doesn't cover, e.g.
+        get_cost_drivers/highlight_cost_driver called for the first time
+        after a get_assembly_bom answer.
         """
-        if name not in self._QUANTITY_TOOLS or "quantity" not in arguments:
+        if name not in self._COST_TOOLS:
             return
         try:
             data = json.loads(tool_result_json)
         except (json.JSONDecodeError, TypeError):
             return
-        if isinstance(data, dict) and data.get("found") is True:
+        if not (isinstance(data, dict) and data.get("found") is True):
+            return
+        if "quantity" in arguments:
             self._last_quantity = arguments["quantity"]
+        if "manufacturing_process" in arguments:
+            self._last_manufacturing_process = arguments["manufacturing_process"]
+        self._history.append(
+            {
+                "role": "system",
+                "content": (
+                    f"Previous cost answer used: manufacturing_process="
+                    f"{self._last_manufacturing_process}, quantity="
+                    f"{self._last_quantity}. If the user's next message "
+                    "only changes one of these, carry the other one over "
+                    "unchanged in your next tool call -- do not omit it "
+                    "or substitute a different value."
+                ),
+            }
+        )
 
     async def _auto_redirect_to_assembly_bom(self, arguments: dict) -> str:
         """Re-run the same cost request as get_assembly_bom(), reusing
@@ -583,6 +684,15 @@ class AiOrchestrator:
         final answer (e.g. "I couldn't check that because no part is open
         in SolidWorks").
         """
+        _TOOL_CALL_LOGGER.info(
+            json.dumps(
+                {
+                    "question": self._current_question,
+                    "tool": name,
+                    "arguments": arguments,
+                }
+            )
+        )
         result: CallToolResult = await self._session.call_tool(name, arguments)
 
         if result.structured_content is not None:
