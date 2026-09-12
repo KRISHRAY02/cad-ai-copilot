@@ -12,6 +12,7 @@ never imports a CadAdapter subclass directly.
 import asyncio
 import json
 import os
+import re
 import sys
 from contextlib import AsyncExitStack
 
@@ -208,6 +209,35 @@ _DETERMINISTIC_ANSWER_FORMATTERS = {
     "get_assembly_cost_drivers": _format_get_assembly_cost_drivers_answer,
 }
 
+_ASSEMBLY_REDIRECT_MARKER = "get_assembly_bom() or get_assembly_cost_drivers() instead"
+
+
+def _is_estimate_cost_assembly_redirect(tool_result_json: str) -> bool:
+    """True if estimate_cost() just refused because the open document is an
+    assembly (see mcp_server.py's estimate_cost -- it returns found=False
+    with this exact message rather than reading a nonexistent root-level
+    material/mass).
+
+    Why this needs its own check instead of just letting the model read
+    the message and retry: observed live with qwen2.5:7b-instruct, told
+    "call get_assembly_bom() ... with the same manufacturing_process/
+    quantity", it does call get_assembly_bom() next -- but silently swaps
+    in a different manufacturing_process (e.g. reverting Injection Molding
+    back to CNC Machining) and/or a fabricated quantity (e.g. 1000 instead
+    of the 10 actually requested), producing a confidently wrong answer
+    instead of an error. Since the correct retry arguments are just
+    "the exact arguments this failed call was given", the orchestrator can
+    make that call itself and skip trusting the model to copy them
+    correctly.
+    """
+    try:
+        data = json.loads(tool_result_json)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(data, dict) or data.get("found") is not False:
+        return False
+    return _ASSEMBLY_REDIRECT_MARKER in data.get("message", "")
+
 
 def _format_deterministic_answer(tool_name: str, tool_result_json: str) -> str | None:
     # Checked for every cost-capable tool regardless of name -- see
@@ -272,6 +302,12 @@ class AiOrchestrator:
         self._ollama = AsyncClient()
         self._tools_schema: list[dict] = []
         self._history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # Last `quantity` used in a *successful* (found=True) cost-related
+        # tool call this session, and the question text that triggered the
+        # tool call currently being processed -- see
+        # _carry_over_quantity_if_unstated's docstring for why these exist.
+        self._last_quantity: int | None = None
+        self._current_question: str = ""
 
     async def start(self) -> None:
         """Launch the MCP server subprocess and fetch its tool definitions.
@@ -351,6 +387,7 @@ class AiOrchestrator:
             raise RuntimeError("AiOrchestrator.start() must be called before ask().")
 
         self._history.append({"role": "user", "content": question})
+        self._current_question = question
 
         # (tool_name, sorted-args-json) signatures already executed in this
         # ask() call -- see _execute_tool_call_deduped's docstring for why
@@ -384,32 +421,53 @@ class AiOrchestrator:
                 # instead). Treat it as the tool call it clearly meant to
                 # be, rather than surfacing raw JSON as if it were a reply.
                 name, arguments = leaked
+                arguments = self._carry_over_quantity_if_unstated(name, arguments)
                 tool_result = await self._execute_tool_call_deduped(
                     name, arguments, called_signatures
                 )
+                self._remember_quantity_if_successful(name, arguments, tool_result)
                 self._history.append(
                     {"role": "tool", "tool_name": name, "content": tool_result}
                 )
-                deterministic = _format_deterministic_answer(name, tool_result)
+                effective_name = name
+                if name == "estimate_cost" and _is_estimate_cost_assembly_redirect(tool_result):
+                    tool_result = await self._auto_redirect_to_assembly_bom(arguments)
+                    self._remember_quantity_if_successful("get_assembly_bom", arguments, tool_result)
+                    self._history.append(
+                        {"role": "tool", "tool_name": "get_assembly_bom", "content": tool_result}
+                    )
+                    effective_name = "get_assembly_bom"
+                deterministic = _format_deterministic_answer(effective_name, tool_result)
                 if deterministic is not None:
                     self._history.append({"role": "assistant", "content": deterministic})
                     return deterministic
                 continue
 
             for tool_call in tool_calls:
-                tool_result = await self._execute_tool_call_deduped(
-                    tool_call.function.name, tool_call.function.arguments, called_signatures
+                name = tool_call.function.name
+                arguments = self._carry_over_quantity_if_unstated(
+                    name, tool_call.function.arguments
                 )
+                tool_result = await self._execute_tool_call_deduped(
+                    name, arguments, called_signatures
+                )
+                self._remember_quantity_if_successful(name, arguments, tool_result)
                 self._history.append(
                     {
                         "role": "tool",
-                        "tool_name": tool_call.function.name,
+                        "tool_name": name,
                         "content": tool_result,
                     }
                 )
-                deterministic = _format_deterministic_answer(
-                    tool_call.function.name, tool_result
-                )
+                effective_name = name
+                if name == "estimate_cost" and _is_estimate_cost_assembly_redirect(tool_result):
+                    tool_result = await self._auto_redirect_to_assembly_bom(arguments)
+                    self._remember_quantity_if_successful("get_assembly_bom", arguments, tool_result)
+                    self._history.append(
+                        {"role": "tool", "tool_name": "get_assembly_bom", "content": tool_result}
+                    )
+                    effective_name = "get_assembly_bom"
+                deterministic = _format_deterministic_answer(effective_name, tool_result)
                 if deterministic is not None:
                     self._history.append({"role": "assistant", "content": deterministic})
                     return deterministic
@@ -418,6 +476,73 @@ class AiOrchestrator:
             "I wasn't able to reach a final answer after several tool calls. "
             "Try rephrasing the question."
         )
+
+    _QUANTITY_TOOLS = {
+        "estimate_cost",
+        "get_assembly_bom",
+        "get_assembly_cost_drivers",
+        "compare_materials",
+        "get_cost_drivers",
+        "highlight_cost_driver",
+    }
+
+    def _carry_over_quantity_if_unstated(self, name: str, arguments: dict) -> dict:
+        """If `name` is a quantity-taking cost tool and the current
+        question doesn't itself mention a number, override `quantity` with
+        the last quantity a *successful* cost answer in this conversation
+        actually used, instead of trusting whatever the model filled in.
+
+        Why this exists: observed live with qwen2.5:7b-instruct -- asked
+        "What would it cost with Injection Molding instead?" (a follow-up
+        to an already-answered "...for 10 quantities..." question, with no
+        new quantity mentioned), the model correctly kept the process the
+        user asked for but silently substituted quantity=1000 for the
+        quantity=10 already established, producing a confidently wrong
+        answer. A question with no digit in it has no textual basis for
+        introducing a new quantity, so it's safe to force the last known
+        one; a question that does mention a number is left alone since the
+        user may genuinely be asking about a new quantity.
+        """
+        if name not in self._QUANTITY_TOOLS or "quantity" not in arguments:
+            return arguments
+        if self._last_quantity is None:
+            return arguments
+        if re.search(r"\d", self._current_question):
+            return arguments
+        if arguments.get("quantity") == self._last_quantity:
+            return arguments
+        return {**arguments, "quantity": self._last_quantity}
+
+    def _remember_quantity_if_successful(self, name: str, arguments: dict, tool_result_json: str) -> None:
+        """Record `quantity` from a quantity-taking cost tool call as the
+        session's "last known quantity" -- but only when the call actually
+        succeeded (found=True), so a rejected/errored call (wrong process,
+        assembly redirect, etc.) never overwrites a good prior value with
+        a bogus or missing one.
+        """
+        if name not in self._QUANTITY_TOOLS or "quantity" not in arguments:
+            return
+        try:
+            data = json.loads(tool_result_json)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if isinstance(data, dict) and data.get("found") is True:
+            self._last_quantity = arguments["quantity"]
+
+    async def _auto_redirect_to_assembly_bom(self, arguments: dict) -> str:
+        """Re-run the same cost request as get_assembly_bom(), reusing
+        estimate_cost()'s original manufacturing_process/quantity verbatim
+        instead of letting the model re-issue the call (and potentially
+        corrupt those arguments -- see _is_estimate_cost_assembly_redirect's
+        docstring). `quantity` defaults to 1 to match estimate_cost()'s own
+        default, since a model call that omitted it should redirect the
+        same way a call that included quantity=1 would.
+        """
+        redirect_arguments = {
+            "manufacturing_process": arguments.get("manufacturing_process"),
+            "quantity": arguments.get("quantity", 1),
+        }
+        return await self._call_mcp_tool("get_assembly_bom", redirect_arguments)
 
     async def _execute_tool_call_deduped(
         self, name: str, arguments: dict, called_signatures: set[tuple[str, str]]
