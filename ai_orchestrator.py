@@ -475,6 +475,7 @@ class AiOrchestrator:
                     name, arguments, called_signatures
                 )
                 self._remember_params_if_successful(name, arguments, tool_result)
+                self._remember_structured_result(name, tool_result)
                 self._history.append(
                     {"role": "tool", "tool_name": name, "content": tool_result}
                 )
@@ -482,6 +483,7 @@ class AiOrchestrator:
                 if name == "estimate_cost" and _is_estimate_cost_assembly_redirect(tool_result):
                     tool_result = await self._auto_redirect_to_assembly_bom(arguments)
                     self._remember_params_if_successful("get_assembly_bom", arguments, tool_result)
+                    self._remember_structured_result("get_assembly_bom", tool_result)
                     self._history.append(
                         {"role": "tool", "tool_name": "get_assembly_bom", "content": tool_result}
                     )
@@ -501,6 +503,7 @@ class AiOrchestrator:
                     name, arguments, called_signatures
                 )
                 self._remember_params_if_successful(name, arguments, tool_result)
+                self._remember_structured_result(name, tool_result)
                 self._history.append(
                     {
                         "role": "tool",
@@ -512,6 +515,7 @@ class AiOrchestrator:
                 if name == "estimate_cost" and _is_estimate_cost_assembly_redirect(tool_result):
                     tool_result = await self._auto_redirect_to_assembly_bom(arguments)
                     self._remember_params_if_successful("get_assembly_bom", arguments, tool_result)
+                    self._remember_structured_result("get_assembly_bom", tool_result)
                     self._history.append(
                         {"role": "tool", "tool_name": "get_assembly_bom", "content": tool_result}
                     )
@@ -636,15 +640,6 @@ class AiOrchestrator:
             self._last_quantity = arguments["quantity"]
         if "manufacturing_process" in arguments:
             self._last_manufacturing_process = arguments["manufacturing_process"]
-        # Last successful cost/BOM call's raw data, for callers that want
-        # to render structured UI (a real table) instead of prose -- see
-        # this class's last_structured_tool/last_structured_result
-        # docstring in __init__. Overwritten by each subsequent successful
-        # call within the same ask() turn, so it ends up holding whichever
-        # call actually backs the final answer (e.g. the get_assembly_bom
-        # call an estimate_cost-on-assembly rejection auto-redirects to).
-        self.last_structured_tool = name
-        self.last_structured_result = data
         self._history.append(
             {
                 "role": "system",
@@ -658,6 +653,24 @@ class AiOrchestrator:
                 ),
             }
         )
+
+    def _remember_structured_result(self, name: str, tool_result_json: str) -> None:
+        """Record `last_structured_tool`/`last_structured_result` for ANY
+        successful (found=True) tool call -- not gated to `_COST_TOOLS`
+        the way `_remember_params_if_successful` above is, since a caller
+        wanting to render a real table (e.g. list_assembly_components,
+        which takes no quantity/manufacturing_process and has nothing to
+        do with cost) needs this regardless. Overwritten by each
+        subsequent successful call within the same ask() turn, so it ends
+        up holding whichever call actually backs the final answer.
+        """
+        try:
+            data = json.loads(tool_result_json)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if isinstance(data, dict) and data.get("found") is True:
+            self.last_structured_tool = name
+            self.last_structured_result = data
 
     async def _auto_redirect_to_assembly_bom(self, arguments: dict) -> str:
         """Re-run the same cost request as get_assembly_bom(), reusing

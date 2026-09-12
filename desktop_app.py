@@ -953,6 +953,214 @@ def build_categorized_bom_view(data: dict, rows_key: str) -> ft.Control:
     return _card_container([summary_header, *sections])
 
 
+# --------------------------------------------------------------------------
+# Categorized view for list_assembly_components() -- same category-grouping/
+# collapsible-section/warning-icon language as build_categorized_bom_view
+# above, but for a plain structural listing with no cost/classification
+# data at all (list_assembly_components takes no manufacturing_process, so
+# its rows have no "classification"/"unit_cost_inr"/"total_cost_inr" the
+# way get_assembly_bom's do) -- a dedicated table with a Material column
+# instead of Unit/Total Cost, and no Make/Buy chip, reusing the same
+# category-grouping helpers (_group_rows_by_category/categorize_component
+# key only off part_name, so they work unchanged on either row shape).
+# --------------------------------------------------------------------------
+
+
+def _normalize_component_listing_row(component: dict) -> dict:
+    """Reshape one dataclasses.asdict(AssemblyComponent) dict (quantity,
+    mass_kg, material={"name":...}) into the field names the category-
+    grouping helpers and build_component_listing_table below expect
+    (quantity_per_assembly, unit_mass_kg/total_mass_kg, a flat material
+    name string) -- purely a display-layer reshape, doesn't touch any
+    adapter/calculation logic.
+    """
+    quantity = component.get("quantity", 0) or 0
+    mass_kg = component.get("mass_kg")
+    material = component.get("material") or {}
+    material_name = material.get("name") if isinstance(material, dict) else None
+    return {
+        "part_name": component.get("part_name", "unnamed"),
+        "quantity_per_assembly": quantity,
+        "unit_mass_kg": mass_kg,
+        "total_mass_kg": round(mass_kg * quantity, 4) if isinstance(mass_kg, (int, float)) else None,
+        "material": material_name,
+        "material_verified": component.get("material_verified"),
+    }
+
+
+def build_component_listing_table(rows: list[dict]) -> ft.Column:
+    header = ft.Container(
+        content=ft.Row(
+            [
+                ft.Text("Component", color=COLOR_HEADER_TEXT, size=12, weight=ft.FontWeight.W_600, expand=4),
+                ft.Text("Qty", color=COLOR_HEADER_TEXT, size=12, weight=ft.FontWeight.W_600, expand=1),
+                ft.Text("Mass Each", color=COLOR_HEADER_TEXT, size=12, weight=ft.FontWeight.W_600, expand=2),
+                ft.Text("Total Mass", color=COLOR_HEADER_TEXT, size=12, weight=ft.FontWeight.W_600, expand=2),
+                ft.Text("Material", color=COLOR_HEADER_TEXT, size=12, weight=ft.FontWeight.W_600, expand=4),
+            ],
+            spacing=8,
+        ),
+        bgcolor=COLOR_HEADER_BG,
+        padding=pad_symmetric(horizontal=12, vertical=8),
+        border_radius=CARD_TOP_RADIUS,
+    )
+
+    row_controls: list[ft.Control] = [header]
+    for i, row in enumerate(rows):
+        material_name = row.get("material") or "Not specified"
+        material_cell_children = [
+            ft.Text(
+                material_name,
+                size=13,
+                color=COLOR_AI_TEXT,
+                overflow=ft.TextOverflow.ELLIPSIS,
+            )
+        ]
+        if row.get("material_verified") is False:
+            material_cell_children.append(build_material_warning_icon(material_name))
+
+        row_controls.append(
+            ft.Container(
+                content=ft.Row(
+                    [
+                        ft.Text(
+                            row.get("part_name", "unnamed"),
+                            size=13,
+                            color=COLOR_AI_TEXT,
+                            weight=ft.FontWeight.W_500,
+                            overflow=ft.TextOverflow.ELLIPSIS,
+                            expand=4,
+                        ),
+                        ft.Text(str(row.get("quantity_per_assembly", "?")), size=13, color=COLOR_AI_TEXT, expand=1),
+                        ft.Text(_fmt_mass(row.get("unit_mass_kg")), size=13, color=COLOR_AI_TEXT, expand=2),
+                        ft.Text(_fmt_mass(row.get("total_mass_kg")), size=13, color=COLOR_AI_TEXT, expand=2),
+                        ft.Container(
+                            ft.Row(material_cell_children, spacing=6, tight=True),
+                            expand=4,
+                        ),
+                    ],
+                    spacing=8,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                padding=pad_symmetric(horizontal=12, vertical=10),
+                bgcolor="#FFFFFF" if i % 2 == 0 else "#FAFBFD",
+                border=ft.Border(bottom=ft.BorderSide(1, COLOR_AI_BORDER)),
+            )
+        )
+    return ft.Column(row_controls, spacing=0, tight=True)
+
+
+def build_component_listing_category_section(category: str, rows: list[dict], collapsed_by_default: bool) -> ft.Control:
+    """Same collapsible-header-plus-table pattern as build_category_section
+    above, just with build_component_listing_table (no cost data) instead
+    of build_bom_rows_table, and a mass-only subtotal in the header line.
+    """
+    subtotal = _category_subtotal(rows)  # total_cost_inr always None here -- simply unused below
+    unverified_count = sum(1 for r in rows if r.get("material_verified") is False)
+
+    summary_bits = [f"{subtotal['part_count']} type(s)", f"{subtotal['total_instances']} total instance(s)"]
+    if subtotal["total_mass_kg"] is not None:
+        summary_bits.append(_fmt_mass(subtotal["total_mass_kg"]))
+    summary_text = f"{category} — " + ", ".join(summary_bits)
+    if unverified_count:
+        summary_text += f" ⚠ {unverified_count} unverified"
+
+    expanded = not collapsed_by_default
+    chevron = ft.Icon(
+        ft.Icons.EXPAND_MORE_ROUNDED if expanded else ft.Icons.CHEVRON_RIGHT_ROUNDED,
+        size=18,
+        color=COLOR_HEADER_TEXT,
+    )
+    header = ft.Container(
+        content=ft.Row(
+            [
+                chevron,
+                ft.Text(
+                    summary_text,
+                    color=COLOR_WARNING_TEXT if unverified_count and not expanded else COLOR_HEADER_TEXT,
+                    size=13,
+                    weight=ft.FontWeight.W_600,
+                    expand=True,
+                ),
+            ],
+            spacing=8,
+        ),
+        bgcolor=COLOR_HEADER_BG,
+        padding=pad_symmetric(horizontal=12, vertical=10),
+        ink=True,
+    )
+    table_wrapper = ft.Container(content=build_component_listing_table(rows), visible=expanded)
+
+    def _toggle(e: ft.ControlEvent) -> None:
+        table_wrapper.visible = not table_wrapper.visible
+        chevron.name = ft.Icons.EXPAND_MORE_ROUNDED if table_wrapper.visible else ft.Icons.CHEVRON_RIGHT_ROUNDED
+        table_wrapper.update()
+        chevron.update()
+
+    header.on_click = _toggle
+    return ft.Column([header, table_wrapper], spacing=0, tight=True)
+
+
+def build_component_listing_view(data: dict) -> ft.Control:
+    """list_assembly_components()'s main chat rendering -- same summary-
+    first-plus-collapsible-categories structure as
+    build_categorized_bom_view, adapted for a plain structural listing:
+    unique parts / instances / sub-assembly count / total mass in the
+    header (no cost, since this tool never computes any), Material shown
+    per-row instead of cost, material_verified warnings unchanged.
+    """
+    components = data.get("components", [])
+    rows = [_normalize_component_listing_row(c) for c in components]
+    unverified_count = sum(1 for row in rows if row.get("material_verified") is False)
+    total_mass_values = [r["total_mass_kg"] for r in rows if isinstance(r.get("total_mass_kg"), (int, float))]
+
+    stats = ft.Row(
+        [
+            _stat("Unique parts", str(data.get("unique_part_count", len(rows)))),
+            _stat("Instances", str(data.get("total_instance_count", "?"))),
+            _stat("Sub-assemblies", str(data.get("sub_assembly_count", "?"))),
+            _stat("Total mass", _fmt_mass(sum(total_mass_values)) if total_mass_values else "—"),
+        ],
+        spacing=22,
+        wrap=True,
+    )
+    header_children = [stats]
+    if unverified_count:
+        header_children.append(
+            ft.Row(
+                [
+                    ft.Icon(ft.Icons.WARNING_AMBER_ROUNDED, size=13, color=COLOR_WARNING_ICON),
+                    ft.Text(
+                        f"{unverified_count} component(s) have an unverified material "
+                        "(⚠ icon in the table below) -- may be the CAD platform's "
+                        "untouched default, not a real assignment.",
+                        size=11,
+                        color=COLOR_WARNING_TEXT,
+                    ),
+                ],
+                spacing=6,
+            )
+        )
+    summary_header = ft.Container(
+        content=ft.Column(header_children, spacing=8),
+        bgcolor=COLOR_CHAT_BG,
+        padding=pad_symmetric(horizontal=14, vertical=12),
+        border=ft.Border(bottom=ft.BorderSide(1, COLOR_AI_BORDER)),
+        border_radius=CARD_TOP_RADIUS,
+    )
+
+    groups = _group_rows_by_category(rows)
+    sections = [
+        build_component_listing_category_section(
+            category, groups[category], category in _CATEGORIES_COLLAPSED_BY_DEFAULT
+        )
+        for category in CATEGORY_DISPLAY_ORDER
+        if groups[category]
+    ]
+
+    return _card_container([summary_header, *sections])
+
+
 def build_cost_breakdown_card(data: dict) -> ft.Control:
     """Single-part cost card for estimate_cost() -- only ever two line
     items (material cost, production cost), so no Make/Buy chips or
@@ -1025,6 +1233,7 @@ STRUCTURED_CARD_BUILDERS = {
     "get_assembly_bom": lambda data: build_categorized_bom_view(data, "bom"),
     "get_assembly_cost_drivers": lambda data: build_bom_card(data, "cost_drivers"),
     "estimate_cost": build_cost_breakdown_card,
+    "list_assembly_components": build_component_listing_view,
 }
 
 
