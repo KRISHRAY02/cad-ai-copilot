@@ -22,7 +22,7 @@ import mcp_server
 from ai_orchestrator import (
     AiOrchestrator,
     McpServerUnavailableError,
-    run_ai_orchestrator,
+    run_ai_orchestrator_with_data,
 )
 from bom_export import export_bom as write_bom_file
 from cad_adapters.fusion_adapter import FusionAdapter
@@ -128,6 +128,16 @@ class ChatMessage:
     role: str  # "user" | "ai" | "error"
     text: str
     timestamp: str
+    # Populated only for an "ai" message that answered via one of the
+    # cost/BOM tools (see build_bubble's STRUCTURED_CARD_BUILDERS) --
+    # lets the bubble render a real table/breakdown card instead of the
+    # plain Text `text` above. `text` is always still set (the model's
+    # own prose, or the deterministic text summary) so nothing regresses
+    # for tools this doesn't have a card for, and so reopening a past
+    # conversation from chat_db (which only ever stores `text`, not this)
+    # still shows something sensible.
+    structured_tool: str | None = None
+    structured_data: dict | None = None
 
 
 EXAMPLE_QUESTIONS = [
@@ -444,34 +454,405 @@ def build_avatar(role: str) -> ft.CircleAvatar:
     )
 
 
+# --------------------------------------------------------------------------
+# Structured result cards (BOM tables / cost breakdowns)
+#
+# Renders the real found=True dict a cost/BOM tool returned (see
+# AiOrchestrator.last_structured_tool/last_structured_result in
+# ai_orchestrator.py) as actual Flet widgets -- a styled table with a
+# totals footer, Make/Buy chips, and per-row cost-share bars -- instead of
+# the plain text lines _format_get_assembly_bom_answer() etc. produce for
+# the model's own context. Purely a display change: every number here is
+# read directly off the same dict the text formatters already use, none
+# of it is recomputed.
+# --------------------------------------------------------------------------
+
+COLOR_CHIP_MAKE_BG = "#E3F2E5"
+COLOR_CHIP_MAKE_TEXT = "#2E7D32"
+COLOR_CHIP_BUY_BG = "#E3ECFB"
+COLOR_CHIP_BUY_TEXT = COLOR_ACCENT
+COLOR_CHIP_BUY_NOPRICE_BG = "#FFF3E0"
+COLOR_CHIP_BUY_NOPRICE_TEXT = "#B26A00"
+
+COST_BAR_TRACK_WIDTH = 80
+COST_BAR_HEIGHT = 5
+COST_BAR_TRACK_COLOR = "#E4E9F1"
+COST_BAR_FILL_COLOR = COLOR_ACCENT
+
+# Above this many BOM rows, show a one-line summary bubble with a "View
+# Full BOM" toggle instead of the full table by default (Step 5) -- a
+# small BOM is more useful shown in full immediately.
+BOM_SUMMARY_ROW_THRESHOLD = 5
+
+CARD_TOP_RADIUS = ft.BorderRadius(top_left=BUBBLE_RADIUS, top_right=BUBBLE_RADIUS, bottom_left=0, bottom_right=0)
+CARD_BOTTOM_RADIUS = ft.BorderRadius(top_left=0, top_right=0, bottom_left=BUBBLE_RADIUS, bottom_right=BUBBLE_RADIUS)
+
+
+def _fmt_mass(value) -> str:
+    return f"{value:.3f} kg" if isinstance(value, (int, float)) else "—"
+
+
+def _fmt_money(value) -> str:
+    return f"Rs {value:,.2f}" if isinstance(value, (int, float)) else "—"
+
+
+def build_classification_chip(classification: str) -> ft.Container:
+    if classification == "Make":
+        bg, text_color, label = COLOR_CHIP_MAKE_BG, COLOR_CHIP_MAKE_TEXT, "Make"
+    elif classification == "Buy":
+        bg, text_color, label = COLOR_CHIP_BUY_BG, COLOR_CHIP_BUY_TEXT, "Buy"
+    else:  # "Buy - price not available"
+        bg, text_color, label = COLOR_CHIP_BUY_NOPRICE_BG, COLOR_CHIP_BUY_NOPRICE_TEXT, "Buy (no price)"
+    return ft.Container(
+        content=ft.Text(label, size=11, weight=ft.FontWeight.W_600, color=text_color),
+        bgcolor=bg,
+        border_radius=10,
+        padding=pad_symmetric(horizontal=8, vertical=3),
+    )
+
+
+def build_cost_share_bar(fraction: float) -> ft.Container:
+    """A thin filled-track bar showing `fraction` (0..1) of some total --
+    the row's share of the assembly's total cost, or the material/
+    production split of a single part's cost. Two nested Containers (an
+    outer fixed-width "track" and an inner width-scaled "fill") rather
+    than a progress-bar control, to match this app's existing hand-built
+    Container-based styling instead of introducing a new widget family.
+    """
+    fraction = max(0.0, min(fraction, 1.0))
+    return ft.Container(
+        content=ft.Container(
+            width=COST_BAR_TRACK_WIDTH * fraction,
+            height=COST_BAR_HEIGHT,
+            bgcolor=COST_BAR_FILL_COLOR,
+            border_radius=3,
+        ),
+        width=COST_BAR_TRACK_WIDTH,
+        height=COST_BAR_HEIGHT,
+        bgcolor=COST_BAR_TRACK_COLOR,
+        border_radius=3,
+        alignment=ft.Alignment(-1, 0),
+    )
+
+
+def _card_header(text: str) -> ft.Container:
+    return ft.Container(
+        content=ft.Text(text, color=COLOR_HEADER_TEXT, size=12, weight=ft.FontWeight.W_600),
+        bgcolor=COLOR_HEADER_BG,
+        padding=pad_symmetric(horizontal=12, vertical=8),
+        border_radius=CARD_TOP_RADIUS,
+    )
+
+
+def _stat(label: str, value: str, value_color: str = COLOR_AI_TEXT) -> ft.Column:
+    return ft.Column(
+        [
+            ft.Text(label, size=11, color=COLOR_TIMESTAMP),
+            ft.Text(value, size=15, weight=ft.FontWeight.BOLD, color=value_color),
+        ],
+        spacing=2,
+    )
+
+
+def _card_container(children: list[ft.Control]) -> ft.Container:
+    return ft.Container(
+        content=ft.Column(children, spacing=0, tight=True),
+        border_radius=BUBBLE_RADIUS,
+        border=ft.Border.all(1, COLOR_AI_BORDER),
+        clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+        shadow=ft.BoxShadow(spread_radius=0, blur_radius=6, color="#14000000", offset=ft.Offset(0, 2)),
+    )
+
+
+def build_bom_totals_footer(totals: dict, manufacturing_process, quantity, missing_data: list[dict]) -> ft.Container:
+    stats = ft.Row(
+        [
+            _stat("Unique parts", str(totals.get("unique_part_count", "?"))),
+            _stat("Instances", str(totals.get("total_instance_count", "?"))),
+            _stat("Total mass", _fmt_mass(totals.get("total_assembly_mass_kg"))),
+            _stat("Cost / assembly", _fmt_money(totals.get("total_assembly_cost_one_unit_inr")), COLOR_ACCENT),
+            _stat(f"Total for {quantity}", _fmt_money(totals.get("total_assembly_cost_for_quantity_inr")), COLOR_ACCENT),
+        ],
+        spacing=22,
+        wrap=True,
+    )
+    footer_children = [
+        ft.Text(f"{manufacturing_process} · quantity {quantity}", size=11, color=COLOR_TIMESTAMP),
+        stats,
+    ]
+    if missing_data:
+        footer_children.append(
+            ft.Text(
+                f"{len(missing_data)} component(s) missing pricing data -- see chat text for details.",
+                size=11,
+                color=COLOR_ERROR_TEXT,
+            )
+        )
+    return ft.Container(
+        content=ft.Column(footer_children, spacing=8),
+        bgcolor=COLOR_CHAT_BG,
+        padding=pad_symmetric(horizontal=14, vertical=12),
+        border=ft.Border(top=ft.BorderSide(1, COLOR_AI_BORDER)),
+        border_radius=CARD_BOTTOM_RADIUS,
+    )
+
+
+def build_bom_rows_table(rows: list[dict], total_cost_one_unit) -> ft.Column:
+    header = ft.Container(
+        content=ft.Row(
+            [
+                ft.Text("Component", color=COLOR_HEADER_TEXT, size=12, weight=ft.FontWeight.W_600, expand=4),
+                ft.Text("Qty", color=COLOR_HEADER_TEXT, size=12, weight=ft.FontWeight.W_600, expand=1),
+                ft.Text("Unit Mass", color=COLOR_HEADER_TEXT, size=12, weight=ft.FontWeight.W_600, expand=2),
+                ft.Text("Total Mass", color=COLOR_HEADER_TEXT, size=12, weight=ft.FontWeight.W_600, expand=2),
+                ft.Text("Unit Cost", color=COLOR_HEADER_TEXT, size=12, weight=ft.FontWeight.W_600, expand=2),
+                ft.Text("Total Cost", color=COLOR_HEADER_TEXT, size=12, weight=ft.FontWeight.W_600, expand=3),
+            ],
+            spacing=8,
+        ),
+        bgcolor=COLOR_HEADER_BG,
+        padding=pad_symmetric(horizontal=12, vertical=8),
+        border_radius=CARD_TOP_RADIUS,
+    )
+
+    row_controls: list[ft.Control] = [header]
+    for i, row in enumerate(rows):
+        total_cost = row.get("total_cost_inr")
+        fraction = (
+            (total_cost / total_cost_one_unit)
+            if isinstance(total_cost, (int, float)) and total_cost_one_unit
+            else 0.0
+        )
+        name_cell = ft.Row(
+            [
+                ft.Text(
+                    row.get("part_name", "unnamed"),
+                    size=13,
+                    color=COLOR_AI_TEXT,
+                    weight=ft.FontWeight.W_500,
+                    overflow=ft.TextOverflow.ELLIPSIS,
+                ),
+                build_classification_chip(row.get("classification", "Make")),
+            ],
+            spacing=8,
+            tight=True,
+        )
+        cost_cell = ft.Column(
+            [
+                ft.Text(_fmt_money(total_cost), size=13, color=COLOR_AI_TEXT, weight=ft.FontWeight.W_600),
+                build_cost_share_bar(fraction),
+            ],
+            spacing=3,
+            tight=True,
+        )
+        row_controls.append(
+            ft.Container(
+                content=ft.Row(
+                    [
+                        ft.Container(name_cell, expand=4),
+                        ft.Text(str(row.get("quantity_per_assembly", "?")), size=13, color=COLOR_AI_TEXT, expand=1),
+                        ft.Text(_fmt_mass(row.get("unit_mass_kg")), size=13, color=COLOR_AI_TEXT, expand=2),
+                        ft.Text(_fmt_mass(row.get("total_mass_kg")), size=13, color=COLOR_AI_TEXT, expand=2),
+                        ft.Text(_fmt_money(row.get("unit_cost_inr")), size=13, color=COLOR_AI_TEXT, expand=2),
+                        ft.Container(cost_cell, expand=3),
+                    ],
+                    spacing=8,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                padding=pad_symmetric(horizontal=12, vertical=10),
+                bgcolor="#FFFFFF" if i % 2 == 0 else "#FAFBFD",
+                border=ft.Border(bottom=ft.BorderSide(1, COLOR_AI_BORDER)),
+            )
+        )
+    return ft.Column(row_controls, spacing=0, tight=True)
+
+
+def build_bom_card(data: dict, rows_key: str) -> ft.Control:
+    """`rows_key` is "bom" for get_assembly_bom, "cost_drivers" for
+    get_assembly_cost_drivers -- same row shape either way, just a
+    different key and (for cost_drivers) pre-sorted order.
+    """
+    rows = data.get(rows_key, [])
+    totals = data.get("totals", {})
+    manufacturing_process = data.get("manufacturing_process", "?")
+    quantity = data.get("quantity", "?")
+    missing_data = data.get("missing_data", [])
+    total_cost_one_unit = totals.get("total_assembly_cost_one_unit_inr")
+
+    table = build_bom_rows_table(rows, total_cost_one_unit)
+    footer = build_bom_totals_footer(totals, manufacturing_process, quantity, missing_data)
+    card = _card_container([table, footer])
+
+    if len(rows) <= BOM_SUMMARY_ROW_THRESHOLD:
+        return card
+
+    # Step 5: summary-first for large BOMs, expandable in place.
+    card.visible = False
+    view_button = ft.TextButton("View Full BOM")
+    summary_container = ft.Container(
+        content=ft.Row(
+            [
+                ft.Text(
+                    f"BOM generated — {totals.get('unique_part_count', '?')} unique parts, "
+                    f"{totals.get('total_instance_count', '?')} total instances, "
+                    f"{_fmt_money(total_cost_one_unit)} per assembly.",
+                    size=13,
+                    color=COLOR_AI_TEXT,
+                    expand=True,
+                ),
+                view_button,
+            ],
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        ),
+        bgcolor=COLOR_AI_BUBBLE,
+        border=ft.Border.all(1, COLOR_AI_BORDER),
+        border_radius=BUBBLE_RADIUS,
+        padding=pad_symmetric(horizontal=14, vertical=10),
+    )
+
+    def _toggle(e: ft.ControlEvent) -> None:
+        expanding = not card.visible
+        card.visible = expanding
+        summary_container.visible = not expanding
+        view_button.text = "Hide Full BOM" if expanding else "View Full BOM"
+        card.update()
+        summary_container.update()
+        view_button.update()
+
+    view_button.on_click = _toggle
+    return ft.Column([summary_container, card], spacing=8, tight=True)
+
+
+def build_cost_breakdown_card(data: dict) -> ft.Control:
+    """Single-part cost card for estimate_cost() -- only ever two line
+    items (material cost, production cost), so no Make/Buy chips or
+    per-row summary-collapse the way build_bom_card has; the cost-share
+    bar here shows each line's share of total_cost_per_unit_inr instead
+    of share of an assembly total.
+    """
+    material_cost = data.get("material_cost_per_unit_inr")
+    production_cost = data.get("production_cost_per_unit_inr")
+    total_cost = data.get("total_cost_per_unit_inr")
+    total_for_qty = data.get("total_cost_for_quantity_inr")
+    quantity = data.get("quantity", "?")
+    manufacturing_process = data.get("manufacturing_process", "?")
+    material_used = data.get("material_used", "?")
+
+    def line_item(label: str, value) -> ft.Container:
+        fraction = (value / total_cost) if isinstance(value, (int, float)) and total_cost else 0.0
+        return ft.Container(
+            content=ft.Column(
+                [
+                    ft.Row(
+                        [
+                            ft.Text(label, size=13, color=COLOR_AI_TEXT, weight=ft.FontWeight.W_500, expand=True),
+                            ft.Text(_fmt_money(value), size=13, color=COLOR_AI_TEXT, weight=ft.FontWeight.W_600),
+                        ]
+                    ),
+                    build_cost_share_bar(fraction),
+                ],
+                spacing=4,
+            ),
+            padding=pad_symmetric(horizontal=12, vertical=10),
+            border=ft.Border(bottom=ft.BorderSide(1, COLOR_AI_BORDER)),
+        )
+
+    header = _card_header(f"Cost breakdown — {material_used}")
+    rows = [
+        line_item("Material cost", material_cost),
+        line_item("Production cost", production_cost),
+    ]
+    footer = ft.Container(
+        content=ft.Column(
+            [
+                ft.Text(f"{manufacturing_process} · quantity {quantity}", size=11, color=COLOR_TIMESTAMP),
+                ft.Row(
+                    [
+                        _stat("Cost / unit", _fmt_money(total_cost), COLOR_ACCENT),
+                        _stat(f"Total for {quantity}", _fmt_money(total_for_qty), COLOR_ACCENT),
+                    ],
+                    spacing=24,
+                ),
+            ],
+            spacing=8,
+        ),
+        bgcolor=COLOR_CHAT_BG,
+        padding=pad_symmetric(horizontal=14, vertical=12),
+        border=ft.Border(top=ft.BorderSide(1, COLOR_AI_BORDER)),
+        border_radius=CARD_BOTTOM_RADIUS,
+    )
+    return _card_container([header, *rows, footer])
+
+
+# Tool name -> (result dict) -> Flet control. Only tools whose found=True
+# shape this app actually knows how to render as a card; every other tool
+# (get_mass, run_dfm_check, etc.) keeps using the plain text bubble below,
+# unchanged.
+STRUCTURED_CARD_BUILDERS = {
+    "get_assembly_bom": lambda data: build_bom_card(data, "bom"),
+    "get_assembly_cost_drivers": lambda data: build_bom_card(data, "cost_drivers"),
+    "estimate_cost": build_cost_breakdown_card,
+}
+
+
 def build_bubble(message: ChatMessage, page_width_hint: int) -> ft.Container:
     is_user = message.role == "user"
     is_error = message.role == "error"
 
-    bubble_color = (
-        COLOR_ERROR_BUBBLE if is_error else COLOR_USER_BUBBLE if is_user else COLOR_AI_BUBBLE
+    card_builder = (
+        STRUCTURED_CARD_BUILDERS.get(message.structured_tool)
+        if message.role == "ai" and message.structured_data is not None
+        else None
     )
-    text_color = COLOR_ERROR_TEXT if is_error else COLOR_USER_TEXT if is_user else COLOR_AI_TEXT
 
-    bubble = ft.Container(
-        content=ft.Text(
-            message.text,
-            color=text_color,
-            size=FONT_SIZE_MESSAGE,
-            font_family=FONT_FAMILY,
-            selectable=True,
-        ),
-        bgcolor=bubble_color,
-        padding=pad_symmetric(horizontal=14, vertical=10),
-        border_radius=BUBBLE_RADIUS,
-        border=None if is_user or is_error else ft.Border.all(1, COLOR_AI_BORDER),
-        shadow=ft.BoxShadow(
-            spread_radius=0,
-            blur_radius=6,
-            color="#14000000",
-            offset=ft.Offset(0, 2),
-        ),
-    )
+    if card_builder is not None:
+        # The card widget (build_bom_card/build_cost_breakdown_card) already
+        # carries its own border/shadow/radius via _card_container, so the
+        # wrapping wrapper here stays unstyled -- adding COLOR_AI_BUBBLE's
+        # border/shadow on top would double it up. Text still renders too,
+        # right below the card, so anything the model added beyond the raw
+        # numbers (caveats, units, follow-up prompts) isn't lost.
+        bubble = ft.Column(
+            [
+                card_builder(message.structured_data),
+                ft.Text(
+                    message.text,
+                    color=COLOR_AI_TEXT,
+                    size=FONT_SIZE_MESSAGE,
+                    font_family=FONT_FAMILY,
+                    selectable=True,
+                ),
+            ],
+            spacing=8,
+            tight=True,
+        )
+        bubble_max_width_ratio = 0.92
+    else:
+        bubble_color = (
+            COLOR_ERROR_BUBBLE if is_error else COLOR_USER_BUBBLE if is_user else COLOR_AI_BUBBLE
+        )
+        text_color = COLOR_ERROR_TEXT if is_error else COLOR_USER_TEXT if is_user else COLOR_AI_TEXT
+        bubble = ft.Container(
+            content=ft.Text(
+                message.text,
+                color=text_color,
+                size=FONT_SIZE_MESSAGE,
+                font_family=FONT_FAMILY,
+                selectable=True,
+            ),
+            bgcolor=bubble_color,
+            padding=pad_symmetric(horizontal=14, vertical=10),
+            border_radius=BUBBLE_RADIUS,
+            border=None if is_user or is_error else ft.Border.all(1, COLOR_AI_BORDER),
+            shadow=ft.BoxShadow(
+                spread_radius=0,
+                blur_radius=6,
+                color="#14000000",
+                offset=ft.Offset(0, 2),
+            ),
+        )
+        bubble_max_width_ratio = BUBBLE_MAX_WIDTH_RATIO
 
     meta = ft.Row(
         [
@@ -491,7 +872,7 @@ def build_bubble(message: ChatMessage, page_width_hint: int) -> ft.Container:
 
     wrapper = ft.Container(
         content=column,
-        width=int(page_width_hint * BUBBLE_MAX_WIDTH_RATIO),
+        width=int(page_width_hint * bubble_max_width_ratio),
         opacity=0,
         offset=ft.Offset(0, 0.08),
         animate_opacity=ft.Animation(ANIM_DURATION_MS, ft.AnimationCurve.EASE_OUT),
@@ -1104,13 +1485,19 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
         chat_list.controls.append(loading_row)
         page.update()
 
+        structured_tool: str | None = None
+        structured_data: dict | None = None
         try:
-            answer = await asyncio.to_thread(run_ai_orchestrator, text)
+            answer, structured_tool, structured_data = await asyncio.to_thread(
+                run_ai_orchestrator_with_data, text
+            )
             role = "ai"
         except Exception as exc:  # last-resort UI-side guard; orchestrator never raises
             answer = f"Unexpected error: {exc}"
             role = "error"
 
+        # chat_db has no column for structured_data (see ChatMessage's
+        # docstring) -- only the text answer is persisted, same as before.
         chat_db.add_message(conversation_id, role, answer)
 
         # The user may have switched conversations (sidebar click / New Chat)
@@ -1121,7 +1508,9 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
         if state["conversation_id"] == conversation_id:
             if loading_row in chat_list.controls:
                 chat_list.controls.remove(loading_row)
-            await add_bubble_animated(ChatMessage(role, answer, timestamp_now()))
+            await add_bubble_animated(
+                ChatMessage(role, answer, timestamp_now(), structured_tool, structured_data)
+            )
 
         message_input.disabled = False
         page.update()

@@ -337,6 +337,16 @@ class AiOrchestrator:
         self._last_quantity: int | None = None
         self._last_manufacturing_process: str | None = None
         self._current_question: str = ""
+        # The name and parsed found=True JSON of the last successful
+        # cost/BOM tool call made while answering the CURRENT ask() turn --
+        # reset at the top of every ask() call. Lets a caller that wants
+        # more than the final prose answer (e.g. a UI rendering a real
+        # table instead of text lines) get at the same structured data the
+        # deterministic text formatters already read, without re-parsing
+        # the prose back into numbers. None for turns that never called a
+        # cost/BOM tool, or where the call didn't succeed.
+        self.last_structured_tool: str | None = None
+        self.last_structured_result: dict | None = None
 
     async def start(self) -> None:
         """Launch the MCP server subprocess and fetch its tool definitions.
@@ -417,6 +427,8 @@ class AiOrchestrator:
 
         self._history.append({"role": "user", "content": question})
         self._current_question = question
+        self.last_structured_tool = None
+        self.last_structured_result = None
 
         # (tool_name, sorted-args-json) signatures already executed in this
         # ask() call -- see _execute_tool_call_deduped's docstring for why
@@ -616,6 +628,15 @@ class AiOrchestrator:
             self._last_quantity = arguments["quantity"]
         if "manufacturing_process" in arguments:
             self._last_manufacturing_process = arguments["manufacturing_process"]
+        # Last successful cost/BOM call's raw data, for callers that want
+        # to render structured UI (a real table) instead of prose -- see
+        # this class's last_structured_tool/last_structured_result
+        # docstring in __init__. Overwritten by each subsequent successful
+        # call within the same ask() turn, so it ends up holding whichever
+        # call actually backs the final answer (e.g. the get_assembly_bom
+        # call an estimate_cost-on-assembly rejection auto-redirects to).
+        self.last_structured_tool = name
+        self.last_structured_result = data
         self._history.append(
             {
                 "role": "system",
@@ -775,22 +796,39 @@ def run_ai_orchestrator(user_message: str) -> str:
     open) is caught here and turned into a plain-language string instead
     of an exception, so callers never need a try/except around this.
     """
+    answer, _tool_name, _data = asyncio.run(_run_ai_orchestrator_async(user_message))
+    return answer
+
+
+def run_ai_orchestrator_with_data(user_message: str) -> tuple[str, str | None, dict | None]:
+    """Same one-shot call as run_ai_orchestrator(), but also returns the
+    name and parsed found=True JSON of the last successful cost/BOM tool
+    call this question triggered (both None if it never called one, or
+    the call didn't succeed) -- see AiOrchestrator.last_structured_tool/
+    last_structured_result's docstring. For a UI that wants to render a
+    real table/breakdown card from the same numbers already backing the
+    prose answer, instead of trying to re-parse that prose back into
+    numbers.
+    """
     return asyncio.run(_run_ai_orchestrator_async(user_message))
 
 
-async def _run_ai_orchestrator_async(user_message: str) -> str:
+async def _run_ai_orchestrator_async(
+    user_message: str,
+) -> tuple[str, str | None, dict | None]:
     orchestrator = AiOrchestrator()
 
     try:
         await orchestrator.start()
     except McpServerUnavailableError as e:
-        return f"Couldn't reach the CAD MCP server: {e}"
+        return f"Couldn't reach the CAD MCP server: {e}", None, None
 
     try:
-        return await orchestrator.ask(user_message)
+        answer = await orchestrator.ask(user_message)
+        return answer, orchestrator.last_structured_tool, orchestrator.last_structured_result
     except OllamaUnavailableError as e:
-        return f"Couldn't reach Ollama: {e}"
+        return f"Couldn't reach Ollama: {e}", None, None
     except Exception as e:  # noqa: BLE001 - last resort, never crash the caller
-        return f"Something went wrong answering that question: {e}"
+        return f"Something went wrong answering that question: {e}", None, None
     finally:
         await orchestrator.stop()
