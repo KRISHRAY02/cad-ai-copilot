@@ -667,6 +667,13 @@ class FusionAdapter(CadAdapter):
                 if material_data is not None
                 else None
             )
+            # False if the bridge's _read_component_material() flagged this
+            # as Fusion's own built-in default material rather than
+            # something the designer actually assigned -- see that
+            # function's docstring for the live-diagnosed "9 unrelated
+            # components all silently read as Steel" bug this exists for.
+            # None (not False) when there's no material to verify at all.
+            material_verified = material_data.get("verified") if material_data is not None else None
 
             bounding_box = row.get("bounding_box_mm")
             components.append(
@@ -683,6 +690,7 @@ class FusionAdapter(CadAdapter):
                     face_count=row["face_count"],
                     bend_count=row["bend_count"],
                     bounding_box_mm=tuple(bounding_box) if bounding_box is not None else None,
+                    material_verified=material_verified,
                 )
             )
         return components

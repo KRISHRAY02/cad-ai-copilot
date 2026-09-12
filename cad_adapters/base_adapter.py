@@ -119,6 +119,17 @@ class AssemblyComponent:
     face_count: int | None
     bend_count: int | None
     bounding_box_mm: tuple[float, float, float] | None
+    # True: `material` was read with confidence it's a real, deliberately
+    # assigned material. False: `material` resolved to *something*, but
+    # it's suspected to be the CAD platform's own untouched default rather
+    # than something the designer actually picked -- see
+    # FusionAdapter.get_assembly_components()'s docstring for the concrete
+    # case this exists for (every unassigned Fusion body silently resolves
+    # to the same built-in "Steel" Material object; there's no public API
+    # flag to tell that apart from a real assignment, so this is a
+    # heuristic, not a certainty). None: not applicable (`material` itself
+    # is None -- nothing to verify).
+    material_verified: bool | None
 
 
 class CadAdapter(ABC):
@@ -435,6 +446,13 @@ class CadAdapter(ABC):
                 "configuration": component.configuration,
                 "classification": classification,
                 "material": material_name,
+                # False: material resolved to something, but the adapter
+                # suspects it's an unmodified CAD-platform default rather
+                # than a real designer assignment (see AssemblyComponent.
+                # material_verified's docstring) -- downstream display
+                # should show a warning rather than presenting it as
+                # confirmed. None: not applicable (no material at all).
+                "material_verified": component.material_verified,
                 "quantity_per_assembly": component.quantity,
                 "unit_mass_kg": unit_mass_kg,
                 "total_mass_kg": total_mass_for_row,

@@ -43,6 +43,19 @@ import adsk.fusion
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 19191
 
+# Fusion's built-in stock "Steel" Physical Material -- part of the base
+# material library shipped with every Fusion install, auto-assigned to any
+# BRepBody the designer never explicitly changed materials on (confirmed
+# live 2026-09-12 -- see _read_component_material()'s docstring). This id
+# is baked into Fusion's bundled library, not user-/document-generated, so
+# it's expected to be stable across documents and installs of the same
+# Fusion release; if a future Fusion version ever changes it, the practical
+# symptom would be material_verified silently going back to always-True
+# rather than a crash, so this is worth re-confirming (same live-diagnostic
+# approach: check whether several unrelated components share one Material
+# id) if BUG 1 (materials silently reading "Steel") ever resurfaces.
+_FUSION_DEFAULT_MATERIAL_ID = "PrismMaterial-018"
+
 # adsk.core.DocumentTypes enum values -> human-readable strings. Fusion
 # doesn't have SolidWorks' part/assembly/drawing split (a single Fusion
 # "design" document can contain many components, i.e. what SolidWorks
@@ -641,6 +654,29 @@ def _read_component_material(component):
     """Material of the component's first body -- same single-material-
     per-part scope as _get_material() (which reads the whole design's
     first body); reused here per-component instead of per-document.
+
+    Also reports `verified` (bool): False if this material resolved to
+    Fusion's own built-in default physical material ("Steel",
+    _FUSION_DEFAULT_MATERIAL_ID) rather than a genuine per-component
+    signal. **Diagnosed live 2026-09-12 against a real 99-component
+    assembly**: BRepBody.material NEVER returns None for a body that
+    exists (Fusion auto-assigns this same built-in Material object to
+    every body the designer never explicitly changed materials on) --
+    confirmed by a temporary diagnostic showing 9 completely unrelated
+    components (foam, rubber, leather, ABS parts) all resolving to the
+    exact same Material.id ("PrismMaterial-018"), while two components
+    that genuinely had materials assigned ("Handle" -> Stainless Steel
+    AISI 304, "Rubber Plug" -> Rubber, Butyl) each had distinct ids.
+    Checked Fusion's own API docs for a documented way to tell "explicitly
+    assigned" apart from "still on the default" -- BRepFace has
+    `appearanceSourceType` for this exact distinction on *appearance*, but
+    there is no equivalent for *physical material*, so id-matching against
+    the known default is the best available signal, not a certainty: a
+    component whose designer deliberately chose this exact stock "Steel"
+    material (and never touched anything else about it) would also read
+    as verified=False here. That's the intentionally conservative
+    direction -- never presenting a possibly-untouched default as
+    confirmed real data.
     """
     bodies = list(component.bRepBodies)
     if not bodies:
@@ -666,7 +702,18 @@ def _read_component_material(component):
     except Exception:
         pass
 
-    return {"name": name, "density_kg_m3": density_kg_m3, "category": ""}
+    verified = True
+    try:
+        verified = material.id != _FUSION_DEFAULT_MATERIAL_ID
+    except Exception:
+        pass  # can't check the id -- default to trusting the read
+
+    return {
+        "name": name,
+        "density_kg_m3": density_kg_m3,
+        "category": "",
+        "verified": verified,
+    }
 
 
 def _read_component_bend_count(design, component) -> int:

@@ -530,6 +530,14 @@ class SolidWorksAdapter(CadAdapter):
                 face_count=data["face_count"],
                 bend_count=data["bend_count"],
                 bounding_box_mm=data["bounding_box_mm"],
+                # SOLIDWORKS' GetMaterialPropertyName2 can already
+                # distinguish "no material assigned" (empty string, ->
+                # material=None here) from a real assignment -- unlike
+                # Fusion, there's no documented "silently defaults to the
+                # same built-in object" ambiguity for SolidWorks parts, so
+                # a resolved material is trusted outright. See
+                # AssemblyComponent.material_verified's docstring.
+                material_verified=True if data["material"] is not None else None,
             )
             for key in order
             for data in [aggregated[key]]

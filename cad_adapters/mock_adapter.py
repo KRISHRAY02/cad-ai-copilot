@@ -365,6 +365,9 @@ class MockAdapter(CadAdapter):
                 face_count=data["face_count"],
                 bend_count=data["bend_count"],
                 bounding_box_mm=data["bounding_box_mm"],
+                # Synthetic demo data -- always a deliberately-set material,
+                # never an untouched-default ambiguity to flag.
+                material_verified=True if data["material"] is not None else None,
             )
             for key in order
             for data in [aggregated[key]]
