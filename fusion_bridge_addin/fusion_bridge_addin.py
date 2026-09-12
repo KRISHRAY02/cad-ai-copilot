@@ -28,6 +28,7 @@ separately.
 
 import json
 import math
+import re
 import threading
 import traceback
 import urllib.parse
@@ -762,15 +763,90 @@ def _get_is_assembly() -> dict:
     return {"is_assembly": is_asm}
 
 
+# Fusion auto-appends " (N)" to a Component's name specifically when it's
+# inserted again after a name collision with an already-existing Component
+# -- confirmed live 2026-09-12 against a real 99-component assembly whose
+# BOM was full of e.g. "...Screw ... v1", "...v1 (1)" through "...v1 (5)",
+# each a genuinely SEPARATE Component object (distinct Component.id) rather
+# than repeated Occurrences of one Component, so the per-Component.id
+# aggregation in _get_assembly_components() below never combined them (that
+# aggregation is correct for -- and must stay correct for -- the common
+# "one Component, patterned/mirrored N times" case, e.g. a "Handle" that's
+# genuinely one Component referenced by 18 Occurrences).
+_INSTANCE_SUFFIX_RE = re.compile(r"\s*\(\d+\)\s*$")
+
+
+def _merge_duplicate_component_instances(aggregated: dict, order: list) -> tuple[dict, list]:
+    """Fold rows whose Component.name matches after stripping a trailing
+    " (N)" AND whose mass/volume/bounding box match into one row, summing
+    quantity -- see _INSTANCE_SUFFIX_RE's comment for why this is needed
+    on top of (not instead of) the existing Component.id aggregation.
+
+    Requires geometry to match, not just the stripped name, specifically
+    so two genuinely different components that happen to share a name
+    prefix aren't merged into a wrong combined row -- confirmed live that
+    real duplicate inserts of the same hardware are bit-identical on
+    mass_kg/volume_m3/bounding_box_mm, including a pair with the exact
+    same full name and NO "(N)" suffix at all (Fusion only appends the
+    suffix starting from the *second* colliding insert, so the first
+    inserted copy keeps the bare name -- matching on geometry alone would
+    still catch that case even without any name-stripping).
+    None geometry values only match None (never treated as equal to a
+    real number), so two components that both failed to report geometry
+    are NOT merged just because they're both missing data -- that would
+    risk merging two actually-different unreadable components.
+    """
+    merge_key_for_key: dict = {}
+    for key in order:
+        row = aggregated[key]
+        base_name = _INSTANCE_SUFFIX_RE.sub("", row["part_name"]).strip()
+        bbox = row.get("bounding_box_mm")
+        merge_key_for_key[key] = (
+            base_name,
+            round(row["mass_kg"], 6) if row["mass_kg"] is not None else None,
+            round(row["volume_m3"], 9) if row["volume_m3"] is not None else None,
+            tuple(round(d, 3) for d in bbox) if bbox is not None else None,
+        )
+
+    merged: dict = {}
+    merged_order: list = []
+    for key in order:
+        row = aggregated[key]
+        merge_key = merge_key_for_key[key]
+        if merge_key not in merged:
+            merged_row = dict(row)
+            merged_row["part_name"] = merge_key[0]  # the shared, suffix-stripped name
+            merged[merge_key] = merged_row
+            merged_order.append(merge_key)
+        else:
+            # First-encountered row's parent_assembly/level win -- same
+            # "first occurrence" simplification base_adapter.py's
+            # AssemblyComponent docstring already documents.
+            merged[merge_key]["quantity"] += row["quantity"]
+
+    return merged, merged_order
+
+
 def _get_assembly_components() -> dict:
     """Recursively walk the design's occurrence tree (root ->
     childOccurrences, all the way down) and return one row per unique
-    Component, aggregated by Component.id across the WHOLE tree --
-    Fusion's occurrence model means the same Component can legitimately
-    be referenced by many Occurrences (e.g. 8 identical bolts), and
-    Component.id (a documented persistent, stable identifier) is what
-    identifies "the same underlying part" the way a (file_path,
-    configuration) pair does for solidworks_adapter.py.
+    real-world part, in two aggregation passes:
+
+    1. By Component.id across the WHOLE tree -- Fusion's occurrence model
+       means the same Component can legitimately be referenced by many
+       Occurrences (e.g. 8 identical bolts), and Component.id (a
+       documented persistent, stable identifier) is what identifies "the
+       same underlying part" the way a (file_path, configuration) pair
+       does for solidworks_adapter.py.
+    2. _merge_duplicate_component_instances() -- a SEPARATE case pass 1
+       can't catch: inserting the same hardware/library part multiple
+       times sometimes creates multiple *distinct* Component objects
+       (different ids) rather than multiple Occurrences of one Component,
+       which Fusion then disambiguates in the tree by auto-suffixing the
+       second-and-later copies' names with " (N)". See that function's
+       docstring for the live-diagnosed evidence and the name+geometry
+       matching this uses to fold those back into one row without
+       merging two genuinely different parts.
 
     An occurrence with further childOccurrences is a sub-assembly (no row
     emitted for it -- only its leaf descendants become rows, exactly
@@ -868,7 +944,8 @@ def _get_assembly_components() -> dict:
     for occurrence in root.occurrences:
         visit(occurrence, None, 0)
 
-    return {"components": [aggregated[key] for key in order]}
+    merged, merged_order = _merge_duplicate_component_instances(aggregated, order)
+    return {"components": [merged[key] for key in merged_order]}
 
 
 # -- Open document --------------------------------------------------------
