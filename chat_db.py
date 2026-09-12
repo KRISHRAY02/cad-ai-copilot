@@ -10,6 +10,7 @@ datetimes are naive local time -- there's no multi-timezone concern for a
 single desktop app.
 """
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
@@ -36,6 +37,16 @@ class Message:
     role: str
     content: str
     created_at: str
+    # The tool name + parsed JSON behind an "ai" message's structured chat
+    # card (see desktop_app.py's STRUCTURED_CARD_BUILDERS) -- both None for
+    # every message that's plain text only (user messages, errors, or an
+    # "ai" answer no card exists for). Persisted so a card (BOM table,
+    # component listing, cost breakdown) still renders when a past
+    # conversation is reopened, including after logging out and back in --
+    # previously only `content` (the plain text) was stored, so a reopened
+    # conversation always fell back to the text-only bubble.
+    structured_tool: str | None = None
+    structured_data: dict | None = None
 
 
 def _connect() -> sqlite3.Connection:
@@ -94,6 +105,17 @@ def init_db() -> None:
         existing_user_columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
         if "last_used_platform" not in existing_user_columns:
             conn.execute("ALTER TABLE users ADD COLUMN last_used_platform TEXT")
+
+        # Migration for a messages table created before structured chat
+        # cards existed. NULL for every pre-existing row (and for every
+        # user/error message going forward) -- get_messages() only
+        # attempts to render a card when structured_tool is non-NULL, so
+        # old rows simply keep showing as plain text, not a broken card.
+        existing_message_columns = {row["name"] for row in conn.execute("PRAGMA table_info(messages)")}
+        if "structured_tool" not in existing_message_columns:
+            conn.execute("ALTER TABLE messages ADD COLUMN structured_tool TEXT")
+        if "structured_data" not in existing_message_columns:
+            conn.execute("ALTER TABLE messages ADD COLUMN structured_data TEXT")
 
 
 def create_user(username: str, password: str) -> dict:
@@ -189,12 +211,26 @@ def set_conversation_title(conversation_id: int, title: str) -> None:
         )
 
 
-def add_message(conversation_id: int, role: str, content: str) -> None:
+def add_message(
+    conversation_id: int,
+    role: str,
+    content: str,
+    structured_tool: str | None = None,
+    structured_data: dict | None = None,
+) -> None:
     with _connect() as conn:
         conn.execute(
-            "INSERT INTO messages (conversation_id, role, content, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (conversation_id, role, content, datetime.now().isoformat()),
+            "INSERT INTO messages "
+            "(conversation_id, role, content, created_at, structured_tool, structured_data) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                conversation_id,
+                role,
+                content,
+                datetime.now().isoformat(),
+                structured_tool,
+                json.dumps(structured_data) if structured_data is not None else None,
+            ),
         )
 
 
@@ -215,14 +251,31 @@ def list_conversations(user_id: int) -> list[Conversation]:
 def get_messages(conversation_id: int) -> list[Message]:
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT id, conversation_id, role, content, created_at FROM messages "
+            "SELECT id, conversation_id, role, content, created_at, "
+            "structured_tool, structured_data FROM messages "
             "WHERE conversation_id = ? ORDER BY id ASC",
             (conversation_id,),
         ).fetchall()
-        return [
-            Message(r["id"], r["conversation_id"], r["role"], r["content"], r["created_at"])
-            for r in rows
-        ]
+        messages = []
+        for r in rows:
+            structured_data = None
+            if r["structured_data"] is not None:
+                try:
+                    structured_data = json.loads(r["structured_data"])
+                except json.JSONDecodeError:
+                    structured_data = None  # corrupt row -- fall back to plain text, don't crash
+            messages.append(
+                Message(
+                    r["id"],
+                    r["conversation_id"],
+                    r["role"],
+                    r["content"],
+                    r["created_at"],
+                    r["structured_tool"],
+                    structured_data,
+                )
+            )
+        return messages
 
 
 def delete_conversation(conversation_id: int, user_id: int) -> bool:

@@ -1248,26 +1248,14 @@ def build_bubble(message: ChatMessage, page_width_hint: int) -> ft.Container:
     )
 
     if card_builder is not None:
-        # The card widget (build_bom_card/build_cost_breakdown_card) already
-        # carries its own border/shadow/radius via _card_container, so the
-        # wrapping wrapper here stays unstyled -- adding COLOR_AI_BUBBLE's
-        # border/shadow on top would double it up. Text still renders too,
-        # right below the card, so anything the model added beyond the raw
-        # numbers (caveats, units, follow-up prompts) isn't lost.
-        bubble = ft.Column(
-            [
-                card_builder(message.structured_data),
-                ft.Text(
-                    message.text,
-                    color=COLOR_AI_TEXT,
-                    size=FONT_SIZE_MESSAGE,
-                    font_family=FONT_FAMILY,
-                    selectable=True,
-                ),
-            ],
-            spacing=8,
-            tight=True,
-        )
+        # The card widget (build_bom_card/build_cost_breakdown_card/etc.)
+        # already carries its own border/shadow/radius via _card_container,
+        # so the wrapping wrapper here stays unstyled -- adding
+        # COLOR_AI_BUBBLE's border/shadow on top would double it up. Just
+        # the card, no prose repeating the same numbers below it (Krish's
+        # explicit request -- the model's own text answer for these tools
+        # only ever restates what the card already shows).
+        bubble = card_builder(message.structured_data)
         bubble_max_width_ratio = 0.92
     else:
         bubble_color = (
@@ -1864,7 +1852,10 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
         empty_state.visible = len(messages) == 0
         for m in messages:
             row = build_bubble(
-                ChatMessage(m.role, m.content, chat_db.relative_time(m.created_at)),
+                ChatMessage(
+                    m.role, m.content, chat_db.relative_time(m.created_at),
+                    m.structured_tool, m.structured_data,
+                ),
                 bubble_width_hint(),
             )
             animated = row.data
@@ -1937,9 +1928,7 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
             answer = f"Unexpected error: {exc}"
             role = "error"
 
-        # chat_db has no column for structured_data (see ChatMessage's
-        # docstring) -- only the text answer is persisted, same as before.
-        chat_db.add_message(conversation_id, role, answer)
+        chat_db.add_message(conversation_id, role, answer, structured_tool, structured_data)
 
         # The user may have switched conversations (sidebar click / New Chat)
         # while the request above was in flight, which clears chat_list.
