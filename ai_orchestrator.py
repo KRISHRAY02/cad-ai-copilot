@@ -87,10 +87,18 @@ def _format_list_assembly_components_answer(tool_result_json: str) -> str | None
         return None
 
     components = data.get("components", [])
+    sub_assembly_count = data.get("sub_assembly_count")
+    sub_assembly_names = data.get("sub_assembly_names") or []
+    sub_assembly_bit = (
+        f", {sub_assembly_count} sub-assembly/assemblies "
+        f"({', '.join(sub_assembly_names)})"
+        if sub_assembly_count
+        else ""
+    )
     lines = [
         f"This assembly has {data.get('unique_part_count', len(components))} "
         f"unique component(s), {data.get('total_instance_count', '?')} "
-        "total instance(s):",
+        f"total instance(s){sub_assembly_bit}:",
         "",
     ]
     for c in components:
@@ -728,14 +736,22 @@ class AiOrchestrator:
         otherwise None. Only matches a name from `self._tools_schema`, so
         an ordinary text answer that happens to look JSON-ish is never
         misread as a tool call.
+
+        Observed live with qwen2.5:7b-instruct: it sometimes wraps the
+        leaked JSON in an XML-ish tag -- `<tool_response>\n{...}\n
+        </tool_response>` -- rather than emitting bare JSON. A plain
+        `json.loads(content)` chokes on the tag text and raises, so this
+        case fell all the way through to being shown to the user as the
+        literal raw `<tool_response>{...}</tool_response>` text instead
+        of the tool actually being called. Falls back to parsing just the
+        substring between the first "{" and the last "}" in `content`
+        when parsing the whole string outright fails, which recovers the
+        JSON regardless of what surrounds it.
         """
         if not content:
             return None
-        try:
-            parsed = json.loads(content)
-        except (json.JSONDecodeError, TypeError):
-            return None
-        if not isinstance(parsed, dict):
+        parsed = self._try_parse_json_object(content)
+        if parsed is None:
             return None
         name = parsed.get("name")
         arguments = parsed.get("arguments", {})
@@ -745,6 +761,24 @@ class AiOrchestrator:
         if name not in known_names:
             return None
         return name, arguments
+
+    @staticmethod
+    def _try_parse_json_object(text: str) -> dict | None:
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        start, end = text.find("{"), text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return None
+        try:
+            parsed = json.loads(text[start : end + 1])
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
 
     @staticmethod
     def _to_ollama_tool(tool) -> dict:

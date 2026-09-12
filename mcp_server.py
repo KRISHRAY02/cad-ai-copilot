@@ -654,16 +654,27 @@ def list_assembly_components() -> dict:
 
     Use this for purely structural/quantity questions like "list the
     components in this assembly", "how many unique parts are there",
-    "what quantity of [part] does this assembly use", or "what's this
-    assembly made of" -- anything that doesn't ask about cost. Do NOT ask
-    the user for a manufacturing process to answer this kind of question;
-    only get_assembly_bom/get_assembly_cost_drivers/export_bom (which
-    compute Make-part production cost) need one.
+    "how many sub-assemblies are there", "what quantity of [part] does
+    this assembly use", or "what's this assembly made of" -- anything
+    that doesn't ask about cost. Do NOT ask the user for a manufacturing
+    process to answer this kind of question; only get_assembly_bom/
+    get_assembly_cost_drivers/export_bom (which compute Make-part
+    production cost) need one.
 
     This tool's result is COMPLETE on its own for these questions -- do
     NOT follow it up by calling get_assembly_bom, get_assembly_cost_drivers,
     or any other tool "to be thorough". If the user didn't ask about cost,
     answer directly from this tool's output and stop.
+
+    `sub_assembly_count`/`sub_assembly_names`: every leaf component's
+    `parent_assembly` field already names the sub-assembly it's directly
+    inside (None for a top-level part) -- the distinct non-None values
+    across every component ARE the assembly's sub-assemblies. **Known
+    limitation**: a sub-assembly with no leaf parts of its own (only
+    further nested sub-assemblies) won't be counted, since nothing
+    records it as anyone's immediate parent -- this undercounts only in
+    that specific deeply-nested-with-no-direct-leaves case, never
+    overcounts.
 
     Returns found=False if the currently open document isn't an assembly
     (call get_current_part_info() first if you're not sure).
@@ -678,10 +689,13 @@ def list_assembly_components() -> dict:
         }
 
     components = adapter.get_assembly_components()
+    sub_assembly_names = sorted({c.parent_assembly for c in components if c.parent_assembly is not None})
     return {
         "found": True,
         "unique_part_count": len(components),
         "total_instance_count": sum(c.quantity for c in components),
+        "sub_assembly_count": len(sub_assembly_names),
+        "sub_assembly_names": sub_assembly_names,
         "components": [dataclasses.asdict(c) for c in components],
     }
 
