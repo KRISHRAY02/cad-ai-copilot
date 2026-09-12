@@ -593,7 +593,20 @@ def build_material_warning_icon(material_name) -> ft.Icon:
     )
 
 
-def build_bom_totals_footer(totals: dict, manufacturing_process, quantity, missing_data: list[dict], unverified_count: int) -> ft.Container:
+def build_bom_stats_block(
+    totals: dict,
+    manufacturing_process,
+    quantity,
+    missing_data: list[dict],
+    unverified_count: int,
+    position: str = "bottom",
+) -> ft.Container:
+    """The tinted, bordered stats block shared by the single-flat-table BOM
+    card (as a footer, `position="bottom"`) and the categorized BOM view's
+    prominent summary-first header (`position="top"`) -- same visual
+    language either way, just which edge carries the border/radius and
+    which corners round off.
+    """
     stats = ft.Row(
         [
             _stat("Unique parts", str(totals.get("unique_part_count", "?"))),
@@ -605,19 +618,19 @@ def build_bom_totals_footer(totals: dict, manufacturing_process, quantity, missi
         spacing=22,
         wrap=True,
     )
-    footer_children = [
+    children = [
         ft.Text(f"{manufacturing_process} · quantity {quantity}", size=11, color=COLOR_TIMESTAMP),
         stats,
     ]
     if unverified_count:
-        footer_children.append(
+        children.append(
             ft.Row(
                 [
                     ft.Icon(ft.Icons.WARNING_AMBER_ROUNDED, size=13, color=COLOR_WARNING_ICON),
                     ft.Text(
                         f"{unverified_count} component(s) have an unverified material "
-                        "(⚠ icon above) -- may be the CAD platform's untouched default, "
-                        "not a real assignment.",
+                        "(⚠ icon in the table below) -- may be the CAD platform's "
+                        "untouched default, not a real assignment.",
                         size=11,
                         color=COLOR_WARNING_TEXT,
                     ),
@@ -626,7 +639,7 @@ def build_bom_totals_footer(totals: dict, manufacturing_process, quantity, missi
             )
         )
     if missing_data:
-        footer_children.append(
+        children.append(
             ft.Text(
                 f"{len(missing_data)} component(s) missing pricing data -- see chat text for details.",
                 size=11,
@@ -634,12 +647,19 @@ def build_bom_totals_footer(totals: dict, manufacturing_process, quantity, missi
             )
         )
     return ft.Container(
-        content=ft.Column(footer_children, spacing=8),
+        content=ft.Column(children, spacing=8),
         bgcolor=COLOR_CHAT_BG,
         padding=pad_symmetric(horizontal=14, vertical=12),
-        border=ft.Border(top=ft.BorderSide(1, COLOR_AI_BORDER)),
-        border_radius=CARD_BOTTOM_RADIUS,
+        border=ft.Border(
+            top=ft.BorderSide(1, COLOR_AI_BORDER) if position == "bottom" else None,
+            bottom=ft.BorderSide(1, COLOR_AI_BORDER) if position == "top" else None,
+        ),
+        border_radius=CARD_BOTTOM_RADIUS if position == "bottom" else CARD_TOP_RADIUS,
     )
+
+
+def build_bom_totals_footer(totals: dict, manufacturing_process, quantity, missing_data: list[dict], unverified_count: int) -> ft.Container:
+    return build_bom_stats_block(totals, manufacturing_process, quantity, missing_data, unverified_count, position="bottom")
 
 
 def build_bom_rows_table(rows: list[dict], total_cost_one_unit) -> ft.Column:
@@ -774,6 +794,165 @@ def build_bom_card(data: dict, rows_key: str) -> ft.Control:
     return ft.Column([summary_container, card], spacing=8, tight=True)
 
 
+# --------------------------------------------------------------------------
+# Category grouping for get_assembly_bom()'s categorized view
+#
+# Pure display-layer heuristic -- buckets rows by simple keyword matches on
+# part_name, purely for how the BOM is presented in chat. Doesn't touch
+# get_assembly_cost_drivers() (still the flat, cost-ranked build_bom_card
+# above -- categorizing would defeat the point of "highest cost first").
+# --------------------------------------------------------------------------
+
+# Checked in this order -- e.g. "Wheel Axle Bolt" should land in Fasteners
+# (its own real category), not get swept into Wheels & Casters just
+# because "wheel"/"axle" also appear in the name, so Fasteners' fairly
+# unambiguous keywords are checked first.
+_CATEGORY_KEYWORDS = {
+    "Fasteners & Hardware": [
+        "screw", "bolt", "nut", "washer", "tee-nut", "tee nut", "insert",
+        "rivet", "pin", "fastener", "anchor", "threaded rod", "hex ",
+    ],
+    "Soft Goods": [
+        "foam", "leather", "rubber", "anti-slip", "anti slip", "mat",
+        "cushion", "upholstery", "fabric", "padding",
+    ],
+    "Wheels & Casters": ["wheel", "caster", "castor", "tire", "tyre", "roller", "axle"],
+    "Structural/Frame": [
+        "tube", "bracket", "plate", "frame", "beam", "rail", "channel",
+        "gusset", "support", "chassis",
+    ],
+}
+
+# Render order -- Fasteners & Hardware deliberately placed just before the
+# "Other" catch-all (Step 2: collapsed by default, rarely need individual
+# review), everything else expanded and shown first.
+CATEGORY_DISPLAY_ORDER = [
+    "Structural/Frame",
+    "Wheels & Casters",
+    "Soft Goods",
+    "Fasteners & Hardware",
+    "Other",
+]
+
+_CATEGORIES_COLLAPSED_BY_DEFAULT = {"Fasteners & Hardware"}
+
+
+def categorize_component(part_name: str) -> str:
+    name_lower = (part_name or "").lower()
+    for category in CATEGORY_DISPLAY_ORDER:
+        for keyword in _CATEGORY_KEYWORDS.get(category, []):
+            if keyword in name_lower:
+                return category
+    return "Other"
+
+
+def _group_rows_by_category(rows: list[dict]) -> dict[str, list[dict]]:
+    groups: dict[str, list[dict]] = {category: [] for category in CATEGORY_DISPLAY_ORDER}
+    for row in rows:
+        groups[categorize_component(row.get("part_name", ""))].append(row)
+    return groups
+
+
+def _category_subtotal(rows: list[dict]) -> dict:
+    mass_values = [r["total_mass_kg"] for r in rows if isinstance(r.get("total_mass_kg"), (int, float))]
+    cost_values = [r["total_cost_inr"] for r in rows if isinstance(r.get("total_cost_inr"), (int, float))]
+    return {
+        "part_count": len(rows),
+        "total_instances": sum(r.get("quantity_per_assembly", 0) or 0 for r in rows),
+        "total_mass_kg": sum(mass_values) if mass_values else None,
+        "total_cost_inr": sum(cost_values) if cost_values else None,
+    }
+
+
+def build_category_section(category: str, rows: list[dict], total_cost_one_unit, collapsed_by_default: bool) -> ft.Control:
+    """One collapsible category section: a clickable dark header line
+    (category name + its own subtotal, Step 1) that toggles the full
+    Component/Qty/.../Total Cost table (Steps 1, 3, 4 -- reused from
+    build_bom_rows_table unchanged) below it. `collapsed_by_default` is a
+    fixed per-category rule (Fasteners & Hardware only, Step 2), not the
+    row-count heuristic build_bom_card's large-BOM collapse uses.
+    """
+    subtotal = _category_subtotal(rows)
+    unverified_count = sum(1 for r in rows if r.get("material_verified") is False)
+
+    summary_bits = [f"{subtotal['part_count']} type(s)", f"{subtotal['total_instances']} total instance(s)"]
+    if subtotal["total_mass_kg"] is not None:
+        summary_bits.append(_fmt_mass(subtotal["total_mass_kg"]))
+    if subtotal["total_cost_inr"] is not None:
+        summary_bits.append(_fmt_money(subtotal["total_cost_inr"]))
+    summary_text = f"{category} — " + ", ".join(summary_bits)
+    if unverified_count:
+        summary_text += f" ⚠ {unverified_count} unverified"
+
+    expanded = not collapsed_by_default
+    chevron = ft.Icon(
+        ft.Icons.EXPAND_MORE_ROUNDED if expanded else ft.Icons.CHEVRON_RIGHT_ROUNDED,
+        size=18,
+        color=COLOR_HEADER_TEXT,
+    )
+    header = ft.Container(
+        content=ft.Row(
+            [
+                chevron,
+                ft.Text(
+                    summary_text,
+                    color=COLOR_WARNING_TEXT if unverified_count and not expanded else COLOR_HEADER_TEXT,
+                    size=13,
+                    weight=ft.FontWeight.W_600,
+                    expand=True,
+                ),
+            ],
+            spacing=8,
+        ),
+        bgcolor=COLOR_HEADER_BG,
+        padding=pad_symmetric(horizontal=12, vertical=10),
+        ink=True,
+    )
+    table_wrapper = ft.Container(content=build_bom_rows_table(rows, total_cost_one_unit), visible=expanded)
+
+    def _toggle(e: ft.ControlEvent) -> None:
+        table_wrapper.visible = not table_wrapper.visible
+        chevron.name = ft.Icons.EXPAND_MORE_ROUNDED if table_wrapper.visible else ft.Icons.CHEVRON_RIGHT_ROUNDED
+        table_wrapper.update()
+        chevron.update()
+
+    header.on_click = _toggle
+    return ft.Column([header, table_wrapper], spacing=0, tight=True)
+
+
+def build_categorized_bom_view(data: dict, rows_key: str) -> ft.Control:
+    """get_assembly_bom()'s main chat rendering: a prominent summary-stats
+    header (Step 3, reusing the same tinted stats block build_bom_card's
+    footer uses) followed by one collapsible section per non-empty
+    category (Step 1), Fasteners & Hardware collapsed by default (Step 2).
+    Per-row material_verified warnings (Step 4) come along for free --
+    build_bom_rows_table (shared with build_bom_card, unchanged) already
+    adds those.
+    """
+    rows = data.get(rows_key, [])
+    totals = data.get("totals", {})
+    manufacturing_process = data.get("manufacturing_process", "?")
+    quantity = data.get("quantity", "?")
+    missing_data = data.get("missing_data", [])
+    total_cost_one_unit = totals.get("total_assembly_cost_one_unit_inr")
+    unverified_count = sum(1 for row in rows if row.get("material_verified") is False)
+
+    summary_header = build_bom_stats_block(
+        totals, manufacturing_process, quantity, missing_data, unverified_count, position="top"
+    )
+
+    groups = _group_rows_by_category(rows)
+    sections = [
+        build_category_section(
+            category, groups[category], total_cost_one_unit, category in _CATEGORIES_COLLAPSED_BY_DEFAULT
+        )
+        for category in CATEGORY_DISPLAY_ORDER
+        if groups[category]
+    ]
+
+    return _card_container([summary_header, *sections])
+
+
 def build_cost_breakdown_card(data: dict) -> ft.Control:
     """Single-part cost card for estimate_cost() -- only ever two line
     items (material cost, production cost), so no Make/Buy chips or
@@ -840,7 +1019,10 @@ def build_cost_breakdown_card(data: dict) -> ft.Control:
 # (get_mass, run_dfm_check, etc.) keeps using the plain text bubble below,
 # unchanged.
 STRUCTURED_CARD_BUILDERS = {
-    "get_assembly_bom": lambda data: build_bom_card(data, "bom"),
+    # Categorized view (Step 1-4 redesign) -- get_assembly_cost_drivers
+    # deliberately keeps the flat, cost-ranked build_bom_card instead;
+    # bucketing by category would defeat its "highest cost first" point.
+    "get_assembly_bom": lambda data: build_categorized_bom_view(data, "bom"),
     "get_assembly_cost_drivers": lambda data: build_bom_card(data, "cost_drivers"),
     "estimate_cost": build_cost_breakdown_card,
 }
