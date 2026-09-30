@@ -994,8 +994,19 @@ def generate_am_readiness_guide(
 
     **Call this in response to the "Would you like help completing the
     additive manufacturing setup for this model?" prompt**, or whenever
-    the user asks for AM/3D-printing setup help on the current part,
-    instead of calling the three underlying tools yourself one at a time.
+    the user asks for AM/3D-printing setup help on the current part --
+    e.g. "help me set up this part for 3D printing", "how should I print
+    this?", "get this ready to print" -- instead of calling the three
+    underlying tools yourself one at a time.
+
+    **Call this tool immediately for those phrasings -- do NOT ask the
+    user the material questions yourself first.** Orientation and support
+    strategy need no user input at all and this tool computes them right
+    away; only material selection needs the 4 questions below, and this
+    tool already tells you the exact wording to use for those on its
+    first response (`material_questions_to_ask`). Composing your own
+    version of those questions instead of calling this tool skips the
+    real geometric analysis entirely.
 
     Orientation and support strategy are pure geometric analysis and need
     no extra input from the user -- this tool computes them immediately

@@ -117,7 +117,7 @@ def _build_reason(
     load_clause = " and is rated suitable for load-bearing use" if load_bearing else ""
 
     return (
-        f"{row['strength_tier']} strength, rated to {row['max_service_temp_c']:.0f}°C, "
+        f"{row['strength_tier']} strength, rated to {row['max_service_temp_c']:.0f} deg C, "
         f"{row['cost_tier']} cost, {row['surface_finish_tier']} surface finish -- meets the "
         f"'{temperature_exposure}' temperature requirement{load_clause}; {priority_clause}."
     )
@@ -191,7 +191,7 @@ def recommend_am_material(
             "message": (
                 "No material in am_materials.csv meets both the "
                 f"'{temperature_exposure_normalized}' temperature requirement "
-                f"(>= {min_temp:.0f}°C service temp)"
+                f"(>= {min_temp:.0f} deg C service temp)"
                 + (" and load-bearing suitability" if load_bearing else "")
                 + " -- consider relaxing one of these requirements with the "
                 "user, or add a suitable entry to am_materials.csv."

@@ -200,6 +200,136 @@ def _format_get_assembly_cost_drivers_answer(tool_result_json: str) -> str | Non
     return "\n".join(lines)
 
 
+# Plain-language translation for generate_am_readiness_guide()'s raw
+# orientation labels / support-strategy enum -- see
+# _format_generate_am_readiness_guide_answer's docstring for why a
+# beginner-facing rewrite exists on top of the raw technical fields.
+_ORIENTATION_PLAIN_LANGUAGE = {
+    "as-modeled": "print it exactly as it's currently modeled, with no rotation",
+    "rotated 180": "flip it upside down (180 degrees) from how it's currently modeled",
+}
+
+
+def _describe_orientation_plain(orientation: str) -> str:
+    """A beginner-facing sentence for an orientation label like
+    "rotated 90 about X" -- falls back to the raw label (still
+    understandable, just less friendly) for any label this mapping
+    doesn't recognize, e.g. a custom angle/axis the user asked for."""
+    if orientation in _ORIENTATION_PLAIN_LANGUAGE:
+        return _ORIENTATION_PLAIN_LANGUAGE[orientation]
+    match = re.match(r"rotated (\d+) about ([xyz])", orientation, re.IGNORECASE)
+    if match:
+        degrees, axis = match.groups()
+        return (
+            f"tip it {degrees} degrees onto its side (rotate it around the "
+            f"{axis.upper()}-axis from how it's currently modeled)"
+        )
+    return orientation
+
+
+_SUPPORT_STRATEGY_PLAIN_LANGUAGE = {
+    "minimal_or_no_support": (
+        "Little to no support material needed",
+        "the overhanging area is small enough that your slicer's default "
+        "settings should handle it fine.",
+    ),
+    "tree_branch_supports": (
+        "Use tree/branch-style supports",
+        "these are thin and touch the part at only a few points, so they're "
+        "easy to snap off and leave a cleaner surface than solid supports.",
+    ),
+    "dense_grid_block_supports": (
+        "Use dense grid/block supports",
+        "there's a large, broad overhanging surface, so it needs solid "
+        "support underneath it for stability -- this uses more filament, "
+        "adds print time, and may leave visible marks where it's removed.",
+    ),
+}
+
+
+def _format_generate_am_readiness_guide_answer(tool_result_json: str) -> str | None:
+    """Turn generate_am_readiness_guide()'s JSON into a beginner-friendly
+    plain-language answer, without asking the LLM to re-express it.
+
+    Why this exists: observed live with qwen2.5:7b-instruct asked "help me
+    set up this part for 3D printing" -- across repeat runs it either (a)
+    skipped calling the tool entirely and free-typed its own guess of the
+    4 material questions instead of the guide's real ones, or (b) called
+    the tool but then fabricated fictional fields ("tool_wear",
+    "material_properties") that don't exist anywhere in this tool's output
+    schema when summarizing the real orientation/support data in prose.
+    Same failure family as _format_list_assembly_components_answer above
+    -- render the real fields directly in Python instead of trusting a 7B
+    model to paraphrase a nested JSON result correctly.
+
+    Rewritten for a beginner audience (Krish's explicit request, after
+    reviewing the original raw-technical-fields version live): raw
+    orientation labels/support-strategy enum values are translated into
+    plain sentences via _describe_orientation_plain/
+    _SUPPORT_STRATEGY_PLAIN_LANGUAGE, overhang area is converted from mm^2
+    to cm^2 (a beginner has a better intuition for cm^2), and a short
+    "why this matters" line is added -- the raw numbers are kept too, just
+    de-emphasized, so nothing is hidden from a more advanced reader. This
+    text formatter is the fallback for any client that only shows plain
+    text (e.g. a future headless/Streamlit path); desktop_app.py's Flet
+    UI renders the same data as an actual visual card instead (see
+    build_am_readiness_card in desktop_app.py) and does not use this text.
+    """
+    try:
+        data = json.loads(tool_result_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict) or not data.get("found"):
+        return None
+
+    best = data.get("best_orientation", {})
+    support = data.get("support_strategy", {})
+    orientation = best.get("orientation", "?")
+    area_cm2 = (best.get("total_overhang_area_mm2") or 0) / 100
+    region_count = best.get("overhang_region_count", "?")
+
+    strategy_key = support.get("recommended_support_strategy", "")
+    strategy_title, strategy_explanation = _SUPPORT_STRATEGY_PLAIN_LANGUAGE.get(
+        strategy_key, (strategy_key or "?", support.get("reasoning", ""))
+    )
+    area_label = "area" if region_count == 1 else "areas"
+
+    lines = [
+        f"Best way to orient it: {_describe_orientation_plain(orientation)}.",
+        f"(This has the least overhang -- about {area_cm2:.0f} cm^2 spread "
+        f"across {region_count} {area_label} -- of the orientations "
+        "compared, so it needs the least support material and prints more "
+        "reliably.)",
+        "",
+        f"Support strategy: {strategy_title}.",
+        strategy_explanation[:1].upper() + strategy_explanation[1:],
+    ]
+
+    if data.get("material_questions_pending"):
+        lines.append("")
+        lines.append(
+            "One more step -- to recommend a material too, could you answer:"
+        )
+        for q in data.get("material_questions_to_ask", []):
+            lines.append(f"- {q}")
+    else:
+        rec = data.get("material_recommendation", {})
+        recommendations = rec.get("recommendations", []) if isinstance(rec, dict) else []
+        lines.append("")
+        lines.append("Recommended materials for your part:")
+        for m in recommendations:
+            lines.append(
+                f"- {m.get('material', '?')} ({m.get('process_type', '?')}): "
+                f"{m.get('reason', '')}"
+            )
+        assumptions = rec.get("assumptions") if isinstance(rec, dict) else None
+        if assumptions:
+            lines.append("")
+            lines.append(assumptions)
+
+    return "\n".join(lines)
+
+
 def _format_missing_manufacturing_process_answer(tool_result_json: str) -> str | None:
     """Ask the user for a manufacturing process directly, in plain Python,
     instead of leaving that decision to the LLM's next round.
@@ -273,6 +403,7 @@ _DETERMINISTIC_ANSWER_FORMATTERS = {
     "list_assembly_components": _format_list_assembly_components_answer,
     "get_assembly_bom": _format_get_assembly_bom_answer,
     "get_assembly_cost_drivers": _format_get_assembly_cost_drivers_answer,
+    "generate_am_readiness_guide": _format_generate_am_readiness_guide_answer,
 }
 
 _ASSEMBLY_REDIRECT_MARKER = "get_assembly_bom() or get_assembly_cost_drivers() instead"
@@ -387,6 +518,13 @@ class AiOrchestrator:
         # describe two different orientations. See
         # _remember_am_orientation_if_successful/_carry_over_unstated_params.
         self._last_am_orientation: str | None = None
+        # Last load_bearing/temperature_exposure/priority actually used by
+        # a *successful* (found=True, material_questions_pending=False)
+        # generate_am_readiness_guide() call this session -- see
+        # _AM_MATERIAL_TOOLS above and _carry_over_unstated_params's AM
+        # material block for why these specifically need guarding against
+        # model-fabricated values, not just carried over on follow-ups.
+        self._last_am_material_answers: dict | None = None
         self._current_question: str = ""
         # The name and parsed found=True JSON of the last successful
         # cost/BOM tool call made while answering the CURRENT ask() turn --
@@ -519,6 +657,7 @@ class AiOrchestrator:
                 )
                 self._remember_params_if_successful(name, arguments, tool_result)
                 self._remember_am_orientation_if_successful(name, tool_result)
+                self._remember_am_material_answers_if_successful(name, tool_result)
                 self._remember_structured_result(name, tool_result)
                 self._history.append(
                     {"role": "tool", "tool_name": name, "content": tool_result}
@@ -548,6 +687,7 @@ class AiOrchestrator:
                 )
                 self._remember_params_if_successful(name, arguments, tool_result)
                 self._remember_am_orientation_if_successful(name, tool_result)
+                self._remember_am_material_answers_if_successful(name, tool_result)
                 self._remember_structured_result(name, tool_result)
                 self._history.append(
                     {
@@ -607,6 +747,18 @@ class AiOrchestrator:
     # labels aren't a small fixed vocabulary the way PROCESSES is.
     _ORIENTATION_KEYWORDS = ("rotat", "orient", "flip", "as-modeled", "as modeled")
 
+    # generate_am_readiness_guide()'s 4 material-selection fields --
+    # load_bearing/temperature_exposure/priority filter/rank the actual
+    # material recommendation, so a fabricated value for one of these is
+    # far worse than the process/quantity corruption _COST_TOOLS guards
+    # against above: it doesn't just misprice something, it recommends a
+    # materially wrong material with a confident-sounding justification.
+    # part_function is deliberately excluded -- the tool's own docstring
+    # states it's included for context only and never filters/ranks
+    # anything, so a guessed value there can't produce a wrong answer.
+    _AM_MATERIAL_TOOLS = {"generate_am_readiness_guide"}
+    _LOAD_BEARING_KEYWORDS = ("load-bearing", "load bearing", "load bear")
+
     def _carry_over_unstated_params(self, name: str, arguments: dict) -> dict:
         """If `name` is a cost tool, override `quantity`/`manufacturing_process`
         with the last values a *successful* cost answer in this
@@ -639,7 +791,11 @@ class AiOrchestrator:
         to the last recommended one rather than trusted to default to
         "as-modeled" or invent a different one.
         """
-        if name not in self._COST_TOOLS and name not in self._AM_ORIENTATION_TOOLS:
+        if (
+            name not in self._COST_TOOLS
+            and name not in self._AM_ORIENTATION_TOOLS
+            and name not in self._AM_MATERIAL_TOOLS
+        ):
             return arguments
 
         overrides = {}
@@ -670,6 +826,33 @@ class AiOrchestrator:
                 and arguments.get("build_orientation") != self._last_am_orientation
             ):
                 overrides["build_orientation"] = self._last_am_orientation
+
+        if name in self._AM_MATERIAL_TOOLS:
+            remembered = self._last_am_material_answers or {}
+
+            if (
+                arguments.get("load_bearing") is not None
+                and not any(kw in question_lower for kw in self._LOAD_BEARING_KEYWORDS)
+                and arguments.get("load_bearing") != remembered.get("load_bearing")
+            ):
+                overrides["load_bearing"] = remembered.get("load_bearing")
+
+            if arguments.get("temperature_exposure") is not None:
+                value = str(arguments["temperature_exposure"]).lower()
+                if (
+                    value not in question_lower
+                    and arguments.get("temperature_exposure") != remembered.get("temperature_exposure")
+                ):
+                    overrides["temperature_exposure"] = remembered.get("temperature_exposure")
+
+            if arguments.get("priority") is not None:
+                value = str(arguments["priority"]).lower().replace("_", " ")
+                has_basis = value in question_lower or value.replace(" ", "_") in question_lower
+                if (
+                    not has_basis
+                    and arguments.get("priority") != remembered.get("priority")
+                ):
+                    overrides["priority"] = remembered.get("priority")
 
         if overrides:
             _TOOL_CALL_LOGGER.info(
@@ -777,6 +960,49 @@ class AiOrchestrator:
                 ),
             }
         )
+
+    def _remember_am_material_answers_if_successful(
+        self, name: str, tool_result_json: str
+    ) -> None:
+        """Record generate_am_readiness_guide()'s load_bearing/
+        temperature_exposure/priority as this session's "last known good"
+        material answers -- but only once a call actually used all 4 and
+        got a real material_recommendation back (material_questions_pending
+        is False), so a call that never got real answers can't remember a
+        None/fabricated value as if it were confirmed.
+
+        Why this exists: observed live that the model will fabricate
+        entire answers to these open-ended questions (e.g. inventing
+        "mounting bracket for a camera" / load_bearing=True /
+        temperature_exposure="high" out of thin air) rather than asking
+        the user, on a question as generic as "help me set up this part
+        for 3D printing". _carry_over_unstated_params's AM material block
+        is what actually blocks an unfounded guess by forcing it back to
+        None (or this remembered value on a real follow-up); this method
+        only records a value once it's been genuinely confirmed by an
+        actual successful call.
+        """
+        if name != "generate_am_readiness_guide":
+            return
+        try:
+            data = json.loads(tool_result_json)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not (isinstance(data, dict) and data.get("found") is True):
+            return
+        if data.get("material_questions_pending") is not False:
+            return
+
+        rec = data.get("material_recommendation", {})
+        if not isinstance(rec, dict) or not rec.get("found"):
+            return
+
+        self._last_am_material_answers = {
+            "part_function": rec.get("part_function"),
+            "load_bearing": rec.get("load_bearing"),
+            "temperature_exposure": rec.get("temperature_exposure"),
+            "priority": rec.get("priority"),
+        }
 
     def _remember_structured_result(self, name: str, tool_result_json: str) -> None:
         """Record `last_structured_tool`/`last_structured_result` for ANY

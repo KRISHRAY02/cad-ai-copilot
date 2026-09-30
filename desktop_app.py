@@ -23,6 +23,8 @@ from ai_orchestrator import (
     AiOrchestrator,
     McpServerUnavailableError,
     run_ai_orchestrator_with_data,
+    _describe_orientation_plain,
+    _SUPPORT_STRATEGY_PLAIN_LANGUAGE,
 )
 from bom_export import export_bom as write_bom_file
 from cad_adapters.fusion_adapter import FusionAdapter
@@ -1222,6 +1224,207 @@ def build_cost_breakdown_card(data: dict) -> ft.Control:
     return _card_container([header, *rows, footer])
 
 
+_SUPPORT_STRATEGY_CHIP_COLORS = {
+    "minimal_or_no_support": (COLOR_CHIP_MAKE_BG, COLOR_CHIP_MAKE_TEXT),
+    "tree_branch_supports": (COLOR_CHIP_BUY_BG, COLOR_CHIP_BUY_TEXT),
+    "dense_grid_block_supports": (COLOR_CHIP_BUY_NOPRICE_BG, COLOR_CHIP_BUY_NOPRICE_TEXT),
+}
+
+
+def build_am_readiness_card(data: dict) -> ft.Control:
+    """Beginner-friendly visual card for generate_am_readiness_guide() --
+    same "real Flet widgets instead of a text bubble" treatment as
+    build_categorized_bom_view/build_cost_breakdown_card above, plus the
+    plain-language translation from ai_orchestrator's
+    _describe_orientation_plain/_SUPPORT_STRATEGY_PLAIN_LANGUAGE (shared
+    with that module's own text-fallback formatter so the two never say
+    different things about the same result).
+
+    Krish's explicit request after reviewing the raw-technical-fields
+    version live: a beginner asking "help me set up this part for 3D
+    printing" shouldn't see a raw orientation label like "rotated 90
+    about Y" or an enum value like "dense_grid_block_supports" with no
+    explanation of what it means or why it was picked.
+    """
+    best = data.get("best_orientation", {})
+    support = data.get("support_strategy", {})
+    orientation = best.get("orientation", "?")
+    area_cm2 = (best.get("total_overhang_area_mm2") or 0) / 100
+    region_count = best.get("overhang_region_count", "?")
+    area_label = "area" if region_count == 1 else "areas"
+
+    strategy_key = support.get("recommended_support_strategy", "")
+    strategy_title, strategy_explanation = _SUPPORT_STRATEGY_PLAIN_LANGUAGE.get(
+        strategy_key, (strategy_key or "?", support.get("reasoning", ""))
+    )
+    chip_bg, chip_text = _SUPPORT_STRATEGY_CHIP_COLORS.get(
+        strategy_key, (COLOR_CHIP_BUY_BG, COLOR_CHIP_BUY_TEXT)
+    )
+
+    header = _card_header("3D-Print Readiness Guide")
+
+    orientation_section = ft.Container(
+        content=ft.Column(
+            [
+                ft.Row(
+                    [
+                        ft.Icon(ft.Icons.THREED_ROTATION, size=18, color=COLOR_ACCENT),
+                        ft.Text(
+                            "Best orientation",
+                            size=12,
+                            weight=ft.FontWeight.W_600,
+                            color=COLOR_TIMESTAMP,
+                        ),
+                    ],
+                    spacing=6,
+                ),
+                ft.Text(
+                    _describe_orientation_plain(orientation).capitalize() + ".",
+                    size=14,
+                    weight=ft.FontWeight.W_600,
+                    color=COLOR_AI_TEXT,
+                ),
+                ft.Text(
+                    f"Least overhang of the orientations compared -- about "
+                    f"{area_cm2:.0f} cm² across {region_count} {area_label}, "
+                    "so it needs the least support material and prints more "
+                    "reliably.",
+                    size=12,
+                    color=COLOR_TIMESTAMP,
+                ),
+            ],
+            spacing=4,
+        ),
+        padding=pad_symmetric(horizontal=14, vertical=12),
+        border=ft.Border(bottom=ft.BorderSide(1, COLOR_AI_BORDER)),
+    )
+
+    support_section = ft.Container(
+        content=ft.Column(
+            [
+                ft.Row(
+                    [
+                        ft.Icon(ft.Icons.CONSTRUCTION, size=18, color=COLOR_ACCENT),
+                        ft.Text(
+                            "Support strategy",
+                            size=12,
+                            weight=ft.FontWeight.W_600,
+                            color=COLOR_TIMESTAMP,
+                        ),
+                    ],
+                    spacing=6,
+                ),
+                ft.Container(
+                    content=ft.Text(
+                        strategy_title, size=12, weight=ft.FontWeight.W_600, color=chip_text
+                    ),
+                    bgcolor=chip_bg,
+                    border_radius=10,
+                    padding=pad_symmetric(horizontal=8, vertical=3),
+                ),
+                ft.Text(
+                    strategy_explanation[:1].upper() + strategy_explanation[1:],
+                    size=12,
+                    color=COLOR_TIMESTAMP,
+                ),
+            ],
+            spacing=6,
+        ),
+        padding=pad_symmetric(horizontal=14, vertical=12),
+        border=ft.Border(bottom=ft.BorderSide(1, COLOR_AI_BORDER)),
+    )
+
+    sections = [header, orientation_section, support_section]
+
+    if data.get("material_questions_pending"):
+        questions = data.get("material_questions_to_ask", [])
+        sections.append(
+            ft.Container(
+                content=ft.Column(
+                    [
+                        ft.Row(
+                            [
+                                ft.Icon(ft.Icons.HELP_OUTLINE, size=18, color=COLOR_ACCENT),
+                                ft.Text(
+                                    "One more step for a material recommendation",
+                                    size=12,
+                                    weight=ft.FontWeight.W_600,
+                                    color=COLOR_TIMESTAMP,
+                                ),
+                            ],
+                            spacing=6,
+                        ),
+                        *[
+                            ft.Text(f"•  {q}", size=13, color=COLOR_AI_TEXT)
+                            for q in questions
+                        ],
+                    ],
+                    spacing=6,
+                ),
+                bgcolor=COLOR_CHAT_BG,
+                padding=pad_symmetric(horizontal=14, vertical=12),
+                border_radius=CARD_BOTTOM_RADIUS,
+            )
+        )
+    else:
+        rec = data.get("material_recommendation", {})
+        recommendations = rec.get("recommendations", []) if isinstance(rec, dict) else []
+        material_rows = []
+        for m in recommendations:
+            material_rows.append(
+                ft.Container(
+                    content=ft.Column(
+                        [
+                            ft.Text(
+                                f"{m.get('material', '?')} ({m.get('process_type', '?')})",
+                                size=13,
+                                weight=ft.FontWeight.W_600,
+                                color=COLOR_AI_TEXT,
+                            ),
+                            ft.Text(m.get("reason", ""), size=12, color=COLOR_TIMESTAMP),
+                        ],
+                        spacing=2,
+                    ),
+                    padding=pad_symmetric(horizontal=14, vertical=10),
+                    border=ft.Border(bottom=ft.BorderSide(1, COLOR_AI_BORDER)),
+                )
+            )
+        assumptions = rec.get("assumptions") if isinstance(rec, dict) else None
+        footer_children = []
+        if assumptions:
+            footer_children.append(ft.Text(assumptions, size=11, color=COLOR_TIMESTAMP))
+        sections.append(
+            ft.Container(
+                content=ft.Row(
+                    [
+                        ft.Icon(ft.Icons.CATEGORY_OUTLINED, size=18, color=COLOR_ACCENT),
+                        ft.Text(
+                            "Recommended materials",
+                            size=12,
+                            weight=ft.FontWeight.W_600,
+                            color=COLOR_TIMESTAMP,
+                        ),
+                    ],
+                    spacing=6,
+                ),
+                padding=pad_symmetric(horizontal=14, vertical=10),
+                border=ft.Border(bottom=ft.BorderSide(1, COLOR_AI_BORDER)),
+            )
+        )
+        sections.extend(material_rows)
+        if footer_children:
+            sections.append(
+                ft.Container(
+                    content=ft.Column(footer_children, spacing=4),
+                    bgcolor=COLOR_CHAT_BG,
+                    padding=pad_symmetric(horizontal=14, vertical=10),
+                    border_radius=CARD_BOTTOM_RADIUS,
+                )
+            )
+
+    return _card_container(sections)
+
+
 # Tool name -> (result dict) -> Flet control. Only tools whose found=True
 # shape this app actually knows how to render as a card; every other tool
 # (get_mass, run_dfm_check, etc.) keeps using the plain text bubble below,
@@ -1234,6 +1437,7 @@ STRUCTURED_CARD_BUILDERS = {
     "get_assembly_cost_drivers": lambda data: build_bom_card(data, "cost_drivers"),
     "estimate_cost": build_cost_breakdown_card,
     "list_assembly_components": build_component_listing_view,
+    "generate_am_readiness_guide": build_am_readiness_card,
 }
 
 

@@ -601,9 +601,13 @@ class FusionAdapter(CadAdapter):
         # Fusion API calls, not a cheap property read -- on a large
         # multi-body assembly (thousands of faces) this genuinely takes
         # tens of seconds, well past the 3s default used by cheap
-        # endpoints elsewhere in this adapter. Confirmed live: a ~4600
-        # face assembly took ~50s.
-        data = self._request("/geometry/faces", timeout=120.0)
+        # endpoints elsewhere in this adapter. Confirmed live on a ~4600
+        # face assembly: ~50s on a fresh Fusion session, degrading to
+        # ~146s after several repeated calls in the same session (Fusion
+        # itself appears to slow down under repeated heavy API traversal,
+        # not this code) -- 240s leaves real margin above the worst
+        # observed case rather than the first-call baseline.
+        data = self._request("/geometry/faces", timeout=240.0)
         if "error" in data:
             raise FusionDataUnavailableError(data["error"])
 
