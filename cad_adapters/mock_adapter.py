@@ -13,6 +13,7 @@ from cad_adapters.base_adapter import (
     AssemblyComponent,
     CadAdapter,
     Feature,
+    FaceGeometry,
     MaterialInfo,
     PartInfo,
 )
@@ -207,6 +208,30 @@ class MockAdapter(CadAdapter):
         self._bend_count = 0  # this sample part is a machined bracket, not sheet metal
         self._bounding_box_mm = (120.0, 80.0, 25.0)
 
+        # Simplified synthetic face geometry for compare_build_orientations()
+        # demos/tests -- NOT a literal model of this bracket's real 18
+        # faces (see self._face_count above), just a small, deliberately
+        # asymmetric box-with-an-overhanging-shelf shape whose overhang
+        # area/region count genuinely differs across orientations, so the
+        # ranking it produces is a real computed result rather than a
+        # fixed/hardcoded one. Indices double as adjacency identifiers:
+        #   0: bottom (normal -Z), 1: top (normal +Z),
+        #   2-5: four vertical side walls (+X, -X, +Y, -Y),
+        #   6: one 30-degree overhanging shelf face near the top.
+        # Adjacency is a simplified approximation of a real box's edge
+        # topology (bottom/top each touch all four side walls; the shelf
+        # touches the top and one side wall) -- enough to exercise
+        # region-grouping without modeling every real edge.
+        self._face_geometry = [
+            FaceGeometry(normal=(0.0, 0.0, -1.0), area_mm2=4800.0, adjacent_indices=[2, 3, 4, 5]),
+            FaceGeometry(normal=(0.0, 0.0, 1.0), area_mm2=4800.0, adjacent_indices=[2, 3, 4, 5, 6]),
+            FaceGeometry(normal=(1.0, 0.0, 0.0), area_mm2=3000.0, adjacent_indices=[0, 1, 4, 5, 6]),
+            FaceGeometry(normal=(-1.0, 0.0, 0.0), area_mm2=3000.0, adjacent_indices=[0, 1, 4, 5]),
+            FaceGeometry(normal=(0.0, 1.0, 0.0), area_mm2=3000.0, adjacent_indices=[0, 1, 2, 3]),
+            FaceGeometry(normal=(0.0, -1.0, 0.0), area_mm2=3000.0, adjacent_indices=[0, 1, 2, 3]),
+            FaceGeometry(normal=(0.0, -0.5, -0.866), area_mm2=600.0, adjacent_indices=[1, 2]),
+        ]
+
         self._features = [
             Feature(
                 name="Boss-Extrude1",
@@ -300,6 +325,9 @@ class MockAdapter(CadAdapter):
 
     def get_bounding_box_mm(self) -> tuple[float, float, float]:
         return self._bounding_box_mm
+
+    def get_face_geometry(self) -> list[FaceGeometry]:
+        return list(self._face_geometry)
 
     def get_hole_features(self) -> list[dict]:
         """Synthetic holes matching this bracket's own "Mounting Holes"

@@ -8,10 +8,13 @@ platform can be added later by writing one new adapter class with no
 changes required anywhere else in the project.
 """
 
+import math
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
+from cad_adapters.dfm_checks import make_finding
 from hardware_db import classify_component, load_hardware
 from materials_db import (
     csv_path_for_platform,
@@ -132,6 +135,206 @@ class AssemblyComponent:
     material_verified: bool | None
 
 
+@dataclass
+class FaceGeometry:
+    """Per-face geometry needed for additive-manufacturing build
+    orientation analysis: the face's real outward unit normal, its area,
+    and which other faces (by index into the same list this came from)
+    it shares an edge with.
+
+    `normal` is in the part's own local/model coordinate frame -- the
+    same frame get_bounding_box_mm() reads its axes in, NOT whatever the
+    CAD viewport's camera currently happens to be looking from.
+    `adjacent_indices` is used to group flagged overhang faces into
+    contiguous regions (see compare_build_orientations() below) instead
+    of just counting isolated flagged faces.
+    """
+
+    normal: tuple[float, float, float]
+    area_mm2: float
+    adjacent_indices: list[int]
+
+
+# -- Build orientation / overhang analysis helpers --------------------
+#
+# Private module-level helpers backing CadAdapter.compare_build_
+# orientations() below. Kept dependency-free (plain tuples/math, no
+# numpy) since only 3x3 rotations of a single vector are ever needed --
+# consistent with fusion_bridge_addin.py's own stdlib-only approach.
+
+# Default "up"/build direction in the part's own local frame, used as the
+# fixed real-world build direction candidate orientations are compared
+# against (see compare_build_orientations()'s docstring for why the
+# candidate's rotation is applied to this vector rather than to the
+# part's geometry).
+DEFAULT_BUILD_DIRECTION = (0.0, 0.0, 1.0)
+
+# Standard self-supporting overhang threshold, measured from vertical: a
+# face angled less than this many degrees from straight-down is flagged
+# as needing support. 45 degrees is the commonly cited default for FDM;
+# some processes tolerate steeper (lower-angle) overhangs, so this is
+# exposed as a parameter rather than hardcoded.
+DEFAULT_OVERHANG_CRITICAL_ANGLE_DEG = 45.0
+
+_IDENTITY_MATRIX = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+
+_AS_MODELED_ALIASES = {"as-modeled", "as modeled", "identity", "none", "default"}
+
+# Axis is optional only for a 180 degree rotation: rotating the build
+# direction (0, 0, 1) by 180 degrees about ANY axis lying in the
+# horizontal (X/Y) plane gives the same result, (0, 0, -1), so defaulting
+# to "x" when omitted (see _parse_candidate_orientation()) doesn't
+# silently guess a materially different answer for that one case.
+_ORIENTATION_RE = re.compile(
+    r"^rotated?\s+(-?\d+(?:\.\d+)?)\s*(?:deg(?:rees)?)?\s*(?:about\s+([xyz]))?$",
+    re.IGNORECASE,
+)
+
+
+def _rotation_matrix(axis: str, angle_deg: float) -> tuple:
+    """Standard right-hand-rule rotation matrix about the given axis."""
+    theta = math.radians(angle_deg)
+    c, s = math.cos(theta), math.sin(theta)
+    if axis == "x":
+        return ((1.0, 0.0, 0.0), (0.0, c, -s), (0.0, s, c))
+    if axis == "y":
+        return ((c, 0.0, s), (0.0, 1.0, 0.0), (-s, 0.0, c))
+    return ((c, -s, 0.0), (s, c, 0.0), (0.0, 0.0, 1.0))  # "z"
+
+
+def _matvec(matrix: tuple, vector: tuple) -> tuple:
+    return tuple(sum(matrix[i][j] * vector[j] for j in range(3)) for i in range(3))
+
+
+def _transpose(matrix: tuple) -> tuple:
+    return tuple(tuple(matrix[j][i] for j in range(3)) for i in range(3))
+
+
+def _parse_candidate_orientation(candidate: str) -> tuple:
+    """Parse a candidate orientation label into the 3x3 rotation matrix
+    it describes, relative to "as-modeled" (no rotation).
+
+    Accepts "as-modeled" (and a few aliases -- see _AS_MODELED_ALIASES)
+    for the identity rotation, or "rotated <degrees> about <x|y|z>" (e.g.
+    "rotated 90 about X"). The axis may be omitted only for a 180 degree
+    rotation (e.g. "rotated 180") -- see _ORIENTATION_RE's comment for why
+    that specific case is unambiguous without one.
+
+    Raises ValueError with the expected syntax spelled out if `candidate`
+    doesn't match either form -- never guesses a rotation for text it
+    can't parse.
+    """
+    normalized = candidate.strip().lower()
+    if normalized in _AS_MODELED_ALIASES:
+        return _IDENTITY_MATRIX
+
+    match = _ORIENTATION_RE.match(normalized)
+    if not match:
+        raise ValueError(
+            f"Could not parse candidate orientation '{candidate}' -- expected "
+            "'as-modeled', or 'rotated <degrees> about <x|y|z>' (e.g. "
+            "'rotated 90 about X'). The axis may be omitted only for a 180 "
+            "degree rotation (e.g. 'rotated 180'), since the effective build "
+            "direction is the same regardless of which axis is used in that "
+            "one case."
+        )
+
+    angle_deg = float(match.group(1))
+    axis = match.group(2) or "x"
+    return _rotation_matrix(axis, angle_deg)
+
+
+def _is_overhang_face(
+    normal: tuple, effective_up: tuple, critical_angle_deg: float
+) -> bool:
+    """True if a face with this outward normal needs support under a
+    build direction of `effective_up`.
+
+    The angle between the face normal and straight-down (the negated
+    build direction) is 0 degrees for a flat, downward-facing bottom face
+    (always flagged) and 90 degrees for a vertical wall (never flagged,
+    regardless of threshold) -- flagged when that angle is less than
+    `critical_angle_deg`, which is equivalent to checking
+    normal . effective_up < -cos(critical_angle_deg) without an actual
+    arccos call.
+    """
+    dot = sum(n * u for n, u in zip(normal, effective_up))
+    return dot < -math.cos(math.radians(critical_angle_deg))
+
+
+def _group_overhang_regions(flagged_indices: set, faces: list) -> list[list[int]]:
+    """Group `flagged_indices` into connected components, using each
+    face's adjacent_indices (from get_face_geometry()) restricted to
+    other flagged faces -- so one overhang made of many small adjacent
+    faces becomes one region, not one per face.
+
+    Returns a list of regions, each a list of the face indices making up
+    that region -- lets a caller compute both region count (len of the
+    result) and each region's own area (sum of its members' area_mm2),
+    which recommend_support_strategy() needs to tell "many small
+    overhangs" apart from "one broad flat overhang" at the same total
+    area.
+    """
+    visited = set()
+    regions = []
+    for start in flagged_indices:
+        if start in visited:
+            continue
+        region = []
+        stack = [start]
+        visited.add(start)
+        while stack:
+            current = stack.pop()
+            region.append(current)
+            for neighbor in faces[current].adjacent_indices:
+                if neighbor in flagged_indices and neighbor not in visited:
+                    visited.add(neighbor)
+                    stack.append(neighbor)
+        regions.append(region)
+    return regions
+
+
+def _evaluate_overhangs_for_orientation(
+    faces: list, orientation: str, critical_angle_deg: float
+) -> tuple:
+    """Shared per-orientation computation behind both
+    compare_build_orientations() and recommend_support_strategy(): parse
+    `orientation`, derive the effective build direction, flag overhang
+    faces, and group them into regions.
+
+    Returns (effective_up, flagged_indices, regions). Kept as one shared
+    helper instead of duplicated inline logic so the two methods can never
+    silently drift into flagging overhangs differently from one another.
+    """
+    rotation = _parse_candidate_orientation(orientation)
+    effective_up = _matvec(_transpose(rotation), DEFAULT_BUILD_DIRECTION)
+    flagged_indices = {
+        i
+        for i, face in enumerate(faces)
+        if _is_overhang_face(face.normal, effective_up, critical_angle_deg)
+    }
+    regions = _group_overhang_regions(flagged_indices, faces)
+    return effective_up, flagged_indices, regions
+
+
+# -- recommend_support_strategy() classification thresholds -----------
+#
+# Named, adjustable constants (same pattern as cad_adapters/dfm_checks.py's
+# MIN_HOLE_DIAMETER_MM etc.) rather than magic numbers inline, so the
+# support-strategy classification rule is easy to explain to a user and
+# easy to retune later.
+
+# At or below this total flagged overhang area, a build orientation is
+# considered to need little to no support material at all.
+SUPPORT_NEGLIGIBLE_TOTAL_AREA_MM2 = 25.0
+
+# A single overhang region at or above this area is treated as "broad and
+# flat" -- large spans like this need a dense grid/block support pattern
+# underneath for stability, rather than sparse branch supports that would
+# leave the middle of the span unsupported.
+SUPPORT_LARGE_FLAT_REGION_AREA_MM2 = 1500.0
+
+
 class CadAdapter(ABC):
     """Abstract interface that all CAD platform adapters must implement.
 
@@ -211,6 +414,22 @@ class CadAdapter(ABC):
         Used as a geometric complexity feature for the ML cost model (see
         cost_model/) -- more faces generally means more machining
         operations.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_face_geometry(self) -> list[FaceGeometry]:
+        """Return one FaceGeometry entry per face across every solid body
+        in the current part -- same "whole document" scope as
+        get_face_count().
+
+        Used by compare_build_orientations() below to flag overhang faces
+        (via each face's real outward normal) and group them into
+        contiguous regions (via adjacent_indices), for a real geometric
+        build-orientation comparison rather than a guessed one. A face
+        whose normal or area can't be read is skipped entirely rather
+        than included with a guessed value. Returns an empty list if the
+        part has no solid bodies.
         """
         raise NotImplementedError
 
@@ -936,3 +1155,322 @@ class CadAdapter(ABC):
             "highlighted": highlight_result["success"],
             "top_driver": top,
         }
+
+    def compare_build_orientations(
+        self,
+        candidate_orientations: list[str],
+        critical_angle_deg: float = DEFAULT_OVERHANG_CRITICAL_ANGLE_DEG,
+    ) -> list[dict]:
+        """Rank a list of candidate additive-manufacturing build
+        orientations by how much overhang each one produces, using real
+        per-face geometry (get_face_geometry()) -- not a cost estimate.
+
+        `candidate_orientations` is a list of orientation labels, each
+        either "as-modeled" (no rotation) or "rotated <degrees> about
+        <x|y|z>" (e.g. "rotated 90 about X", "rotated 180 about Y"; the
+        axis may be omitted for a 180 degree rotation -- see
+        _parse_candidate_orientation()).
+
+        Concrete (not abstract), like compare_materials() and
+        get_cost_drivers() above: get_face_geometry() is called exactly
+        once regardless of how many candidates are given, since the
+        part's real geometry doesn't change between candidates -- only
+        the reference build direction does. For each candidate, the
+        fixed real-world build direction (DEFAULT_BUILD_DIRECTION) is
+        rotated by the INVERSE of the candidate's rotation into the
+        part's unchanging local frame, giving an "effective build
+        direction" to compare face normals against. This is
+        mathematically equivalent to physically rotating the part and
+        keeping the real-world build direction fixed, without ever
+        touching the live CAD document, calling into it more than once,
+        or risking leaving the model reoriented.
+
+        A face is flagged as an overhang if the angle between its normal
+        and the effective build direction's downward vector is less than
+        `critical_angle_deg` (default 45 degrees -- see
+        DEFAULT_OVERHANG_CRITICAL_ANGLE_DEG). Flagged faces are grouped
+        into distinct overhang regions using real face-adjacency data
+        from get_face_geometry() via connected-component grouping (see
+        _count_overhang_regions()), not just a raw flagged-face count, so
+        one overhang made of many small faces is reported as one region.
+
+        This does not attempt to determine which face (if any) sits flush
+        against the print bed for a given orientation -- every downward-
+        facing face meeting the angle threshold is flagged, including a
+        flat base that would in practice rest directly on the bed and
+        need no support. Callers comparing candidates relative to each
+        other are unaffected by this (a full flat base is flagged
+        consistently across every orientation it appears in), but an
+        absolute overhang-area number should not be read as "square mm of
+        support material needed".
+
+        Returns a list of dicts, one per candidate, ranked best (least
+        total overhang area) first, ties broken by fewer overhang
+        regions:
+            {
+                "orientation": the candidate string as given,
+                "total_overhang_area_mm2": float,
+                "overhang_region_count": int,
+                "overhang_face_count": int,
+                "effective_build_direction": (x, y, z),
+            }
+
+        Raises ValueError if `candidate_orientations` is empty, if any
+        candidate string can't be parsed (see
+        _parse_candidate_orientation()'s message for the exact expected
+        syntax), or if get_face_geometry() returns no faces at all (no
+        solid geometry to analyze) -- never guesses a ranking from
+        incomplete data.
+        """
+        if not candidate_orientations:
+            raise ValueError("candidate_orientations must be a non-empty list.")
+
+        faces = self.get_face_geometry()
+        if not faces:
+            raise ValueError(
+                "get_face_geometry() returned no faces -- no solid "
+                "geometry to analyze for build orientation."
+            )
+
+        results = []
+        for candidate in candidate_orientations:
+            effective_up, flagged_indices, regions = _evaluate_overhangs_for_orientation(
+                faces, candidate, critical_angle_deg
+            )
+            total_area = sum(faces[i].area_mm2 for i in flagged_indices)
+            region_count = len(regions)
+
+            results.append(
+                {
+                    "orientation": candidate,
+                    "total_overhang_area_mm2": round(total_area, 3),
+                    "overhang_region_count": region_count,
+                    "overhang_face_count": len(flagged_indices),
+                    "effective_build_direction": tuple(
+                        round(c, 6) for c in effective_up
+                    ),
+                }
+            )
+
+        results.sort(key=lambda r: (r["total_overhang_area_mm2"], r["overhang_region_count"]))
+        return results
+
+    def recommend_support_strategy(
+        self,
+        build_orientation: str,
+        critical_angle_deg: float = DEFAULT_OVERHANG_CRITICAL_ANGLE_DEG,
+    ) -> dict:
+        """Recommend a support strategy for ONE build orientation, using
+        the same real overhang-region detection compare_build_
+        orientations() uses (see _evaluate_overhangs_for_orientation()) --
+        not a separate guess.
+
+        `build_orientation` uses the same label syntax
+        compare_build_orientations() accepts ("as-modeled" or "rotated
+        <degrees> about <x|y|z>").
+
+        Classification (see the SUPPORT_* constants above for the actual
+        threshold values, kept as named constants so they're easy to
+        explain and retune):
+          - total overhang area at or below SUPPORT_NEGLIGIBLE_TOTAL_AREA_MM2
+            -> "minimal_or_no_support": negligible material either way.
+          - otherwise, if the LARGEST single overhang region is at or
+            above SUPPORT_LARGE_FLAT_REGION_AREA_MM2 -> "dense_grid_block_
+            supports": a broad flat span needs stable support underneath
+            its whole area, not sparse points.
+          - otherwise -> "tree_branch_supports": every overhang region is
+            small/localized (whether there's one such region or several),
+            which tree/branch supports handle with less material and
+            easier removal than a full grid.
+        Checked in that order, so a large TOTAL area split across many
+        small, non-flat regions still recommends tree/branch supports --
+        it's each region's own size, not the sum, that determines whether
+        a broad contiguous span actually exists to support.
+
+        Returns a dict with the recommendation plus the measured data
+        behind it, so the reasoning is visible rather than just a label:
+            {
+                "build_orientation": as given,
+                "recommended_support_strategy": one of the three labels
+                    above,
+                "reasoning": a one-sentence explanation citing the actual
+                    numbers that drove the classification,
+                "total_overhang_area_mm2": float,
+                "overhang_region_count": int,
+                "overhang_face_count": int,
+                "largest_region_area_mm2": float (0.0 if no regions),
+                "region_areas_mm2": each region's own area, largest first,
+                "effective_build_direction": (x, y, z),
+            }
+
+        Raises ValueError if `build_orientation` can't be parsed (see
+        _parse_candidate_orientation()'s message) or if get_face_geometry()
+        returns no faces at all -- never guesses a recommendation from
+        incomplete data.
+        """
+        faces = self.get_face_geometry()
+        if not faces:
+            raise ValueError(
+                "get_face_geometry() returned no faces -- no solid "
+                "geometry to analyze for a support strategy recommendation."
+            )
+
+        effective_up, flagged_indices, regions = _evaluate_overhangs_for_orientation(
+            faces, build_orientation, critical_angle_deg
+        )
+
+        total_area = sum(faces[i].area_mm2 for i in flagged_indices)
+        region_areas = sorted(
+            (sum(faces[i].area_mm2 for i in region) for region in regions), reverse=True
+        )
+        largest_region_area = region_areas[0] if region_areas else 0.0
+        region_count = len(regions)
+
+        if total_area <= SUPPORT_NEGLIGIBLE_TOTAL_AREA_MM2:
+            strategy = "minimal_or_no_support"
+            reasoning = (
+                f"Total flagged overhang area is {total_area:.1f}mm^2, at or "
+                f"below the {SUPPORT_NEGLIGIBLE_TOTAL_AREA_MM2}mm^2 negligible "
+                "threshold -- little to no support material is expected to "
+                "be needed in this orientation."
+            )
+        elif largest_region_area >= SUPPORT_LARGE_FLAT_REGION_AREA_MM2:
+            strategy = "dense_grid_block_supports"
+            reasoning = (
+                f"The largest single overhang region is "
+                f"{largest_region_area:.1f}mm^2, at or above the "
+                f"{SUPPORT_LARGE_FLAT_REGION_AREA_MM2}mm^2 broad-flat-region "
+                "threshold -- a span this large needs a dense grid/block "
+                "support pattern underneath it for stability, not sparse "
+                "branch supports."
+            )
+        else:
+            strategy = "tree_branch_supports"
+            reasoning = (
+                f"{region_count} overhang region(s) were flagged (largest "
+                f"{largest_region_area:.1f}mm^2), none reaching the "
+                f"{SUPPORT_LARGE_FLAT_REGION_AREA_MM2}mm^2 broad-flat-region "
+                "threshold -- localized overhangs like this are well suited "
+                "to tree/branch supports, which use less material and are "
+                "easier to remove than a dense grid."
+            )
+
+        return {
+            "build_orientation": build_orientation,
+            "recommended_support_strategy": strategy,
+            "reasoning": reasoning,
+            "total_overhang_area_mm2": round(total_area, 3),
+            "overhang_region_count": region_count,
+            "overhang_face_count": len(flagged_indices),
+            "largest_region_area_mm2": round(largest_region_area, 3),
+            "region_areas_mm2": [round(a, 3) for a in region_areas],
+            "effective_build_direction": tuple(round(c, 6) for c in effective_up),
+        }
+
+    def run_am_dfm_check(
+        self,
+        build_orientation: str,
+        critical_angle_deg: float = DEFAULT_OVERHANG_CRITICAL_ANGLE_DEG,
+    ) -> list[dict]:
+        """Run additive-manufacturing DFM checks for ONE build
+        orientation: overhang, min_feature_size, trapped_volume -- same
+        finding shape (dfm_checks.make_finding) as run_dfm_check()'s
+        subtractive-manufacturing checks.
+
+        `build_orientation` should be the SAME orientation label
+        compare_build_orientations()/generate_am_readiness_guide()
+        recommended (or whatever orientation the user is currently
+        evaluating) -- this method has no memory of a prior
+        recommendation and will happily analyze whatever orientation
+        it's given, so keeping it consistent with an earlier
+        recommendation is enforced by the caller (see
+        ai_orchestrator.py's _remember_am_orientation_if_successful /
+        _carry_over_unstated_params, which override a follow-up
+        run_am_dfm_check tool call to reuse generate_am_readiness_guide()'s
+        last recommended orientation unless the user's question clearly
+        asks about a different one).
+
+        **overhang**: real geometric analysis, reusing the EXACT same
+        detection compare_build_orientations()/recommend_support_strategy()
+        use (_evaluate_overhangs_for_orientation()) -- not a second,
+        independent algorithm that could silently disagree with them.
+        "flagged" if total overhang area exceeds
+        SUPPORT_NEGLIGIBLE_TOTAL_AREA_MM2 (the same threshold
+        recommend_support_strategy() uses for "negligible"), else "pass".
+
+        **min_feature_size** and **trapped_volume** always report
+        "not_applicable": neither check is implemented yet -- this
+        project currently has no primitive for measuring a printable
+        wall/rib thickness, or for detecting fully enclosed internal
+        voids, the way get_face_geometry() exists for face normals/areas.
+        Reported honestly as not yet available, same "never guess a
+        pass/fail" rule run_dfm_check()'s tolerance check follows for a
+        real API gap.
+
+        Raises ValueError if `build_orientation` can't be parsed, or if
+        get_face_geometry() returns no faces -- same as
+        compare_build_orientations()/recommend_support_strategy().
+        """
+        faces = self.get_face_geometry()
+        if not faces:
+            raise ValueError(
+                "get_face_geometry() returned no faces -- no solid "
+                "geometry to run AM DFM checks against."
+            )
+
+        _, flagged_indices, regions = _evaluate_overhangs_for_orientation(
+            faces, build_orientation, critical_angle_deg
+        )
+        total_area = round(sum(faces[i].area_mm2 for i in flagged_indices), 3)
+        region_count = len(regions)
+
+        if total_area <= SUPPORT_NEGLIGIBLE_TOTAL_AREA_MM2:
+            overhang_finding = make_finding(
+                "overhang",
+                "pass",
+                message=(
+                    f"Total flagged overhang area for orientation "
+                    f"'{build_orientation}' is {total_area}mm^2, at or "
+                    f"below the {SUPPORT_NEGLIGIBLE_TOTAL_AREA_MM2}mm^2 "
+                    "negligible threshold."
+                ),
+                build_orientation=build_orientation,
+                total_overhang_area_mm2=total_area,
+                overhang_region_count=region_count,
+            )
+        else:
+            overhang_finding = make_finding(
+                "overhang",
+                "flagged",
+                message=(
+                    f"Orientation '{build_orientation}' has {total_area}mm^2 "
+                    f"of overhang across {region_count} region(s) -- see "
+                    "recommend_support_strategy() for a support strategy "
+                    "recommendation for this same orientation."
+                ),
+                build_orientation=build_orientation,
+                total_overhang_area_mm2=total_area,
+                overhang_region_count=region_count,
+            )
+
+        min_feature_size_finding = make_finding(
+            "min_feature_size",
+            "not_applicable",
+            message=(
+                "Not implemented yet -- this project has no primitive for "
+                "measuring the thinnest wall/rib/feature size on the part "
+                "against a process's minimum printable feature size."
+            ),
+        )
+        trapped_volume_finding = make_finding(
+            "trapped_volume",
+            "not_applicable",
+            message=(
+                "Not implemented yet -- this project has no primitive for "
+                "detecting fully enclosed internal voids (needed to flag "
+                "trapped powder/resin that can't drain during "
+                "post-processing)."
+            ),
+        )
+
+        return [overhang_finding, min_feature_size_finding, trapped_volume_finding]

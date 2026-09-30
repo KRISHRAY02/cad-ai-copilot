@@ -1,8 +1,10 @@
-"""Shared constants and result-shape helper for CadAdapter.run_dfm_check().
+"""Shared constants and result-shape helper for CadAdapter.run_dfm_check()
+and CadAdapter.run_am_dfm_check() (see cad_adapters/base_adapter.py).
 
-Four checks, each protecting against a specific real manufacturing
-problem (see docstrings on SolidWorksAdapter._check_* / MockAdapter's
-run_dfm_check() for the plain-language "why"):
+run_dfm_check() runs four subtractive/formative-manufacturing checks,
+each protecting against a specific real manufacturing problem (see
+docstrings on SolidWorksAdapter._check_* / MockAdapter's run_dfm_check()
+for the plain-language "why"):
 
 1. Hole geometry (diameter, depth:diameter ratio) -- drills that are too
    thin or too deep relative to their diameter break or wander.
@@ -13,6 +15,13 @@ run_dfm_check() for the plain-language "why"):
 4. Dimension tolerance -- tolerances tighter than a shop's normal
    process capability cost disproportionately more (special tooling,
    100% inspection, higher scrap rate).
+
+run_am_dfm_check() runs three additive-manufacturing checks for a given
+build orientation -- overhang (implemented, reusing the same face-normal
+geometric analysis as compare_build_orientations()/
+recommend_support_strategy()), min_feature_size and trapped_volume (both
+always not_applicable -- not implemented yet, see run_am_dfm_check()'s
+docstring for why).
 
 Every finding is a dict: {"check", "status", "feature", "message", ...}.
 "status" is always one of "flagged", "pass", "not_applicable" -- never a

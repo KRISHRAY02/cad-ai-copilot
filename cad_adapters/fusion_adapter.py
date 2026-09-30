@@ -42,6 +42,7 @@ from cad_adapters.base_adapter import (
     AssemblyComponent,
     CadAdapter,
     Feature,
+    FaceGeometry,
     MaterialInfo,
     PartInfo,
 )
@@ -583,6 +584,37 @@ class FusionAdapter(CadAdapter):
         if "error" in data:
             raise FusionDataUnavailableError(data["error"])
         return data["face_count"]
+
+    def get_face_geometry(self) -> list[FaceGeometry]:
+        """Per-face outward unit normal, area, and edge-adjacency across
+        every solid body in the current design, via the bridge's
+        /geometry/faces endpoint -- see fusion_bridge_addin.py's
+        _get_face_geometry() for how each value is actually read.
+
+        Raises:
+            FusionBridgeNotReachableError: the bridge server isn't
+                running/reachable.
+            FusionDataUnavailableError: the active document isn't a
+                Fusion Design.
+        """
+        # Per-face normal/area/adjacency over every body is O(face count)
+        # Fusion API calls, not a cheap property read -- on a large
+        # multi-body assembly (thousands of faces) this genuinely takes
+        # tens of seconds, well past the 3s default used by cheap
+        # endpoints elsewhere in this adapter. Confirmed live: a ~4600
+        # face assembly took ~50s.
+        data = self._request("/geometry/faces", timeout=120.0)
+        if "error" in data:
+            raise FusionDataUnavailableError(data["error"])
+
+        return [
+            FaceGeometry(
+                normal=tuple(f["normal"]),
+                area_mm2=f["area_mm2"],
+                adjacent_indices=f["adjacent_indices"],
+            )
+            for f in data.get("faces", [])
+        ]
 
     def get_bend_count(self) -> int:
         """Number of Sheet Metal bend-producing features in the current

@@ -1,0 +1,16 @@
+process_type,material,strength_tier,max_service_temp_c,cost_tier,surface_finish_tier,load_bearing_suitable,notes
+FDM,PLA,low,50,low,low,no,Easy to print and low cost but brittle and low heat resistance -- best for visual prototypes and non-functional models only.
+FDM,PETG,medium,70,low,medium,no,Tougher and more temperature-resistant than PLA but still not rated for sustained structural loads.
+FDM,ABS,medium,85,low,low,no,Moderate strength and heat resistance; warps easily during printing and has a rougher as-printed finish than PETG.
+FDM,Nylon (PA12),high,120,medium,medium,yes,Strong flexible engineering-grade filament with good fatigue and wear resistance -- a common choice for load-bearing FDM brackets and jigs.
+FDM,Nylon (Carbon-Fiber Filled),high,150,medium,medium,yes,Very stiff and strong with the highest heat resistance of the FDM materials here -- suited to demanding load-bearing fixtures.
+FDM,TPU,low,60,medium,medium,no,Flexible rubber-like material for gaskets/grips/bellows -- not rated for rigid load-bearing structures.
+SLA,Standard Resin,low,55,medium,high,no,Excellent surface detail and finish but brittle with low heat/impact resistance -- visual prototypes only.
+SLA,Tough/Engineering Resin,medium,60,medium,high,no,Better impact resistance than standard resin while keeping SLA's fine surface finish; still not for sustained heavy loads.
+SLA,High-Temp Resin,medium,120,high,high,no,High heat-deflection resin for fixtures and mold masters; still brittle under mechanical load.
+SLS,Nylon PA12 (SLS),high,95,medium,medium,yes,Strong and isotropic (no weak layer direction like FDM) -- a solid choice for functional load-bearing parts.
+SLS,Nylon PA11 (SLS),high,90,medium,medium,yes,More flexible and impact-resistant than PA12 SLS while remaining an engineering-grade load-bearing material.
+MJF,Nylon PA12 (MJF),high,95,medium,high,yes,Similar strength profile to SLS Nylon with generally better surface finish and dimensional accuracy.
+DMLS,Aluminum (AlSi10Mg),high,300,high,medium,yes,Metal powder-bed process with high strength and heat resistance -- for demanding load-bearing or thermal applications, at higher cost.
+DMLS,Stainless Steel (316L),high,500,high,medium,yes,Excellent strength, corrosion resistance, and heat resistance -- a premium metal AM option.
+DMLS,Titanium (Ti6Al4V),high,600,high,medium,yes,Extremely high strength-to-weight ratio and heat resistance -- aerospace-grade, the highest cost option here.

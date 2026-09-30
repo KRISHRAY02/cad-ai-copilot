@@ -235,6 +235,37 @@ def _format_missing_manufacturing_process_answer(tool_result_json: str) -> str |
     )
 
 
+def _format_not_an_assembly_answer(tool_result_json: str) -> str | None:
+    """Give a clean, direct answer when an assembly-only tool
+    (list_assembly_components / get_assembly_bom / get_assembly_cost_drivers /
+    export_bom) refuses because the currently open document is a single part,
+    instead of routing the found=False message back through the LLM.
+
+    Observed live: asked "how many unique parts are in this assembly?" with
+    only a single part ("ALCOA Bracket") open, the model called
+    get_current_part_info() (per list_assembly_components's old docstring
+    advice to check first) and then produced a confused non-answer about
+    "a part's identity or metadata" instead of ever stating the simple fact
+    that it's just one part, not an assembly. Same failure family as
+    _format_missing_manufacturing_process_answer above -- short-circuit it in
+    Python rather than trusting the model to state the obvious correctly.
+    """
+    try:
+        data = json.loads(tool_result_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict) or data.get("found") is not False:
+        return None
+    if "is not an assembly" not in data.get("message", ""):
+        return None
+    return (
+        "This is a single part, not an assembly, so there's just the one "
+        "part currently open -- no assembly-level component count, BOM, or "
+        "sub-assembly breakdown applies here. Open an assembly if you want "
+        "that kind of question answered."
+    )
+
+
 # Tool name -> formatter, for tools whose output is reliable to render
 # directly rather than routing back through the LLM. See
 # _format_list_assembly_components_answer's docstring for why this exists.
@@ -280,6 +311,9 @@ def _format_deterministic_answer(tool_name: str, tool_result_json: str) -> str |
     missing_process = _format_missing_manufacturing_process_answer(tool_result_json)
     if missing_process is not None:
         return missing_process
+    not_an_assembly = _format_not_an_assembly_answer(tool_result_json)
+    if not_an_assembly is not None:
+        return not_an_assembly
     formatter = _DETERMINISTIC_ANSWER_FORMATTERS.get(tool_name)
     if formatter is None:
         return None
@@ -344,6 +378,15 @@ class AiOrchestrator:
         # these exist.
         self._last_quantity: int | None = None
         self._last_manufacturing_process: str | None = None
+        # Last build orientation generate_am_readiness_guide() recommended
+        # in a *successful* (found=True) call this session -- same
+        # "deterministic override regardless of what the model does"
+        # reasoning as _last_quantity/_last_manufacturing_process above,
+        # applied to run_am_dfm_check()'s build_orientation so the AM
+        # readiness guide and a follow-up AM DFM check can't silently
+        # describe two different orientations. See
+        # _remember_am_orientation_if_successful/_carry_over_unstated_params.
+        self._last_am_orientation: str | None = None
         self._current_question: str = ""
         # The name and parsed found=True JSON of the last successful
         # cost/BOM tool call made while answering the CURRENT ask() turn --
@@ -475,6 +518,7 @@ class AiOrchestrator:
                     name, arguments, called_signatures
                 )
                 self._remember_params_if_successful(name, arguments, tool_result)
+                self._remember_am_orientation_if_successful(name, tool_result)
                 self._remember_structured_result(name, tool_result)
                 self._history.append(
                     {"role": "tool", "tool_name": name, "content": tool_result}
@@ -503,6 +547,7 @@ class AiOrchestrator:
                     name, arguments, called_signatures
                 )
                 self._remember_params_if_successful(name, arguments, tool_result)
+                self._remember_am_orientation_if_successful(name, tool_result)
                 self._remember_structured_result(name, tool_result)
                 self._history.append(
                     {
@@ -546,6 +591,22 @@ class AiOrchestrator:
         "export_bom",
     }
 
+    # Tools whose build_orientation argument should default to
+    # generate_am_readiness_guide()'s last recommendation -- see
+    # _carry_over_unstated_params's AM block and
+    # _remember_am_orientation_if_successful below. A set (like
+    # _COST_TOOLS) even though it currently has one member, so a future
+    # AM tool taking build_orientation (e.g. a per-orientation cost/
+    # material-usage estimate) gets this for free.
+    _AM_ORIENTATION_TOOLS = {"run_am_dfm_check"}
+
+    # Substrings whose presence in the user's question is treated as
+    # "the user is talking about a specific/different orientation right
+    # now" -- same role PROCESSES's names play for manufacturing_process
+    # below, just keyword-based instead of an exact enum since orientation
+    # labels aren't a small fixed vocabulary the way PROCESSES is.
+    _ORIENTATION_KEYWORDS = ("rotat", "orient", "flip", "as-modeled", "as modeled")
+
     def _carry_over_unstated_params(self, name: str, arguments: dict) -> dict:
         """If `name` is a cost tool, override `quantity`/`manufacturing_process`
         with the last values a *successful* cost answer in this
@@ -569,28 +630,46 @@ class AiOrchestrator:
         textual basis for a new process -- in either case, whatever the
         model put there gets overridden with the session's last known
         good value rather than trusted.
+
+        The same reasoning is applied to `_AM_ORIENTATION_TOOLS`'
+        build_orientation argument below: a follow-up like "run the AM
+        DFM checks" or "check it for overhangs" after
+        generate_am_readiness_guide() already recommended an orientation
+        has no textual basis to switch orientations, so it's overridden
+        to the last recommended one rather than trusted to default to
+        "as-modeled" or invent a different one.
         """
-        if name not in self._COST_TOOLS:
+        if name not in self._COST_TOOLS and name not in self._AM_ORIENTATION_TOOLS:
             return arguments
 
         overrides = {}
         question_lower = self._current_question.lower()
 
-        if (
-            "quantity" in arguments
-            and self._last_quantity is not None
-            and not re.search(r"\d", self._current_question)
-            and arguments.get("quantity") != self._last_quantity
-        ):
-            overrides["quantity"] = self._last_quantity
+        if name in self._COST_TOOLS:
+            if (
+                "quantity" in arguments
+                and self._last_quantity is not None
+                and not re.search(r"\d", self._current_question)
+                and arguments.get("quantity") != self._last_quantity
+            ):
+                overrides["quantity"] = self._last_quantity
 
-        if (
-            "manufacturing_process" in arguments
-            and self._last_manufacturing_process is not None
-            and not any(p.lower() in question_lower for p in PROCESSES)
-            and arguments.get("manufacturing_process") != self._last_manufacturing_process
-        ):
-            overrides["manufacturing_process"] = self._last_manufacturing_process
+            if (
+                "manufacturing_process" in arguments
+                and self._last_manufacturing_process is not None
+                and not any(p.lower() in question_lower for p in PROCESSES)
+                and arguments.get("manufacturing_process") != self._last_manufacturing_process
+            ):
+                overrides["manufacturing_process"] = self._last_manufacturing_process
+
+        if name in self._AM_ORIENTATION_TOOLS:
+            if (
+                "build_orientation" in arguments
+                and self._last_am_orientation is not None
+                and not any(kw in question_lower for kw in self._ORIENTATION_KEYWORDS)
+                and arguments.get("build_orientation") != self._last_am_orientation
+            ):
+                overrides["build_orientation"] = self._last_am_orientation
 
         if overrides:
             _TOOL_CALL_LOGGER.info(
@@ -650,6 +729,51 @@ class AiOrchestrator:
                     "only changes one of these, carry the other one over "
                     "unchanged in your next tool call -- do not omit it "
                     "or substitute a different value."
+                ),
+            }
+        )
+
+    def _remember_am_orientation_if_successful(self, name: str, tool_result_json: str) -> None:
+        """Record generate_am_readiness_guide()'s recommended build
+        orientation as this session's "last known good" AM orientation,
+        so a later run_am_dfm_check() call defaults to the SAME
+        orientation instead of silently falling back to "as-modeled" or a
+        different one -- same "deterministic override regardless of what
+        the model does" reasoning as _remember_params_if_successful
+        above, applied to build orientation instead of quantity/
+        manufacturing_process. The actual override happens in
+        _carry_over_unstated_params; this only records the value.
+
+        Only triggers on generate_am_readiness_guide() (not
+        compare_build_orientations() directly), since the guide's
+        best_orientation IS the recommendation a follow-up DFM check
+        should stay consistent with -- reading the raw ranked list from
+        compare_build_orientations() wouldn't unambiguously say which
+        entry was "the" recommendation.
+        """
+        if name != "generate_am_readiness_guide":
+            return
+        try:
+            data = json.loads(tool_result_json)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not (isinstance(data, dict) and data.get("found") is True):
+            return
+
+        orientation = data.get("best_orientation", {}).get("orientation")
+        if not orientation:
+            return
+
+        self._last_am_orientation = orientation
+        self._history.append(
+            {
+                "role": "system",
+                "content": (
+                    f"The AM readiness guide recommended build orientation "
+                    f"'{orientation}'. If the user asks to run AM DFM checks "
+                    "next without naming a different orientation, use this "
+                    "same orientation for build_orientation -- do not "
+                    "default to 'as-modeled' or substitute a different one."
                 ),
             }
         )

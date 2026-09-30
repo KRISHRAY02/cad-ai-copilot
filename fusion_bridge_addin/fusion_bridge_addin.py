@@ -367,7 +367,13 @@ def _get_bend_count() -> dict:
         return {"error": "The active document is not a Fusion Design (parametric modeling) document."}
 
     count = 0
-    timeline = design.timeline
+    try:
+        timeline = design.timeline
+    except Exception:
+        # Non-parametric (direct-modeling) documents have no Timeline --
+        # same fix as _read_component_bend_count() above; 0 is the
+        # correct answer, not an error.
+        return {"bend_count": count}
     for i in range(timeline.count):
         item = timeline.item(i)
         try:
@@ -378,6 +384,124 @@ def _get_bend_count() -> dict:
             count += 1
 
     return {"bend_count": count}
+
+
+# -- Build orientation / overhang geometry endpoint ----------------------
+
+
+def _get_face_geometry() -> dict:
+    """Per-face outward unit normal, area (mm^2), and edge-adjacency for
+    every face across every solid body in the current design -- the raw
+    geometric primitive compare_build_orientations() (see
+    cad_adapters/base_adapter.py) needs to flag overhang faces and group
+    them into contiguous regions, for a real orientation-vs-support
+    analysis rather than a guessed one.
+
+    Normal: BRepFace has no simple `.normal` property that works for
+    every face type (only adsk.core.Plane, the geometry object behind a
+    planar face, has one) -- `face.evaluator.getNormalAtPoint(point)`,
+    evaluated at `face.pointOnFace` (a documented point guaranteed to lie
+    on the face), works for planar and curved faces alike. Like other
+    Fusion API calls translated from a C++ output parameter, it returns
+    (returnValue, normal); a False returnValue means the normal couldn't
+    be evaluated there, so that face is skipped entirely rather than
+    guessed.
+
+    Area: BRepFace.area is documented in cm^2 (Fusion's internal length
+    unit convention, same as mass/features/etc. elsewhere in this
+    bridge) -- *100 to get mm^2.
+
+    Adjacency: for each face, walk its edges and each edge's connected
+    faces (BRepEdge.faces -- normally exactly the 2 faces meeting at that
+    edge). Faces are matched back to their index in the flat list below
+    via `entityToken`, a documented persistent identifier for a B-Rep
+    entity, rather than Python object identity/`id()` -- re-reading a
+    property like `edge.faces` returns fresh wrapper objects each call,
+    not the same Python object instance the outer loop already holds, so
+    `id()` would not reliably match.
+    """
+    design = _get_design()
+    if design is None:
+        return {"error": "The active document is not a Fusion Design (parametric modeling) document."}
+
+    all_faces = []
+    for body in _iter_all_bodies(design):
+        try:
+            for face in body.faces:
+                all_faces.append(face)
+        except Exception:
+            continue
+
+    token_to_index = {}
+    for i, face in enumerate(all_faces):
+        try:
+            token_to_index[face.entityToken] = i
+        except Exception:
+            pass
+
+    # Two passes: first read each face's own data (or None if it can't be
+    # read, so it's skipped rather than guessed), then remap adjacency
+    # indices to only the faces that survived -- adjacent_indices in the
+    # final response must index into the FILTERED list this endpoint
+    # returns, not the raw all_faces enumeration.
+    raw_results: list[dict | None] = []
+    for i, face in enumerate(all_faces):
+        normal = None
+        try:
+            point = face.pointOnFace
+            success, normal_vec = face.evaluator.getNormalAtPoint(point)
+            if success:
+                normal = (normal_vec.x, normal_vec.y, normal_vec.z)
+        except Exception:
+            normal = None
+
+        if normal is None:
+            raw_results.append(None)
+            continue
+
+        try:
+            area_mm2 = face.area * 100.0  # cm^2 -> mm^2
+        except Exception:
+            raw_results.append(None)
+            continue
+
+        adjacent_raw = []
+        try:
+            for edge in face.edges:
+                try:
+                    for other_face in edge.faces:
+                        try:
+                            other_index = token_to_index.get(other_face.entityToken)
+                        except Exception:
+                            other_index = None
+                        if other_index is not None and other_index != i:
+                            adjacent_raw.append(other_index)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        raw_results.append(
+            {"normal": list(normal), "area_mm2": area_mm2, "adjacent_raw": adjacent_raw}
+        )
+
+    old_to_new = {}
+    new_index = 0
+    for i, r in enumerate(raw_results):
+        if r is not None:
+            old_to_new[i] = new_index
+            new_index += 1
+
+    faces_out = []
+    for i, r in enumerate(raw_results):
+        if r is None:
+            continue
+        remapped = sorted({old_to_new[j] for j in r["adjacent_raw"] if j in old_to_new})
+        faces_out.append(
+            {"normal": r["normal"], "area_mm2": r["area_mm2"], "adjacent_indices": remapped}
+        )
+
+    return {"faces": faces_out}
 
 
 # -- DFM raw-data endpoints --------------------------------------------
@@ -727,7 +851,18 @@ def _read_component_bend_count(design, component) -> int:
     document with its own independent feature tree.
     """
     count = 0
-    timeline = design.timeline
+    try:
+        timeline = design.timeline
+    except Exception:
+        # Non-parametric (direct-modeling) documents have no Timeline at
+        # all -- confirmed live 2026-09-13, `design.timeline` raises a raw
+        # Fusion API RuntimeError ("3 : this is not a parametric design")
+        # here, which used to crash the whole assembly-component walk for
+        # any such document that still has occurrences (occurrences and
+        # parametric-mode are independent design properties). 0 bends is
+        # the correct answer, same as a parametric design with a timeline
+        # but no bend features.
+        return count
     for i in range(timeline.count):
         item = timeline.item(i)
         try:
@@ -1191,6 +1326,7 @@ class _BridgeRequestHandler(BaseHTTPRequestHandler):
             "/features": _get_features,
             "/face_count": _get_face_count,
             "/bend_count": _get_bend_count,
+            "/geometry/faces": _get_face_geometry,
             "/dfm/holes": _get_dfm_holes,
             "/dfm/wall_thickness": _get_dfm_wall_thickness,
             "/dfm/draft": _get_dfm_draft,

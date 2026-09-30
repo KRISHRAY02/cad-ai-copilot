@@ -17,6 +17,7 @@ from cad_adapters.base_adapter import (
     AssemblyComponent,
     CadAdapter,
     Feature,
+    FaceGeometry,
     MaterialInfo,
     PartInfo,
 )
@@ -382,6 +383,21 @@ class SolidWorksAdapter(CadAdapter):
             1
             for feat in cls._iter_raw_features(model)
             if feat.GetTypeName2 in _SHEET_METAL_BEND_FEATURE_TYPES
+        )
+
+    def get_face_geometry(self) -> list[FaceGeometry]:
+        """Not implemented yet -- per-face normal/area/adjacency extraction
+        via IFace2 (GetSurface/GetArea/GetEdges/IEdge::GetTwoAdjacentFaces2
+        or similar) hasn't been written or verified live against a real
+        SOLIDWORKS part. compare_build_orientations() is therefore only
+        available via FusionAdapter and MockAdapter for now -- see this
+        project's status notes.
+        """
+        raise NotImplementedError(
+            "SolidWorksAdapter.get_face_geometry() is not implemented yet -- "
+            "compare_build_orientations() is not yet available for SOLIDWORKS "
+            "parts. Extend this method with real IFace2-based normal/area/"
+            "adjacency extraction to support it."
         )
 
     def get_bounding_box_mm(self) -> tuple[float, float, float]:

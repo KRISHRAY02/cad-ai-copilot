@@ -52,6 +52,27 @@ _MIN_FILLET_RADIUS_MM = 1.0
 _DEFAULT_MACHINE_TYPE = "CNC_3axis"
 _DEFAULT_SUPPLIER = "Supplier_A"
 
+# Default candidate orientations for generate_am_readiness_guide() when the
+# user doesn't name specific ones -- covers the part sitting as-modeled
+# plus a 90-degree tip about each horizontal axis and a full flip, a small
+# representative set rather than an exhaustive sweep.
+_DEFAULT_AM_CANDIDATE_ORIENTATIONS = [
+    "as-modeled",
+    "rotated 90 about X",
+    "rotated 90 about Y",
+    "rotated 180",
+]
+
+# The exact 4 material-selection questions recommend_am_material() needs --
+# shared by generate_am_readiness_guide()'s "ask the user" response so the
+# wording never drifts out of sync between the two tools' docstrings.
+_AM_MATERIAL_QUESTIONS = [
+    "What does this part actually do / what is its function?",
+    "Is it load-bearing (does it carry or transmit mechanical load in use)?",
+    "What temperature will it be exposed to in service (low / moderate / high)?",
+    "What matters most for this part: strength, cost, or surface finish?",
+]
+
 
 def _build_adapter(backend: str | None = None) -> CadAdapter:
     """Construct the CadAdapter to use.
@@ -676,8 +697,10 @@ def list_assembly_components() -> dict:
     that specific deeply-nested-with-no-direct-leaves case, never
     overcounts.
 
-    Returns found=False if the currently open document isn't an assembly
-    (call get_current_part_info() first if you're not sure).
+    Returns found=False if the currently open document isn't an assembly --
+    just call this tool directly rather than checking with
+    get_current_part_info() first, its found=False message already tells
+    you (and the user) what's open.
     """
     if not adapter.is_assembly():
         return {
@@ -738,8 +761,10 @@ def get_assembly_bom(manufacturing_process: str | None = None, quantity: int = 1
     actually asked to change. Never omit a parameter or let it silently
     default/revert to a different value.
 
-    Returns found=False if the currently open document isn't an assembly
-    (call get_current_part_info() first if you're not sure).
+    Returns found=False if the currently open document isn't an assembly --
+    just call this tool directly rather than checking with
+    get_current_part_info() first, its found=False message already tells
+    you (and the user) what's open.
     """
     if manufacturing_process not in PROCESSES:
         return {
@@ -886,6 +911,244 @@ def export_bom(
         return {"found": False, "message": f"Could not export the BOM: {e}"}
 
     return {"found": True, "bom_path": saved_path, "indented": indented}
+
+
+@mcp.tool()
+def recommend_am_material(
+    part_function: str,
+    load_bearing: bool,
+    temperature_exposure: str,
+    priority: str,
+) -> dict:
+    """Recommend additive-manufacturing (3D printing) material(s) for the
+    part, based on how it will be USED -- not on the CAD model's geometry
+    or its currently assigned material. This tool reads NOTHING from the
+    CAD document; it only matches the four answers below against
+    am_materials.csv's reference table of common AM process/material
+    combinations.
+
+    **Before calling this tool, you MUST ask the user these four
+    questions conversationally, one at a time or together, and use their
+    actual answers -- never guess, infer from the part's geometry/mass/
+    current material, or fill in a plausible-sounding default:**
+      1. What does this part actually do / what is its function?
+      2. Is it load-bearing (does it carry or transmit mechanical load in
+         use)?
+      3. What temperature will it be exposed to in service?
+      4. What matters most for this part: strength, cost, or surface
+         finish?
+    This is fundamentally different from every geometry-driven tool in
+    this server (get_mass, estimate_cost, run_dfm_check, etc.) -- no
+    amount of reading the model's faces, mass, or feature tree can tell
+    you what a part is FOR or how hot it will get in use. If the user
+    hasn't already told you all four answers earlier in the conversation,
+    ask before calling this tool. If you must call it before getting a
+    real answer to one of these (e.g. the user explicitly says "just
+    guess"), say so plainly when presenting the result -- don't present a
+    guessed input as if the user stated it.
+
+    `temperature_exposure` MUST be one of "low" (room temperature/indoor
+    use), "moderate" (e.g. near a motor, an enclosed outdoor housing in
+    sun), or "high" (e.g. near an engine/heat source, sustained hot
+    environments) -- ask the user to characterize it in these terms if
+    their answer is more specific (e.g. "it sits on a car dashboard in
+    summer" maps to "high").
+
+    `priority` MUST be one of "strength", "cost", or "surface_finish".
+
+    `part_function` is free text (e.g. "mounting bracket for a camera",
+    "gasket", "enclosure lid") -- carried through in the response for
+    context, but does not change which materials are filtered in/out
+    (am_materials.csv has no per-application suitability column, so this
+    tool is honest about not pretending to use data that doesn't exist).
+
+    Filters am_materials.csv to materials meeting the temperature
+    requirement, further restricts to load_bearing_suitable=True entries
+    if `load_bearing` is True, then ranks what's left by `priority` and
+    returns up to 3 recommendations, each with a one-line reason citing
+    the actual strength/temperature/cost/surface-finish data behind it --
+    never just a bare material name. Returns found=False with an
+    explanatory message (never a guessed fallback) if `temperature_exposure`/
+    `priority` aren't recognized, or if no material in am_materials.csv
+    meets the combined temperature + load-bearing requirement.
+    """
+    from am_material_advisor import recommend_am_material as _recommend_am_material
+
+    return _recommend_am_material(part_function, load_bearing, temperature_exposure, priority)
+
+
+@mcp.tool()
+def generate_am_readiness_guide(
+    candidate_orientations: list[str] | None = None,
+    part_function: str | None = None,
+    load_bearing: bool | None = None,
+    temperature_exposure: str | None = None,
+    priority: str | None = None,
+) -> dict:
+    """Run the full additive-manufacturing (3D printing) readiness guide
+    for the CURRENTLY OPEN part in one call: best build orientation,
+    recommended support strategy, and (once the material questions below
+    are answered) recommended material -- combining
+    compare_build_orientations, recommend_support_strategy, and
+    recommend_am_material.
+
+    **Call this in response to the "Would you like help completing the
+    additive manufacturing setup for this model?" prompt**, or whenever
+    the user asks for AM/3D-printing setup help on the current part,
+    instead of calling the three underlying tools yourself one at a time.
+
+    Orientation and support strategy are pure geometric analysis and need
+    no extra input from the user -- this tool computes them immediately
+    using `candidate_orientations` if the user named specific ones, or a
+    small representative default set otherwise ("as-modeled", "rotated 90
+    about X", "rotated 90 about Y", "rotated 180").
+
+    Material selection CANNOT be inferred from geometry (see
+    recommend_am_material's docstring for why) -- it needs
+    `part_function`, `load_bearing`, `temperature_exposure`, and
+    `priority`, which only the user can answer. **On the first call, if
+    you don't already know all four of these from earlier in the
+    conversation, leave them as None**: this tool still returns the
+    orientation + support strategy results immediately, plus
+    `material_questions_pending=True` and the exact questions to ask the
+    user next (present these to the user before anything else). Once you
+    have all four answers, call this tool AGAIN with them filled in to
+    get the complete guide including a material recommendation -- do not
+    guess any of them just to avoid a second call, and do not fabricate a
+    material recommendation yourself in the meantime.
+
+    `temperature_exposure` and `priority` follow the same accepted values
+    as recommend_am_material() ("low"/"moderate"/"high" and
+    "strength"/"cost"/"surface_finish" respectively).
+
+    Returns:
+        {
+            "found": True,
+            "best_orientation": {"orientation", "total_overhang_area_mm2",
+                "overhang_region_count", "reason"} -- the top-ranked entry
+                from compare_build_orientations, with an explicit reason
+                sentence citing the actual numbers,
+            "orientation_comparison": the full ranked list every candidate
+                orientation was compared against, for transparency,
+            "support_strategy": recommend_support_strategy()'s full result
+                for the best orientation (label + reasoning + measured
+                overhang data),
+            "material_questions_pending": True if part_function/
+                load_bearing/temperature_exposure/priority weren't all
+                given this call,
+            "material_questions_to_ask": the 4 questions to ask the user,
+                present only when material_questions_pending is True,
+            "material_recommendation": recommend_am_material()'s full
+                result, present only when all 4 material answers were
+                given this call,
+        }
+
+    Returns found=False with an explanatory message (never guesses) if
+    build-orientation analysis isn't available for the current CAD
+    platform (e.g. get_face_geometry() not yet implemented -- currently
+    true for SolidWorksAdapter), if `candidate_orientations` contains an
+    unparseable label, or if `temperature_exposure`/`priority` (when
+    given) aren't recognized values.
+    """
+    from am_material_advisor import recommend_am_material as _recommend_am_material
+
+    orientations = candidate_orientations or list(_DEFAULT_AM_CANDIDATE_ORIENTATIONS)
+
+    try:
+        comparison = adapter.compare_build_orientations(orientations)
+    except (ValueError, NotImplementedError) as e:
+        return {
+            "found": False,
+            "message": f"Could not analyze build orientations for the current part: {e}",
+        }
+
+    best = comparison[0]
+    support_strategy = adapter.recommend_support_strategy(best["orientation"])
+
+    result = {
+        "found": True,
+        "best_orientation": {
+            "orientation": best["orientation"],
+            "total_overhang_area_mm2": best["total_overhang_area_mm2"],
+            "overhang_region_count": best["overhang_region_count"],
+            "reason": (
+                f"'{best['orientation']}' has the least total overhang area "
+                f"({best['total_overhang_area_mm2']}mm^2 across "
+                f"{best['overhang_region_count']} region(s)) of the "
+                f"{len(orientations)} orientation(s) compared."
+            ),
+        },
+        "orientation_comparison": comparison,
+        "support_strategy": support_strategy,
+    }
+
+    have_all_material_answers = (
+        part_function is not None
+        and load_bearing is not None
+        and temperature_exposure is not None
+        and priority is not None
+    )
+
+    if have_all_material_answers:
+        result["material_questions_pending"] = False
+        result["material_recommendation"] = _recommend_am_material(
+            part_function, load_bearing, temperature_exposure, priority
+        )
+    else:
+        result["material_questions_pending"] = True
+        result["material_questions_to_ask"] = list(_AM_MATERIAL_QUESTIONS)
+
+    return result
+
+
+@mcp.tool()
+def run_am_dfm_check(build_orientation: str) -> list[dict]:
+    """Run additive-manufacturing (3D printing) DFM checks on the
+    CURRENTLY OPEN part for ONE build orientation: overhang,
+    min_feature_size, trapped_volume.
+
+    **If generate_am_readiness_guide() already ran earlier in this
+    conversation, you MUST pass its recommended orientation
+    (best_orientation.orientation from that result) as `build_orientation`
+    here, UNLESS the user's current question explicitly asks about a
+    different orientation (e.g. names a specific rotation, says "what if
+    I print it as-modeled instead", etc.).** Do not default to
+    "as-modeled" or silently pick a different orientation than what was
+    already recommended -- the guide's recommendation and these DFM
+    results must describe the same orientation, or they'll contradict
+    each other. If no orientation has been established yet in this
+    conversation and the user hasn't named one, ask which orientation to
+    check (or suggest running generate_am_readiness_guide() first to get
+    a recommendation).
+
+    `build_orientation` uses the same label syntax as
+    compare_build_orientations() ("as-modeled" or "rotated <degrees>
+    about <x|y|z>").
+
+    Each finding has "check" (overhang/min_feature_size/trapped_volume),
+    "status" (flagged/pass/not_applicable), and a message. The overhang
+    check is real geometric analysis, reusing the exact same detection
+    compare_build_orientations()/recommend_support_strategy() use --
+    "flagged" if total overhang area exceeds the same negligible-area
+    threshold recommend_support_strategy() uses, else "pass".
+    min_feature_size and trapped_volume always report "not_applicable":
+    neither is implemented yet in this project (no primitive exists yet
+    for measuring printable feature size or detecting enclosed voids) --
+    reported honestly rather than guessed.
+
+    Raises no exception for a bad `build_orientation` -- returns
+    found=False with the parser's exact expected-syntax message instead,
+    same pattern as the other AM tools.
+    """
+    try:
+        return adapter.run_am_dfm_check(build_orientation)
+    except (ValueError, NotImplementedError) as e:
+        return [
+            {
+                "found": False,
+                "message": f"Could not run AM DFM checks for the current part: {e}",
+            }
+        ]
 
 
 @mcp.tool()
