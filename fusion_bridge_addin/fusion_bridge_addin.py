@@ -208,6 +208,28 @@ def _get_mass_kg() -> dict:
     return {"mass_kg": mass_kg}
 
 
+def _get_bounding_box_mm() -> dict:
+    """Axis-aligned bounding box (x, y, z) in millimeters of the whole
+    current design's root component -- same "whole active document"
+    scope as _get_mass_kg(), reusing _read_component_bounding_box_mm()
+    (already relied on per-component for the assembly BOM) against
+    design.rootComponent instead of a sub-component.
+    """
+    design = _get_design()
+    if design is None:
+        return {"error": "The active document is not a Fusion Design (parametric modeling) document."}
+
+    try:
+        box_mm = _read_component_bounding_box_mm(design.rootComponent)
+    except Exception as e:
+        return {"error": f"Could not read bounding box: {e}"}
+
+    if box_mm is None:
+        return {"error": "No solid bodies found in the current design."}
+
+    return {"bounding_box_mm": box_mm}
+
+
 def _get_material() -> dict:
     """Material assigned to the current design's first solid body --
     same "one material representing the current part" scope as
@@ -1322,6 +1344,7 @@ class _BridgeRequestHandler(BaseHTTPRequestHandler):
         endpoints = {
             "/part_info": _get_active_document_info,
             "/mass": _get_mass_kg,
+            "/bounding_box": _get_bounding_box_mm,
             "/material": _get_material,
             "/features": _get_features,
             "/face_count": _get_face_count,

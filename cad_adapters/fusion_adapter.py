@@ -648,7 +648,20 @@ class FusionAdapter(CadAdapter):
         self._not_implemented("capture_screenshot")
 
     def get_bounding_box_mm(self) -> tuple:
-        self._not_implemented("get_bounding_box_mm")
+        """Axis-aligned bounding box (x, y, z) in millimeters of the whole
+        current design's root component, via the bridge's /bounding_box
+        endpoint -- same "whole active document" scope as get_mass().
+
+        Raises:
+            FusionBridgeNotReachableError: the bridge server isn't
+                running/reachable.
+            FusionDataUnavailableError: the active document isn't a
+                Fusion Design, or has no solid bodies.
+        """
+        data = self._request("/bounding_box")
+        if "error" in data:
+            raise FusionDataUnavailableError(data["error"])
+        return tuple(data["bounding_box_mm"])
 
     def is_assembly(self) -> bool:
         """True if the design's root component references any occurrences

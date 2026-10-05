@@ -29,7 +29,17 @@ from ai_orchestrator import (
 from bom_export import export_bom as write_bom_file
 from cad_adapters.fusion_adapter import FusionAdapter
 from cad_adapters.solidworks_adapter import SolidWorksAdapter
+from production_cost import (
+    CNC_LABOR_HOURLY_RATE_INR,
+    CNC_MACHINE_HOURLY_RATE_INR,
+    IM_MACHINE_HOURLY_RATE_INR,
+    IM_TOOLING_COST_INR,
+    PROCESSES,
+    SM_COST_PER_BEND_INR,
+    SM_CUTTING_RATE_PER_MM_INR,
+)
 from report.generate_report import generate_manufacturing_report
+from ui.components.cost_card import build_cost_card as new_build_cost_card
 
 # CAD platform selection (post-login, see build_platform_popup /
 # run_platform_selection). Values match mcp_server._build_adapter()'s
@@ -1163,65 +1173,215 @@ def build_component_listing_view(data: dict) -> ft.Control:
     return _card_container([summary_header, *sections])
 
 
-def build_cost_breakdown_card(data: dict) -> ft.Control:
-    """Single-part cost card for estimate_cost() -- only ever two line
-    items (material cost, production cost), so no Make/Buy chips or
-    per-row summary-collapse the way build_bom_card has; the cost-share
-    bar here shows each line's share of total_cost_per_unit_inr instead
-    of share of an assembly total.
-    """
-    material_cost = data.get("material_cost_per_unit_inr")
-    production_cost = data.get("production_cost_per_unit_inr")
-    total_cost = data.get("total_cost_per_unit_inr")
-    total_for_qty = data.get("total_cost_for_quantity_inr")
-    quantity = data.get("quantity", "?")
-    manufacturing_process = data.get("manufacturing_process", "?")
-    material_used = data.get("material_used", "?")
+def build_cost_breakdown_card(data: dict, on_what_if_result=None) -> ft.Control:
+    """Thin adapter: renders estimate_cost()'s result via the redesigned
+    ui.components.cost_card component (header chip + placeholder-rate
+    badge, hero stat tiles, colour-blind-safe cost-split bar + legend,
+    collapsible "Show calculation" detail table, ML-comparison strip,
+    action row) instead of building the card's widget tree here -- see
+    that module's docstring for the full visual spec and exactly which
+    real field backs each element (it never shows a placeholder number).
 
-    def line_item(label: str, value) -> ft.Container:
-        fraction = (value / total_cost) if isinstance(value, (int, float)) and total_cost else 0.0
-        return ft.Container(
-            content=ft.Column(
-                [
-                    ft.Row(
-                        [
-                            ft.Text(label, size=13, color=COLOR_AI_TEXT, weight=ft.FontWeight.W_500, expand=True),
-                            ft.Text(_fmt_money(value), size=13, color=COLOR_AI_TEXT, weight=ft.FontWeight.W_600),
-                        ]
-                    ),
-                    build_cost_share_bar(fraction),
-                ],
-                spacing=4,
-            ),
-            padding=pad_symmetric(horizontal=12, vertical=10),
-            border=ft.Border(bottom=ft.BorderSide(1, COLOR_AI_BORDER)),
+    Kept this function's name/signature (`data`, `on_what_if_result`)
+    unchanged so build_bubble's STRUCTURED_CARD_BUILDERS dispatch and its
+    estimate_cost special-case (passing on_what_if_result through) don't
+    need to change at all -- only the rendering underneath it moved.
+
+    `on_what_if_result`, if given, is an async callback
+    `(process, quantity, rate_overrides, new_data) -> None` -- see
+    post_what_if_result in main(), which posts the recomputed scenario
+    into the chat as a real message pair. Reuses the existing
+    build_what_if_overlay popup unchanged; only the button that opens it
+    now lives inside the new component.
+    """
+    def _open_what_if(e: ft.ControlEvent) -> None:
+        overlay = build_what_if_overlay(e.page, data, on_what_if_result)
+        e.page.overlay.append(overlay)
+        e.page.update()
+
+    card, _animate_in = new_build_cost_card(
+        data,
+        on_what_if=_open_what_if if on_what_if_result is not None else None,
+    )
+    return card
+
+
+# key -> (field label, default value) per process, for the "What if..."
+# dialog's rate-override fields -- see build_what_if_overlay. Keys match
+# exactly what production_cost.py's process functions accept in their
+# `rate_overrides` dict (see each function's docstring there).
+_WHAT_IF_RATE_FIELDS = {
+    "CNC Machining": [
+        ("machine_hourly_rate_inr", "Machine rate (Rs/hr)", CNC_MACHINE_HOURLY_RATE_INR),
+        ("labor_hourly_rate_inr", "Labor rate (Rs/hr)", CNC_LABOR_HOURLY_RATE_INR),
+    ],
+    "Injection Molding": [
+        ("machine_hourly_rate_inr", "Machine rate (Rs/hr)", IM_MACHINE_HOURLY_RATE_INR),
+        ("tooling_cost_total_inr", "Tooling cost, total (Rs)", IM_TOOLING_COST_INR),
+    ],
+    "Sheet Metal": [
+        ("cutting_rate_per_mm_inr", "Cutting rate (Rs/mm)", SM_CUTTING_RATE_PER_MM_INR),
+        ("cost_per_bend_inr", "Cost per bend (Rs)", SM_COST_PER_BEND_INR),
+    ],
+}
+
+
+def build_what_if_overlay(page: ft.Page, original_data: dict, on_what_if_result) -> ft.Container:
+    """"What if...?" popup for a cost breakdown card -- lets the user
+    compare a different manufacturing process and/or override that
+    process's PLACEHOLDER shop-rate constants (see
+    _WHAT_IF_RATE_FIELDS/production_cost.py).
+
+    The popup itself only collects inputs (process/quantity/rates) and
+    validates them. The actual recompute-and-display happens in
+    `on_what_if_result` (main()'s post_what_if_result) -- per Krish's
+    request, the result shows up as a normal message pair in the chat
+    window (and is saved to chat history like any other answer), not
+    inside this popup, so this closes itself as soon as calculation
+    succeeds rather than rendering a result card in place.
+
+    Built as a plain page.overlay entry (Container scrim + centered
+    card), the same pattern show_platform_selector uses, for the same
+    reason documented there: this project has a history in this Flet
+    environment of unreliable rendering for less battle-tested widgets
+    (ft.AlertDialog, ft.Tabs). Sticks to Container/Row/Column/Text/
+    TextField/RadioGroup -- all already proven elsewhere in this file --
+    rather than ft.Dropdown/ft.ElevatedButton, which aren't used anywhere
+    else here yet.
+    """
+    original_process = original_data.get("manufacturing_process") or PROCESSES[0]
+    original_quantity = original_data.get("quantity", 1)
+
+    process_radio_group = ft.RadioGroup(
+        content=ft.Column(
+            [ft.Radio(value=p, label=p) for p in PROCESSES],
+            spacing=4,
+        ),
+        value=original_process,
+    )
+    quantity_field = ft.TextField(
+        label="Quantity",
+        value=str(original_quantity),
+        content_padding=pad_symmetric(horizontal=12, vertical=8),
+    )
+    rate_field_1 = ft.TextField(content_padding=pad_symmetric(horizontal=12, vertical=8))
+    rate_field_2 = ft.TextField(content_padding=pad_symmetric(horizontal=12, vertical=8))
+    error_text = ft.Text("", size=12, color=COLOR_ERROR_TEXT)
+    calculate_text = ft.Text("Calculate", size=13, weight=ft.FontWeight.W_600, color="#FFFFFF")
+
+    def sync_rate_fields(process: str) -> None:
+        fields = _WHAT_IF_RATE_FIELDS.get(process, [])
+        for field, entry in zip((rate_field_1, rate_field_2), fields):
+            _key, label, default_value = entry
+            field.label = label
+            field.value = str(default_value)
+            field.visible = True
+        for field in (rate_field_1, rate_field_2)[len(fields):]:
+            field.visible = False
+
+    sync_rate_fields(original_process)
+
+    def on_process_change(e: ft.ControlEvent) -> None:
+        sync_rate_fields(process_radio_group.value)
+        error_text.value = ""
+        page.update()
+
+    process_radio_group.on_change = on_process_change
+
+    async def on_calculate(e: ft.ControlEvent) -> None:
+        error_text.value = ""
+        try:
+            quantity = int(quantity_field.value)
+            if quantity < 1:
+                raise ValueError
+        except (TypeError, ValueError):
+            error_text.value = "Quantity must be a whole number of 1 or more."
+            page.update()
+            return
+
+        process = process_radio_group.value
+        fields = _WHAT_IF_RATE_FIELDS.get(process, [])
+        rate_overrides = {}
+        for (key, label, _default), field in zip(fields, (rate_field_1, rate_field_2)):
+            try:
+                rate_overrides[key] = float(field.value)
+            except (TypeError, ValueError):
+                error_text.value = f"'{label}' must be a number."
+                page.update()
+                return
+
+        calculate_btn.disabled = True
+        calculate_text.value = "Calculating..."
+        page.update()
+
+        new_data = await asyncio.to_thread(
+            mcp_server.estimate_cost,
+            manufacturing_process=process,
+            quantity=quantity,
+            rate_overrides=rate_overrides,
         )
 
-    header = _card_header(f"Cost breakdown — {material_used}")
-    rows = [
-        line_item("Material cost", material_cost),
-        line_item("Production cost", production_cost),
-    ]
-    footer = ft.Container(
+        if overlay in page.overlay:
+            page.overlay.remove(overlay)
+        page.update()
+
+        await on_what_if_result(process, quantity, rate_overrides, new_data)
+
+    def on_close(e: ft.ControlEvent) -> None:
+        if overlay in page.overlay:
+            page.overlay.remove(overlay)
+        page.update()
+
+    calculate_btn = ft.Container(
+        content=calculate_text,
+        bgcolor=COLOR_ACCENT,
+        border_radius=8,
+        padding=pad_symmetric(horizontal=16, vertical=10),
+        alignment=ft.Alignment(0, 0),
+        ink=True,
+        on_click=on_calculate,
+    )
+    close_btn = ft.Container(
+        content=ft.Text("Close", size=13, weight=ft.FontWeight.W_600, color=COLOR_TIMESTAMP),
+        border=ft.Border.all(1, COLOR_SIDEBAR_DIVIDER),
+        border_radius=8,
+        padding=pad_symmetric(horizontal=16, vertical=10),
+        alignment=ft.Alignment(0, 0),
+        ink=True,
+        on_click=on_close,
+    )
+
+    popup_card = ft.Container(
         content=ft.Column(
             [
-                ft.Text(f"{manufacturing_process} · quantity {quantity}", size=11, color=COLOR_TIMESTAMP),
-                ft.Row(
-                    [
-                        _stat("Cost / unit", _fmt_money(total_cost), COLOR_ACCENT),
-                        _stat(f"Total for {quantity}", _fmt_money(total_for_qty), COLOR_ACCENT),
-                    ],
-                    spacing=24,
+                ft.Text("What if...?", size=18, weight=ft.FontWeight.BOLD, color=COLOR_AI_TEXT),
+                ft.Text(
+                    "Compare a different manufacturing process, or override its "
+                    "placeholder shop rates, against the same part.",
+                    size=12,
+                    color=COLOR_TIMESTAMP,
                 ),
+                ft.Text("Manufacturing process", size=12, weight=ft.FontWeight.W_600, color=COLOR_AI_TEXT),
+                process_radio_group,
+                quantity_field,
+                rate_field_1,
+                rate_field_2,
+                error_text,
+                ft.Row([calculate_btn, close_btn], spacing=10),
             ],
-            spacing=8,
+            spacing=12,
+            tight=True,
+            scroll=ft.ScrollMode.AUTO,
         ),
-        bgcolor=COLOR_CHAT_BG,
-        padding=pad_symmetric(horizontal=14, vertical=12),
-        border=ft.Border(top=ft.BorderSide(1, COLOR_AI_BORDER)),
-        border_radius=CARD_BOTTOM_RADIUS,
+        bgcolor=COLOR_AI_BUBBLE,
+        border_radius=16,
+        padding=pad_all(24),
+        width=440,
+        shadow=ft.BoxShadow(spread_radius=0, blur_radius=24, color="#40000000", offset=ft.Offset(0, 8)),
     )
-    return _card_container([header, *rows, footer])
+
+    overlay = ft.Container(content=popup_card, alignment=ft.Alignment(0, 0), expand=True, bgcolor="#B3000000")
+    return overlay
 
 
 _SUPPORT_STRATEGY_CHIP_COLORS = {
@@ -1441,7 +1601,9 @@ STRUCTURED_CARD_BUILDERS = {
 }
 
 
-def build_bubble(message: ChatMessage, page_width_hint: int) -> ft.Container:
+def build_bubble(
+    message: ChatMessage, page_width_hint: int, on_what_if_result=None
+) -> ft.Container:
     is_user = message.role == "user"
     is_error = message.role == "error"
 
@@ -1459,7 +1621,14 @@ def build_bubble(message: ChatMessage, page_width_hint: int) -> ft.Container:
         # the card, no prose repeating the same numbers below it (Krish's
         # explicit request -- the model's own text answer for these tools
         # only ever restates what the card already shows).
-        bubble = card_builder(message.structured_data)
+        # estimate_cost's card is the only one that needs on_what_if_result
+        # (its "What if..." button posts a new scenario back into this same
+        # chat -- see post_what_if_result) -- every other builder still
+        # takes just the structured data.
+        if message.structured_tool == "estimate_cost":
+            bubble = card_builder(message.structured_data, on_what_if_result)
+        else:
+            bubble = card_builder(message.structured_data)
         bubble_max_width_ratio = 0.92
     else:
         bubble_color = (
@@ -1813,6 +1982,43 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
         tooltip="Export Bill of Materials (assembly only, .xlsx)",
     )
 
+    # Fusion-only mode picker (see ai_orchestrator.AiOrchestrator.ask's
+    # fusion_mode parameter): which domain the chat should answer in,
+    # "part" (general part/assembly questions) or "am" (additive
+    # manufacturing / 3D printing). A radio button here, not a typed
+    # answer, because run_ai_orchestrator_with_data() starts a brand-new
+    # AiOrchestrator per message -- a conversational "ask once" question
+    # could never actually be answered by the user's next message in that
+    # one-shot design (this is exactly the bug Krish hit live 2026-10-05:
+    # answering "part" just re-asked the same question forever). Only
+    # shown for Fusion 360 (see update_fusion_mode_visibility(), called
+    # wherever state["platform"] is set) -- SolidWorks/mock sessions never
+    # see this row and always get fusion_mode=None (ignored for them).
+    fusion_mode_radio_group = ft.RadioGroup(
+        content=ft.Row(
+            [
+                ft.Radio(value="part", label="Part / Assembly"),
+                ft.Radio(value="am", label="Additive Manufacturing (3D Printing)"),
+            ],
+            spacing=20,
+        ),
+        value="part",
+    )
+    fusion_mode_row = ft.Container(
+        content=ft.Row(
+            [
+                ft.Text("Ask about:", size=12, color=COLOR_TIMESTAMP, weight=ft.FontWeight.W_600),
+                fusion_mode_radio_group,
+            ],
+            spacing=10,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        ),
+        padding=pad_symmetric(horizontal=16, vertical=6),
+        bgcolor=COLOR_INPUT_BAR_BG,
+        border=ft.Border(top=ft.BorderSide(1, COLOR_INPUT_BORDER)),
+        visible=False,
+    )
+
     sidebar_list = ft.ListView(expand=True, spacing=2, padding=pad_symmetric(vertical=8))
     new_chat_button = ft.Container(
         content=ft.Row(
@@ -1842,6 +2048,10 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
         platform_badge.visible = platform is not None
         if platform is not None:
             platform_badge_text.value = PLATFORM_LABELS[platform]
+        page.update()
+
+    def update_fusion_mode_visibility() -> None:
+        fusion_mode_row.visible = state.get("platform") == PLATFORM_FUSION
         page.update()
 
     async def show_toast(message: str, success: bool = True) -> None:
@@ -1894,7 +2104,7 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
     message_input.on_change = update_send_button_state
 
     async def add_bubble_animated(message: ChatMessage) -> None:
-        row = build_bubble(message, bubble_width_hint())
+        row = build_bubble(message, bubble_width_hint(), on_what_if_result=post_what_if_result)
         chat_list.controls.append(row)
         page.update()
         await asyncio.sleep(0.02)
@@ -1902,6 +2112,55 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
         animated.opacity = 1
         animated.offset = ft.Offset(0, 0)
         page.update()
+
+    async def post_what_if_result(
+        process: str, quantity: int, rate_overrides: dict, new_data: dict
+    ) -> None:
+        """Callback for a cost card's "What if..." popup (see
+        build_what_if_overlay) -- posts the scenario and its recomputed
+        result into the chat as a normal user/AI message pair, saved to
+        chat_db exactly like any other turn, instead of showing the
+        result inside the popup. Per Krish's explicit request: the
+        what-if answer should look and persist like a real chat answer,
+        not a transient dialog.
+
+        Guards against the user having switched conversations while the
+        popup was open, same "DB write always happens, live UI update
+        only if still viewing this conversation" pattern
+        _send_and_await_reply uses.
+        """
+        conversation_id = state["conversation_id"]
+        if conversation_id is None:
+            return
+
+        if rate_overrides:
+            field_labels = {key: label for key, label, _default in _WHAT_IF_RATE_FIELDS.get(process, [])}
+            overrides_text = ", ".join(
+                f"{field_labels.get(key, key)} = {value:g}" for key, value in rate_overrides.items()
+            )
+            question_text = (
+                f"What if I used {process} (quantity {quantity}) with {overrides_text}?"
+            )
+        else:
+            question_text = f"What if I used {process} (quantity {quantity})?"
+
+        chat_db.add_message(conversation_id, "user", question_text)
+        if state["conversation_id"] == conversation_id:
+            await add_bubble_animated(ChatMessage("user", question_text, timestamp_now()))
+
+        if new_data.get("found"):
+            answer_text = "Here's the what-if cost breakdown."
+            structured_tool, structured_data = "estimate_cost", new_data
+        else:
+            answer_text = new_data.get("message", "Could not compute this scenario.")
+            structured_tool, structured_data = None, None
+
+        chat_db.add_message(conversation_id, "ai", answer_text, structured_tool, structured_data)
+        if state["conversation_id"] == conversation_id:
+            await add_bubble_animated(
+                ChatMessage("ai", answer_text, timestamp_now(), structured_tool, structured_data)
+            )
+            render_sidebar()
 
     def render_sidebar() -> None:
         sidebar_list.controls.clear()
@@ -2061,6 +2320,7 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
                     m.structured_tool, m.structured_data,
                 ),
                 bubble_width_hint(),
+                on_what_if_result=post_what_if_result,
             )
             animated = row.data
             animated.opacity = 1
@@ -2125,7 +2385,7 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
         structured_data: dict | None = None
         try:
             answer, structured_tool, structured_data = await asyncio.to_thread(
-                run_ai_orchestrator_with_data, text
+                run_ai_orchestrator_with_data, text, fusion_mode_radio_group.value
             )
             role = "ai"
         except Exception as exc:  # last-resort UI-side guard; orchestrator never raises
@@ -2254,6 +2514,7 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
         new_platform = await show_platform_selector(page, state["user_id"], detected)
         state["platform"] = new_platform
         update_platform_badge()
+        update_fusion_mode_visibility()
         await show_toast(f"Switched to {PLATFORM_LABELS[new_platform]}")
 
     user_footer = ft.Container(
@@ -2398,6 +2659,7 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
             header,
             status_banner,
             ft.Container(content=chat_area, expand=True, bgcolor=COLOR_CHAT_BG),
+            fusion_mode_row,
             input_bar,
         ],
         expand=True,
@@ -2443,6 +2705,7 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
 
     state["platform"] = chosen_platform
     update_platform_badge()
+    update_fusion_mode_visibility()
     if len(running_platforms) == 1 and chosen_platform in running_platforms:
         await show_toast(f"Connected to {PLATFORM_LABELS[chosen_platform]}")
 

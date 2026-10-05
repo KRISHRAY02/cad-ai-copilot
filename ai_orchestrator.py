@@ -397,6 +397,155 @@ def _format_not_an_assembly_answer(tool_result_json: str) -> str | None:
 
 
 # Tool name -> formatter, for tools whose output is reliable to render
+def _plain_tool_error_text(tool_result_json: str) -> str:
+    """Best-effort plain-language rendering of a failed tool result, for
+    direct return to the user -- bypassing the model entirely.
+
+    Used by the forced single-tool short-circuits (mass/volume/material/
+    bounding box) when their one tool call didn't succeed, instead of
+    falling through to the normal LLM loop. Observed live (2026-10-05):
+    a get_bounding_box() call that failed (bridge Add-In not reloaded
+    with the new /bounding_box route yet) fell through to the LLM loop,
+    which -- primed by the AM-mode system prompt suffix -- then ran
+    generate_am_readiness_guide() instead and confidently returned ITS
+    answer, nothing to do with the bounding-box question actually asked.
+    Surfacing the real error directly avoids the model ever getting a
+    chance to substitute a different tool's answer for the one that
+    failed.
+    """
+    try:
+        data = json.loads(tool_result_json)
+    except (json.JSONDecodeError, TypeError):
+        # Not JSON -- this is already the MCP framework's own
+        # plain-language error text for an uncaught exception (e.g.
+        # FusionBridgeNotReachableError), so return it verbatim.
+        return tool_result_json
+    if isinstance(data, dict) and data.get("message"):
+        return data["message"]
+    return tool_result_json
+
+
+def _format_get_mass_answer(tool_result_json: str) -> str | None:
+    """Turn get_mass's JSON straight into a plain-language answer, without
+    asking the LLM to re-express it.
+
+    Returns None (caller falls through to the normal LLM path) if the JSON
+    doesn't parse or has no mass_kg key -- that's the shape of an error
+    message (e.g. "no document open"), which still needs the model to
+    read and explain it.
+    """
+    try:
+        data = json.loads(tool_result_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict) or "mass_kg" not in data:
+        return None
+    return f"The mass of the currently open part is {data['mass_kg']:.4g} kg."
+
+
+def _format_get_bounding_box_answer(tool_result_json: str) -> str | None:
+    """Turn get_bounding_box's JSON straight into a plain-language answer,
+    without asking the LLM to re-express it.
+
+    Returns None (caller falls through to the normal LLM path) if the
+    JSON doesn't parse or found is not True -- that's the shape of an
+    error message (e.g. adapter doesn't implement it yet, or no solid
+    geometry), which still needs the model to read and explain it.
+    """
+    try:
+        data = json.loads(tool_result_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict) or not data.get("found"):
+        return None
+    return (
+        f"The bounding box of the currently open part is "
+        f"{data['length_mm']:,.2f} x {data['width_mm']:,.2f} x "
+        f"{data['height_mm']:,.2f} mm (length x width x height)."
+    )
+
+
+def _format_get_material_answer(tool_result_json: str) -> str | None:
+    """Turn get_material's JSON straight into a plain-language answer,
+    without asking the LLM to re-express it.
+
+    Returns None (caller falls through to the normal LLM path) if the
+    JSON doesn't parse or has no "name" key -- that's the shape of an
+    error message (e.g. "material lookup only supported for parts, not
+    assemblies"), which still needs the model to read and explain it.
+    """
+    try:
+        data = json.loads(tool_result_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict) or "name" not in data:
+        return None
+    answer = f"The material assigned to the currently open part is {data['name']}"
+    if data.get("category"):
+        answer += f" ({data['category']})"
+    if data.get("density_kg_m3") is not None:
+        answer += f", density {data['density_kg_m3']:,.0f} kg/m³"
+    return answer + "."
+
+
+def _format_get_volume_answer(tool_result_json: str) -> str | None:
+    """Turn get_volume's JSON straight into a plain-language answer,
+    without asking the LLM to re-express it.
+
+    Returns None (caller falls through to the normal LLM path) if the
+    JSON doesn't parse or found is not True -- that's the shape of an
+    error message (e.g. adapter doesn't implement it yet, or no solid
+    geometry), which still needs the model to read and explain it.
+    """
+    try:
+        data = json.loads(tool_result_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict) or not data.get("found"):
+        return None
+    return (
+        f"The volume of the currently open part is "
+        f"{data['volume_mm3']:,.2f} mm³ "
+        f"({data['volume_cm3']:,.3f} cm³)."
+    )
+
+
+def _format_estimate_cost_answer(tool_result_json: str) -> str | None:
+    """Turn estimate_cost's JSON straight into a plain-language answer,
+    without asking the LLM to re-express it -- same rationale as the
+    other deterministic formatters above (avoids restating risk).
+    """
+    try:
+        data = json.loads(tool_result_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict) or not data.get("found"):
+        return None
+
+    quantity = data.get("quantity", 1)
+    lines = [
+        f"Estimated cost for {data.get('manufacturing_process', '?')}"
+        + (f", quantity {quantity}" if quantity != 1 else "") + ":",
+        f"- Material cost per unit: Rs {data['material_cost_per_unit_inr']:,.2f} "
+        f"({data.get('material_used', '?')})",
+        f"- Production cost per unit: Rs {data['production_cost_per_unit_inr']:,.2f}",
+        f"- Total cost per unit: Rs {data['total_cost_per_unit_inr']:,.2f}",
+    ]
+    if quantity != 1:
+        lines.append(
+            f"- Total for {quantity} units: Rs {data['total_cost_for_quantity_inr']:,.2f}"
+        )
+    lines.append(
+        f"(Separate ML model estimate, for comparison only -- not summed "
+        f"into the total: Rs {data['ml_predicted_total_cost_per_unit_inr']:,.2f}/unit.)"
+    )
+    lines.append(
+        "This is a student-project estimate using placeholder shop-rate "
+        "assumptions, not a real manufacturing quote."
+    )
+    return "\n".join(lines)
+
+
 # directly rather than routing back through the LLM. See
 # _format_list_assembly_components_answer's docstring for why this exists.
 _DETERMINISTIC_ANSWER_FORMATTERS = {
@@ -404,7 +553,140 @@ _DETERMINISTIC_ANSWER_FORMATTERS = {
     "get_assembly_bom": _format_get_assembly_bom_answer,
     "get_assembly_cost_drivers": _format_get_assembly_cost_drivers_answer,
     "generate_am_readiness_guide": _format_generate_am_readiness_guide_answer,
+    "get_mass": _format_get_mass_answer,
+    "get_volume": _format_get_volume_answer,
+    "get_material": _format_get_material_answer,
+    "get_bounding_box": _format_get_bounding_box_answer,
+    "estimate_cost": _format_estimate_cost_answer,
 }
+
+# Matches plain mass/weight questions ("What's the mass of this part?",
+# "How much does it weigh?") that get_mass() answers directly with no
+# other inputs needed. Observed live (2026-10-05): qwen2.5:7b-instruct
+# sometimes skips tool-calling entirely for this exact phrasing and
+# answers from its own volume*density reasoning instead, asking the user
+# to specify a material get_mass() never needed -- see get_mass's
+# docstring in mcp_server.py, which already says as much. Rather than
+# trust the model's tool-choice for this one unambiguous case, the
+# orchestrator forces the call itself before the model gets a turn.
+# Excludes questions that also mention something get_mass() can't answer
+# (cost, material, carbon, comparisons, reports) so those still go through
+# the normal LLM tool-selection path, which may need more than one tool.
+_SIMPLE_MASS_QUESTION_RE = re.compile(
+    r"\b(mass|weigh[ts]?|how heavy)\b", re.IGNORECASE
+)
+_MASS_QUESTION_EXCLUDE_RE = re.compile(
+    r"\b(cost|price|carbon|material|compare|dfm|report|print)\b", re.IGNORECASE
+)
+
+
+def _is_simple_mass_question(question: str) -> bool:
+    return bool(_SIMPLE_MASS_QUESTION_RE.search(question)) and not (
+        _MASS_QUESTION_EXCLUDE_RE.search(question)
+    )
+
+
+# Same rationale as _is_simple_mass_question, same incident (2026-10-05):
+# a plain "what's the volume" question has a direct tool (get_volume())
+# that needs no material/density guess, but the model has no way to
+# compute volume on its own and was observed hallucinating an excuse
+# ("open the CAD model...") instead of just calling the tool that's
+# already available to it. Force the call for the unambiguous case.
+_SIMPLE_VOLUME_QUESTION_RE = re.compile(r"\bvolume\b", re.IGNORECASE)
+_VOLUME_QUESTION_EXCLUDE_RE = re.compile(
+    r"\b(cost|price|carbon|material|compare|dfm|report|print)\b", re.IGNORECASE
+)
+
+
+def _is_simple_volume_question(question: str) -> bool:
+    return bool(_SIMPLE_VOLUME_QUESTION_RE.search(question)) and not (
+        _VOLUME_QUESTION_EXCLUDE_RE.search(question)
+    )
+
+
+# Same rationale and same incident (2026-10-05) as mass/volume above: "what
+# material is this/applied/assigned" has a direct tool (get_material())
+# reading the CAD model's actual assigned material, needing nothing from
+# the user -- but the model was observed routing this phrasing to
+# recommend_am_material() instead (which answers a different question:
+# "what material SHOULD be used", based on function/load/temperature
+# answers the model then has to ask for). Exclude recommendation/
+# comparison phrasing so those genuinely different questions still go
+# through the normal LLM tool-selection path.
+_SIMPLE_MATERIAL_QUESTION_RE = re.compile(r"\bmaterial\b", re.IGNORECASE)
+_MATERIAL_QUESTION_EXCLUDE_RE = re.compile(
+    r"\b(recommend|suggest|should|best|instead|switch|compare|choose|"
+    r"3d print|print|cost|price|carbon)\b|what if",
+    re.IGNORECASE,
+)
+
+
+def _is_simple_material_question(question: str) -> bool:
+    return bool(_SIMPLE_MATERIAL_QUESTION_RE.search(question)) and not (
+        _MATERIAL_QUESTION_EXCLUDE_RE.search(question)
+    )
+
+
+# Same rationale and same incident class as mass/volume/material above:
+# a plain bounding-box/dimensions question has a direct tool
+# (get_bounding_box()) needing no other input, but the model has no way
+# to measure geometry itself and was observed (2026-10-05) walking the
+# user through manually checking Fusion's properties panel instead of
+# just calling the tool that's already available to it.
+_SIMPLE_BOUNDING_BOX_QUESTION_RE = re.compile(
+    r"\b(bounding box|dimensions?|how big|how large|overall size)\b", re.IGNORECASE
+)
+_BOUNDING_BOX_QUESTION_EXCLUDE_RE = re.compile(
+    r"\b(cost|price|carbon|material|compare|dfm|report|print)\b", re.IGNORECASE
+)
+
+
+def _is_simple_bounding_box_question(question: str) -> bool:
+    return bool(_SIMPLE_BOUNDING_BOX_QUESTION_RE.search(question)) and not (
+        _BOUNDING_BOX_QUESTION_EXCLUDE_RE.search(question)
+    )
+
+
+# Same incident class as mass/volume/material/bounding-box above
+# (2026-10-05): "What is the cost if I make it by CNC?" has everything
+# estimate_cost() needs (manufacturing_process -- quantity defaults to
+# 1) -- the tool reads mass/material/volume itself from the CAD adapter,
+# never from the user -- but the model was observed asking the user for
+# material/volume/operations instead of just calling the tool. Only
+# forces the call when a process is named unambiguously in the question
+# text itself; any question that doesn't name one (or sounds like a
+# follow-up/assembly/comparison question) falls through to the normal
+# LLM path, which already has carry-over/assembly-redirect handling for
+# those cases that a one-shot forced call here would bypass.
+_COST_KEYWORD_RE = re.compile(r"\b(cost|price|expensive|cheap)\b", re.IGNORECASE)
+_COST_QUESTION_EXCLUDE_RE = re.compile(
+    r"\b(assembly|bom|compare|material|carbon|dfm|report|instead|follow[- ]?up)\b",
+    re.IGNORECASE,
+)
+_COST_PROCESS_PATTERNS = (
+    (re.compile(r"\bcnc\b", re.IGNORECASE), "CNC Machining"),
+    (re.compile(r"\binjection\s*mold(?:ing)?\b", re.IGNORECASE), "Injection Molding"),
+    (re.compile(r"\bsheet\s*metal\b", re.IGNORECASE), "Sheet Metal"),
+)
+_COST_QUANTITY_RE = re.compile(
+    r"\b(\d+)\s*(?:units?|pcs?|pieces?|parts?)\b|\bfor\s+(\d+)\b", re.IGNORECASE
+)
+
+
+def _is_simple_cost_question(question: str) -> tuple[str, int] | None:
+    if not _COST_KEYWORD_RE.search(question) or _COST_QUESTION_EXCLUDE_RE.search(question):
+        return None
+    process = None
+    for pattern, name in _COST_PROCESS_PATTERNS:
+        if pattern.search(question):
+            process = name
+            break
+    if process is None:
+        return None
+    quantity_match = _COST_QUANTITY_RE.search(question)
+    quantity = int(next(g for g in quantity_match.groups() if g)) if quantity_match else 1
+    return process, quantity
+
 
 _ASSEMBLY_REDIRECT_MARKER = "get_assembly_bom() or get_assembly_cost_drivers() instead"
 
@@ -464,6 +746,40 @@ SYSTEM_PROMPT = (
     "enough information to answer the question, stop calling tools and "
     "answer directly."
 )
+
+# Fusion-only, per Krish's request (2026-10-05): additive-manufacturing
+# (AM) tools were platform-gated to Fusion 360 in mcp_server.py (they
+# previously ran, wrongly, against a SolidWorks document too). But even
+# on Fusion, a question like "what material is this" is genuinely
+# ambiguous between get_material() (the part's current design) and
+# recommend_am_material() (what to print it IN) -- so for a Fusion
+# session, the caller (desktop_app.py's radio button) picks which domain
+# this session's questions are about, rather than letting the model guess
+# per-question. See AiOrchestrator.ask()'s fusion_mode parameter.
+_FUSION_PART_MODE_SUFFIX = (
+    " This session is about the current part/assembly's design. Answer "
+    "using the general-purpose tools (get_mass, get_volume, get_material, "
+    "estimate_cost, run_dfm_check, etc.). Do NOT call "
+    "recommend_am_material, generate_am_readiness_guide, or "
+    "run_am_dfm_check unless the user explicitly changes topic to ask "
+    "about additive manufacturing or 3D printing."
+)
+
+_FUSION_AM_MODE_SUFFIX = (
+    " This session is about getting the part ready for additive "
+    "manufacturing (3D printing). Prefer generate_am_readiness_guide, "
+    "recommend_am_material, and run_am_dfm_check for this session's "
+    "questions. Plain part/assembly questions (mass, cost, etc.) can "
+    "still be answered with the general-purpose tools if the user asks "
+    "one directly."
+)
+
+
+def _is_fusion_session() -> bool:
+    return os.environ.get("CAD_ADAPTER", "solidworks").lower() in (
+        "fusion",
+        "fusion360",
+    )
 
 
 class AiOrchestrator:
@@ -536,6 +852,10 @@ class AiOrchestrator:
         # cost/BOM tool, or where the call didn't succeed.
         self.last_structured_tool: str | None = None
         self.last_structured_result: dict | None = None
+        # Fusion-only domain ("part" or "am") the system prompt is
+        # currently steered toward -- see ask()'s fusion_mode parameter.
+        # None until the first Fusion-session ask() call sets it.
+        self._fusion_query_mode: str | None = None
 
     async def start(self) -> None:
         """Launch the MCP server subprocess and fetch its tool definitions.
@@ -605,14 +925,39 @@ class AiOrchestrator:
                 return last_message
         return last_message
 
-    async def ask(self, question: str) -> str:
+    async def ask(self, question: str, fusion_mode: str | None = None) -> str:
         """Answer a natural-language question, calling MCP tools as needed.
 
         Appends to the running conversation history so follow-up questions
         retain context.
+
+        `fusion_mode` ("part" or "am") is only meaningful for a Fusion 360
+        session (see _is_fusion_session()) -- it picks which system-prompt
+        suffix (_FUSION_PART_MODE_SUFFIX / _FUSION_AM_MODE_SUFFIX) steers
+        tool selection for this call. **The UI (desktop_app.py) owns this
+        choice via a radio button shown only for Fusion** -- not a typed
+        conversational answer: both run_ai_orchestrator()/
+        run_ai_orchestrator_with_data() construct a brand-new
+        AiOrchestrator per call (see their docstrings), so a question
+        asked here could never actually be answered by the user's next
+        message in that one-shot usage; it would just ask again forever,
+        which is exactly what Krish hit live (2026-10-05) before this was
+        changed to an explicit parameter. Defaults to "part" (the safer,
+        general-purpose-tools default) if a Fusion session never supplies
+        one. Not used for a non-Fusion session (SolidWorks/mock) at all.
         """
         if self._session is None:
             raise RuntimeError("AiOrchestrator.start() must be called before ask().")
+
+        if _is_fusion_session():
+            effective_mode = fusion_mode or "part"
+            if self._fusion_query_mode != effective_mode:
+                self._fusion_query_mode = effective_mode
+                self._history[0]["content"] = SYSTEM_PROMPT + (
+                    _FUSION_AM_MODE_SUFFIX
+                    if effective_mode == "am"
+                    else _FUSION_PART_MODE_SUFFIX
+                )
 
         self._history.append({"role": "user", "content": question})
         self._current_question = question
@@ -627,6 +972,106 @@ class AiOrchestrator:
         # MAX_TOOL_CALL_ROUNDS budget on repeats of a call whose result it
         # already has.
         called_signatures: set[tuple[str, str]] = set()
+
+        if _is_simple_mass_question(question):
+            tool_result = await self._execute_tool_call_deduped(
+                "get_mass", {}, called_signatures
+            )
+            self._remember_structured_result("get_mass", tool_result)
+            self._history.append(
+                {"role": "tool", "tool_name": "get_mass", "content": tool_result}
+            )
+            deterministic = _format_deterministic_answer("get_mass", tool_result)
+            if deterministic is not None:
+                self._history.append({"role": "assistant", "content": deterministic})
+                return deterministic
+            # get_mass failed (no document open, bridge unreachable, etc.) --
+            # return the real error directly rather than letting the model
+            # wander into an unrelated tool (see _plain_tool_error_text).
+            error_text = _plain_tool_error_text(tool_result)
+            self._history.append({"role": "assistant", "content": error_text})
+            return error_text
+
+        if _is_simple_volume_question(question):
+            tool_result = await self._execute_tool_call_deduped(
+                "get_volume", {}, called_signatures
+            )
+            self._remember_structured_result("get_volume", tool_result)
+            self._history.append(
+                {"role": "tool", "tool_name": "get_volume", "content": tool_result}
+            )
+            deterministic = _format_deterministic_answer("get_volume", tool_result)
+            if deterministic is not None:
+                self._history.append({"role": "assistant", "content": deterministic})
+                return deterministic
+            # get_volume failed (adapter doesn't implement it, no solid
+            # geometry) -- return the real error directly, same reasoning
+            # as get_mass above.
+            error_text = _plain_tool_error_text(tool_result)
+            self._history.append({"role": "assistant", "content": error_text})
+            return error_text
+
+        if _is_simple_material_question(question):
+            tool_result = await self._execute_tool_call_deduped(
+                "get_material", {}, called_signatures
+            )
+            self._remember_structured_result("get_material", tool_result)
+            self._history.append(
+                {"role": "tool", "tool_name": "get_material", "content": tool_result}
+            )
+            deterministic = _format_deterministic_answer("get_material", tool_result)
+            if deterministic is not None:
+                self._history.append({"role": "assistant", "content": deterministic})
+                return deterministic
+            # get_material failed (assembly root, no part open, etc.) --
+            # return the real error directly, same reasoning as get_mass
+            # above.
+            error_text = _plain_tool_error_text(tool_result)
+            self._history.append({"role": "assistant", "content": error_text})
+            return error_text
+
+        if _is_simple_bounding_box_question(question):
+            tool_result = await self._execute_tool_call_deduped(
+                "get_bounding_box", {}, called_signatures
+            )
+            self._remember_structured_result("get_bounding_box", tool_result)
+            self._history.append(
+                {"role": "tool", "tool_name": "get_bounding_box", "content": tool_result}
+            )
+            deterministic = _format_deterministic_answer("get_bounding_box", tool_result)
+            if deterministic is not None:
+                self._history.append({"role": "assistant", "content": deterministic})
+                return deterministic
+            # get_bounding_box failed (adapter doesn't implement it, no
+            # solid geometry, bridge Add-In not reloaded with this route
+            # yet) -- return the real error directly, same reasoning as
+            # get_mass above.
+            error_text = _plain_tool_error_text(tool_result)
+            self._history.append({"role": "assistant", "content": error_text})
+            return error_text
+
+        cost_match = _is_simple_cost_question(question)
+        if cost_match is not None:
+            process, quantity = cost_match
+            arguments = {"manufacturing_process": process, "quantity": quantity}
+            tool_result = await self._execute_tool_call_deduped(
+                "estimate_cost", arguments, called_signatures
+            )
+            self._remember_params_if_successful("estimate_cost", arguments, tool_result)
+            self._remember_structured_result("estimate_cost", tool_result)
+            self._history.append(
+                {"role": "tool", "tool_name": "estimate_cost", "content": tool_result}
+            )
+            deterministic = _format_deterministic_answer("estimate_cost", tool_result)
+            if deterministic is not None:
+                self._history.append({"role": "assistant", "content": deterministic})
+                return deterministic
+            # estimate_cost failed (assembly document, material cost
+            # unavailable, trained model missing, etc.) -- return the real
+            # error directly, same reasoning as get_mass above.
+            error_text = _plain_tool_error_text(tool_result)
+            self._history.append({"role": "assistant", "content": error_text})
+            return error_text
 
         for _ in range(MAX_TOOL_CALL_ROUNDS):
             message = await self._chat_retrying_empty()
@@ -1156,7 +1601,7 @@ class AiOrchestrator:
         }
 
 
-def run_ai_orchestrator(user_message: str) -> str:
+def run_ai_orchestrator(user_message: str, fusion_mode: str | None = None) -> str:
     """Answer one question end-to-end: LLM -> (maybe) MCP tool calls -> LLM.
 
     This is a simple, self-contained entry point for one-off calls (e.g. a
@@ -1193,11 +1638,13 @@ def run_ai_orchestrator(user_message: str) -> str:
     open) is caught here and turned into a plain-language string instead
     of an exception, so callers never need a try/except around this.
     """
-    answer, _tool_name, _data = asyncio.run(_run_ai_orchestrator_async(user_message))
+    answer, _tool_name, _data = asyncio.run(_run_ai_orchestrator_async(user_message, fusion_mode))
     return answer
 
 
-def run_ai_orchestrator_with_data(user_message: str) -> tuple[str, str | None, dict | None]:
+def run_ai_orchestrator_with_data(
+    user_message: str, fusion_mode: str | None = None
+) -> tuple[str, str | None, dict | None]:
     """Same one-shot call as run_ai_orchestrator(), but also returns the
     name and parsed found=True JSON of the last successful cost/BOM tool
     call this question triggered (both None if it never called one, or
@@ -1206,12 +1653,16 @@ def run_ai_orchestrator_with_data(user_message: str) -> tuple[str, str | None, d
     real table/breakdown card from the same numbers already backing the
     prose answer, instead of trying to re-parse that prose back into
     numbers.
+
+    `fusion_mode` is passed straight through to AiOrchestrator.ask() --
+    see its docstring. Only meaningful for a Fusion 360 session; ignored
+    otherwise.
     """
-    return asyncio.run(_run_ai_orchestrator_async(user_message))
+    return asyncio.run(_run_ai_orchestrator_async(user_message, fusion_mode))
 
 
 async def _run_ai_orchestrator_async(
-    user_message: str,
+    user_message: str, fusion_mode: str | None = None
 ) -> tuple[str, str | None, dict | None]:
     orchestrator = AiOrchestrator()
 
@@ -1221,7 +1672,7 @@ async def _run_ai_orchestrator_async(
         return f"Couldn't reach the CAD MCP server: {e}", None, None
 
     try:
-        answer = await orchestrator.ask(user_message)
+        answer = await orchestrator.ask(user_message, fusion_mode=fusion_mode)
         return answer, orchestrator.last_structured_tool, orchestrator.last_structured_result
     except OllamaUnavailableError as e:
         return f"Couldn't reach Ollama: {e}", None, None

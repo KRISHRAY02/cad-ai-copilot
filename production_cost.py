@@ -126,13 +126,14 @@ class ProductionCostResult:
     assumptions: str
 
 
-def _hourly_rate_to_cost_inr(minutes: float) -> float:
-    return (minutes / 60.0) * (CNC_MACHINE_HOURLY_RATE_INR + CNC_LABOR_HOURLY_RATE_INR)
+def _hourly_rate_to_cost_inr(minutes: float, machine_rate: float, labor_rate: float) -> float:
+    return (minutes / 60.0) * (machine_rate + labor_rate)
 
 
 def estimate_cnc_machining_cost(
     hole_features: list[dict] | None = None,
     other_feature_count: int = 0,
+    rate_overrides: dict | None = None,
 ) -> ProductionCostResult:
     """CNC Machining production cost, per unit -- with per-hole attribution.
 
@@ -184,8 +185,18 @@ def estimate_cnc_machining_cost(
     CNC_PER_FEATURE_MACHINING_MINUTES estimate for that hole specifically,
     and is marked is_flat_estimate=True in its breakdown entry so this
     fallback is visible rather than silently blended in.
+
+    `rate_overrides`, if given, may contain "machine_hourly_rate_inr"
+    and/or "labor_hourly_rate_inr" to use instead of
+    CNC_MACHINE_HOURLY_RATE_INR/CNC_LABOR_HOURLY_RATE_INR -- for "what if
+    the shop rate were X" sensitivity analysis (see desktop_app.py's cost
+    card "What if..." dialog) without editing the module constants
+    themselves. Missing keys fall back to the module constant.
     """
     hole_features = hole_features or []
+    rate_overrides = rate_overrides or {}
+    machine_rate = rate_overrides.get("machine_hourly_rate_inr", CNC_MACHINE_HOURLY_RATE_INR)
+    labor_rate = rate_overrides.get("labor_hourly_rate_inr", CNC_LABOR_HOURLY_RATE_INR)
 
     hole_entries = []
     hole_time_total = 0.0
@@ -216,7 +227,9 @@ def estimate_cnc_machining_cost(
                 "depth_mm": depth_mm,
                 "depth_to_diameter_ratio": round(ratio, 2) if ratio is not None else None,
                 "estimated_time_minutes": round(time_minutes, 3),
-                "estimated_cost_inr": round(_hourly_rate_to_cost_inr(time_minutes), 2),
+                "estimated_cost_inr": round(
+                    _hourly_rate_to_cost_inr(time_minutes, machine_rate, labor_rate), 2
+                ),
                 "is_flat_estimate": is_flat_estimate,
             }
         )
@@ -226,18 +239,22 @@ def estimate_cnc_machining_cost(
         "label": "Other Features (flat per-feature estimate, not individually modeled)",
         "count": other_feature_count,
         "estimated_time_minutes": round(other_time_minutes, 3),
-        "estimated_cost_inr": round(_hourly_rate_to_cost_inr(other_time_minutes), 2),
+        "estimated_cost_inr": round(
+            _hourly_rate_to_cost_inr(other_time_minutes, machine_rate, labor_rate), 2
+        ),
         "is_flat_estimate": True,
     }
 
     setup_entry = {
         "label": "Setup Time (fixed per-job cost, not per feature)",
         "estimated_time_minutes": CNC_SETUP_TIME_MINUTES,
-        "estimated_cost_inr": round(_hourly_rate_to_cost_inr(CNC_SETUP_TIME_MINUTES), 2),
+        "estimated_cost_inr": round(
+            _hourly_rate_to_cost_inr(CNC_SETUP_TIME_MINUTES, machine_rate, labor_rate), 2
+        ),
     }
 
     machining_time_minutes = CNC_SETUP_TIME_MINUTES + hole_time_total + other_time_minutes
-    production_cost = _hourly_rate_to_cost_inr(machining_time_minutes)
+    production_cost = _hourly_rate_to_cost_inr(machining_time_minutes, machine_rate, labor_rate)
 
     feature_count = len(hole_entries) + other_feature_count
 
@@ -247,8 +264,8 @@ def estimate_cnc_machining_cost(
         breakdown={
             "feature_count": feature_count,
             "estimated_machining_time_minutes": round(machining_time_minutes, 2),
-            "machine_hourly_rate_inr": CNC_MACHINE_HOURLY_RATE_INR,
-            "labor_hourly_rate_inr": CNC_LABOR_HOURLY_RATE_INR,
+            "machine_hourly_rate_inr": machine_rate,
+            "labor_hourly_rate_inr": labor_rate,
             "setup": setup_entry,
             "holes": hole_entries,
             "other_features": other_entry,
@@ -262,15 +279,16 @@ def estimate_cnc_machining_cost(
             f"{other_feature_count} other feature(s) at the flat "
             f"{CNC_PER_FEATURE_MACHINING_MINUTES} min/feature estimate = "
             f"{machining_time_minutes:.1f} min, billed at "
-            f"Rs {CNC_MACHINE_HOURLY_RATE_INR}/hr machine + "
-            f"Rs {CNC_LABOR_HOURLY_RATE_INR}/hr labor "
-            "(PLACEHOLDER rates -- replace with real shop rates)."
+            f"Rs {machine_rate}/hr machine + "
+            f"Rs {labor_rate}/hr labor "
+            "(PLACEHOLDER rates unless overridden -- replace with real shop "
+            "rates)."
         ),
     )
 
 
 def estimate_injection_molding_cost(
-    volume_m3: float, order_quantity: int
+    volume_m3: float, order_quantity: int, rate_overrides: dict | None = None
 ) -> ProductionCostResult:
     """Injection Molding production cost, per unit.
 
@@ -279,14 +297,24 @@ def estimate_injection_molding_cost(
     machine_cost_per_shot = (cycle_time_seconds / 3600) * MACHINE_HOURLY_RATE
     production_cost_per_unit = machine_cost_per_shot +
         (TOOLING_COST / quantity)
+
+    `rate_overrides`, if given, may contain "machine_hourly_rate_inr"
+    and/or "tooling_cost_total_inr" to use instead of
+    IM_MACHINE_HOURLY_RATE_INR/IM_TOOLING_COST_INR -- same "what if"
+    sensitivity-analysis purpose as estimate_cnc_machining_cost's
+    rate_overrides. Missing keys fall back to the module constant.
     """
     order_quantity = max(order_quantity, 1)
+    rate_overrides = rate_overrides or {}
+    machine_rate = rate_overrides.get("machine_hourly_rate_inr", IM_MACHINE_HOURLY_RATE_INR)
+    tooling_cost_total = rate_overrides.get("tooling_cost_total_inr", IM_TOOLING_COST_INR)
+
     volume_cm3 = volume_m3 * 1e6  # m^3 -> cm^3
     cycle_time_seconds = IM_CYCLE_TIME_SECONDS_BASE + (
         volume_cm3 * IM_CYCLE_TIME_SECONDS_PER_CM3
     )
-    machine_cost_per_shot = (cycle_time_seconds / 3600.0) * IM_MACHINE_HOURLY_RATE_INR
-    tooling_cost_per_unit = IM_TOOLING_COST_INR / order_quantity
+    machine_cost_per_shot = (cycle_time_seconds / 3600.0) * machine_rate
+    tooling_cost_per_unit = tooling_cost_total / order_quantity
     production_cost = machine_cost_per_shot + tooling_cost_per_unit
 
     return ProductionCostResult(
@@ -296,7 +324,7 @@ def estimate_injection_molding_cost(
             "volume_cm3": round(volume_cm3, 2),
             "cycle_time_seconds": round(cycle_time_seconds, 2),
             "machine_cost_per_shot_inr": round(machine_cost_per_shot, 2),
-            "tooling_cost_total_inr": IM_TOOLING_COST_INR,
+            "tooling_cost_total_inr": tooling_cost_total,
             "tooling_cost_per_unit_inr": round(tooling_cost_per_unit, 2),
             "order_quantity_used_for_amortization": order_quantity,
         },
@@ -304,16 +332,18 @@ def estimate_injection_molding_cost(
             f"Injection Molding: {cycle_time_seconds:.1f}s cycle time "
             f"({IM_CYCLE_TIME_SECONDS_BASE}s base + "
             f"{IM_CYCLE_TIME_SECONDS_PER_CM3}s/cm3 x {volume_cm3:.1f} cm3) at "
-            f"Rs {IM_MACHINE_HOURLY_RATE_INR}/hr machine rate, plus "
-            f"Rs {IM_TOOLING_COST_INR:,.0f} tooling amortized over "
-            f"{order_quantity} units (PLACEHOLDER rates/tooling cost -- "
-            "replace with real figures)."
+            f"Rs {machine_rate}/hr machine rate, plus "
+            f"Rs {tooling_cost_total:,.0f} tooling amortized over "
+            f"{order_quantity} units (PLACEHOLDER rates/tooling cost unless "
+            "overridden -- replace with real figures)."
         ),
     )
 
 
 def estimate_sheet_metal_cost(
-    bounding_box_mm: tuple[float, float, float], bend_count: int
+    bounding_box_mm: tuple[float, float, float],
+    bend_count: int,
+    rate_overrides: dict | None = None,
 ) -> ProductionCostResult:
     """Sheet Metal production cost, per unit.
 
@@ -328,13 +358,23 @@ def estimate_sheet_metal_cost(
 
     production_cost_per_unit = (cutting_length_mm * CUTTING_RATE_PER_MM) +
         (bend_count * COST_PER_BEND)
+
+    `rate_overrides`, if given, may contain "cutting_rate_per_mm_inr"
+    and/or "cost_per_bend_inr" to use instead of
+    SM_CUTTING_RATE_PER_MM_INR/SM_COST_PER_BEND_INR -- same "what if"
+    sensitivity-analysis purpose as estimate_cnc_machining_cost's
+    rate_overrides. Missing keys fall back to the module constant.
     """
+    rate_overrides = rate_overrides or {}
+    cutting_rate = rate_overrides.get("cutting_rate_per_mm_inr", SM_CUTTING_RATE_PER_MM_INR)
+    cost_per_bend = rate_overrides.get("cost_per_bend_inr", SM_COST_PER_BEND_INR)
+
     dims_sorted = sorted(bounding_box_mm, reverse=True)
     length_mm, width_mm = dims_sorted[0], dims_sorted[1]
     cutting_length_mm = 2 * (length_mm + width_mm)
 
-    cutting_cost = cutting_length_mm * SM_CUTTING_RATE_PER_MM_INR
-    bending_cost = bend_count * SM_COST_PER_BEND_INR
+    cutting_cost = cutting_length_mm * cutting_rate
+    bending_cost = bend_count * cost_per_bend
     production_cost = cutting_cost + bending_cost
 
     return ProductionCostResult(
@@ -351,9 +391,10 @@ def estimate_sheet_metal_cost(
             f"Sheet Metal: cutting length approximated as the bounding-box "
             f"footprint perimeter (2 x ({length_mm:.1f}mm + "
             f"{width_mm:.1f}mm) = {cutting_length_mm:.1f}mm -- NOT a true "
-            f"flat-pattern cut length) at Rs {SM_CUTTING_RATE_PER_MM_INR}/mm, "
-            f"plus {bend_count} bend(s) at Rs {SM_COST_PER_BEND_INR}/bend "
-            "(PLACEHOLDER rates -- replace with real figures)."
+            f"flat-pattern cut length) at Rs {cutting_rate}/mm, "
+            f"plus {bend_count} bend(s) at Rs {cost_per_bend}/bend "
+            "(PLACEHOLDER rates unless overridden -- replace with real "
+            "figures)."
         ),
     )
 
@@ -368,6 +409,7 @@ def estimate_production_cost(
     bend_count: int = 0,
     hole_features: list[dict] | None = None,
     other_feature_count: int | None = None,
+    rate_overrides: dict | None = None,
 ) -> ProductionCostResult:
     """Dispatch to the process-specific production cost formula.
 
@@ -384,6 +426,12 @@ def estimate_production_cost(
     keep passing just `feature_count` as before -- every feature is then
     treated as part of the flat "Other Features" bucket, reproducing the
     old flat-formula behavior exactly.
+
+    `rate_overrides` is passed straight through to whichever
+    process-specific function handles `process` -- see each function's
+    own docstring for its accepted override keys. None (the default)
+    means "use the module's own PLACEHOLDER constants", unchanged from
+    before this parameter existed.
     """
     if process == "CNC Machining":
         if hole_features is not None or other_feature_count is not None:
@@ -392,12 +440,15 @@ def estimate_production_cost(
                 other_feature_count=other_feature_count
                 if other_feature_count is not None
                 else feature_count,
+                rate_overrides=rate_overrides,
             )
-        return estimate_cnc_machining_cost(hole_features=[], other_feature_count=feature_count)
+        return estimate_cnc_machining_cost(
+            hole_features=[], other_feature_count=feature_count, rate_overrides=rate_overrides
+        )
     if process == "Injection Molding":
-        return estimate_injection_molding_cost(volume_m3, order_quantity)
+        return estimate_injection_molding_cost(volume_m3, order_quantity, rate_overrides=rate_overrides)
     if process == "Sheet Metal":
-        return estimate_sheet_metal_cost(bounding_box_mm, bend_count)
+        return estimate_sheet_metal_cost(bounding_box_mm, bend_count, rate_overrides=rate_overrides)
     raise ValueError(
         f"Unknown manufacturing_process {process!r}; must be one of {PROCESSES}"
     )

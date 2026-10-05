@@ -40,7 +40,7 @@ def _load_bundle() -> dict:
     return _bundle
 
 
-def predict_cost(features: dict) -> dict:
+def predict_cost(features: dict, rate_overrides: dict | None = None) -> dict:
     """Predict a part's total cost (INR) from its features, AND compute an
     explicit material_cost / production_cost breakdown the same way the
     synthetic training target was computed (see
@@ -70,6 +70,15 @@ def predict_cost(features: dict) -> dict:
     directly from real material data and production_cost.py's
     process-specific formula (not from the model) so the two numbers are
     shown separately and explicitly, as required by estimate_cost().
+
+    `rate_overrides` is passed straight through to
+    production_cost.estimate_production_cost() -- see that function's
+    docstring. It only affects the directly-computed production_cost_inr
+    figure; predicted_total_cost_inr (the ML model's own estimate) is
+    unaffected, since the model was trained on the module's default
+    rates and has no notion of a per-call override. Used for "what if
+    the shop rate were X" sensitivity analysis (see desktop_app.py's cost
+    card "What if..." dialog).
     """
     missing = [col for col in FEATURE_COLUMNS if col not in features]
     if missing:
@@ -95,6 +104,7 @@ def predict_cost(features: dict) -> dict:
         order_quantity=row["order_quantity"],
         bounding_box_mm=features.get("bounding_box_mm", (0.0, 0.0, 0.0)),
         bend_count=row["bend_count"],
+        rate_overrides=rate_overrides,
     )
 
     return {

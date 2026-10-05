@@ -172,6 +172,65 @@ def get_mass() -> dict:
 
 
 @mcp.tool()
+def get_volume() -> dict:
+    """Get the volume of the currently open part's solid geometry.
+
+    Returns {"found": True, "volume_m3", "volume_mm3", "volume_cm3"} in
+    all three units so the answer never needs a follow-up unit-conversion
+    question. Returns {"found": False, "message": ...} if the current
+    adapter hasn't implemented mass-properties reading yet, or the active
+    document has no solid geometry (sketch-only/surface-only, or an
+    assembly root with no bodies of its own) -- never guesses a volume.
+    """
+    try:
+        mass_properties = adapter.get_mass_properties()
+    except NotImplementedError as e:
+        return {"found": False, "message": str(e)}
+
+    volume_m3 = mass_properties.get("volume_m3")
+    if volume_m3 is None:
+        return {
+            "found": False,
+            "message": (
+                "Could not read volume for the current document (no solid "
+                "geometry? an assembly root has none of its own)."
+            ),
+        }
+    return {
+        "found": True,
+        "volume_m3": volume_m3,
+        "volume_mm3": volume_m3 * 1_000_000_000,
+        "volume_cm3": volume_m3 * 1_000_000,
+    }
+
+
+@mcp.tool()
+def get_bounding_box() -> dict:
+    """Get the axis-aligned bounding box of the currently open part's
+    solid geometry, in millimeters.
+
+    Returns {"found": True, "length_mm", "width_mm", "height_mm"} --
+    the three bounding-box dimensions, sorted largest to smallest so the
+    answer doesn't depend on which axis Fusion/SolidWorks happened to
+    model the part along. Returns {"found": False, "message": ...} if
+    the current adapter hasn't implemented this yet, or the active
+    document has no solid geometry -- never guesses dimensions.
+    """
+    try:
+        box_mm = adapter.get_bounding_box_mm()
+    except NotImplementedError as e:
+        return {"found": False, "message": str(e)}
+
+    dims = sorted(box_mm, reverse=True)
+    return {
+        "found": True,
+        "length_mm": dims[0],
+        "width_mm": dims[1],
+        "height_mm": dims[2],
+    }
+
+
+@mcp.tool()
 def get_material() -> dict:
     """Get the material assigned to the currently open part.
 
@@ -203,6 +262,7 @@ def estimate_cost(
     order_year: int | None = None,
     supplier: str = _DEFAULT_SUPPLIER,
     machine_type: str = _DEFAULT_MACHINE_TYPE,
+    rate_overrides: dict | None = None,
 ) -> dict:
     """Estimate the cost to produce `quantity` units of the current part,
     in INR, using a trained Random Forest Regression model (see
@@ -258,6 +318,19 @@ def estimate_cost(
     then cost_model/train_model.py first), if materials.csv can't
     resolve the part's material cost, or if manufacturing_process is
     missing/invalid -- instead of guessing.
+
+    `rate_overrides` is an optional dict of PLACEHOLDER shop-rate
+    constants to use instead of production_cost.py's defaults, for "what
+    if the rate were X" sensitivity analysis -- see each process
+    function's docstring there for its accepted keys ("CNC Machining":
+    machine_hourly_rate_inr/labor_hourly_rate_inr; "Injection Molding":
+    machine_hourly_rate_inr/tooling_cost_total_inr; "Sheet Metal":
+    cutting_rate_per_mm_inr/cost_per_bend_inr). This is primarily driven
+    by the chat UI's "What if..." dialog on the cost card, not something
+    to guess at conversationally -- only pass it if the user explicitly
+    states a specific rate/cost figure to try. Only affects the directly
+    computed production_cost_per_unit_inr; ml_predicted_total_cost_per_unit_inr
+    is the model's own separate estimate and ignores it.
     """
     from cost_model.predict import predict_cost
 
@@ -353,7 +426,7 @@ def estimate_cost(
     }
 
     try:
-        prediction = predict_cost(features)
+        prediction = predict_cost(features, rate_overrides=rate_overrides)
     except FileNotFoundError as e:
         return {"found": False, "message": str(e)}
 
@@ -377,6 +450,7 @@ def estimate_cost(
         "material_used": material.name,
         "material_cost_per_kg_inr": material_lookup["cost_per_kg"],
         "cost_basis": material_lookup.get("cost_basis"),
+        "rate_overrides_applied": rate_overrides or None,
         "production_cost_breakdown": prediction["production_cost_breakdown"],
         "production_cost_assumptions": prediction["production_cost_assumptions"],
         "inputs_used": prediction["features_used"],
@@ -913,6 +987,18 @@ def export_bom(
     return {"found": True, "bom_path": saved_path, "indented": indented}
 
 
+_FUSION_PLATFORM_ID = "fusion360"
+
+
+def _am_tools_unavailable_message() -> str:
+    return (
+        "Additive-manufacturing (3D printing) tools are only available "
+        "for a Fusion 360 document -- the currently active CAD platform "
+        f"is {adapter.PLATFORM_ID!r}. Open the part in Fusion 360 to use "
+        "AM readiness features."
+    )
+
+
 @mcp.tool()
 def recommend_am_material(
     part_function: str,
@@ -971,7 +1057,17 @@ def recommend_am_material(
     explanatory message (never a guessed fallback) if `temperature_exposure`/
     `priority` aren't recognized, or if no material in am_materials.csv
     meets the combined temperature + load-bearing requirement.
+
+    **Fusion 360 only.** Returns found=False immediately (asking the four
+    questions first is pointless) if the currently active CAD platform
+    isn't Fusion 360 -- this tool, generate_am_readiness_guide(), and
+    run_am_dfm_check() are additive-manufacturing-specific and must not
+    be invoked for a SolidWorks (or other non-Fusion) document, even if
+    the user's phrasing mentions "3D printing" or "material" in passing.
     """
+    if adapter.PLATFORM_ID != _FUSION_PLATFORM_ID:
+        return {"found": False, "message": _am_tools_unavailable_message()}
+
     from am_material_advisor import recommend_am_material as _recommend_am_material
 
     return _recommend_am_material(part_function, load_bearing, temperature_exposure, priority)
@@ -1060,7 +1156,14 @@ def generate_am_readiness_guide(
     true for SolidWorksAdapter), if `candidate_orientations` contains an
     unparseable label, or if `temperature_exposure`/`priority` (when
     given) aren't recognized values.
+
+    **Fusion 360 only** -- see recommend_am_material()'s docstring;
+    returns found=False immediately if the currently active CAD platform
+    isn't Fusion 360.
     """
+    if adapter.PLATFORM_ID != _FUSION_PLATFORM_ID:
+        return {"found": False, "message": _am_tools_unavailable_message()}
+
     from am_material_advisor import recommend_am_material as _recommend_am_material
 
     orientations = candidate_orientations or list(_DEFAULT_AM_CANDIDATE_ORIENTATIONS)
@@ -1150,7 +1253,14 @@ def run_am_dfm_check(build_orientation: str) -> list[dict]:
     Raises no exception for a bad `build_orientation` -- returns
     found=False with the parser's exact expected-syntax message instead,
     same pattern as the other AM tools.
+
+    **Fusion 360 only** -- see recommend_am_material()'s docstring;
+    returns found=False immediately if the currently active CAD platform
+    isn't Fusion 360.
     """
+    if adapter.PLATFORM_ID != _FUSION_PLATFORM_ID:
+        return [{"found": False, "message": _am_tools_unavailable_message()}]
+
     try:
         return adapter.run_am_dfm_check(build_orientation)
     except (ValueError, NotImplementedError) as e:
