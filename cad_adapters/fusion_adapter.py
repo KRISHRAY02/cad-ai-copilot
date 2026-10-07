@@ -700,7 +700,14 @@ class FusionAdapter(CadAdapter):
                 Fusion Design, or isn't an assembly (call is_assembly()
                 first).
         """
-        data = self._request("/assembly_components")
+        # Default _REQUEST_TIMEOUT_SECONDS (3s) is too short here: this
+        # recursively walks the whole occurrence tree, so it scales with
+        # assembly size -- confirmed live (2026-10-07) taking ~4.5s on a
+        # ~40-component assembly, which fired the 3s timeout and got
+        # misreported as "bridge not reachable" even though the bridge
+        # was up and the call was just still working. Same reasoning as
+        # /open_document's 35s override above.
+        data = self._request("/assembly_components", timeout=60.0)
         if "error" in data:
             raise FusionDataUnavailableError(data["error"])
 
