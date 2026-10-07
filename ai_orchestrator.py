@@ -647,6 +647,35 @@ def _is_simple_bounding_box_question(question: str) -> bool:
     )
 
 
+# Same incident class as mass/volume/material/bounding-box above: "how
+# many sub-assemblies/components/unique parts are there" has a direct
+# tool (list_assembly_components()) that reads the currently open
+# assembly's real tree and needs no input from the user -- but the model
+# was observed (reported live by Krish, 2026-10-07) skipping the tool
+# call entirely and hallucinating a fabricated Fusion-API Python snippet
+# instead, when questioned with a SolidWorks assembly actually open.
+# list_assembly_components()'s own docstring already tells the LLM this
+# is the right tool for this phrasing, but that's a soft hint the model
+# doesn't reliably follow -- force the call for the unambiguous case,
+# same as every other "simple" question above. Excludes cost/BOM
+# phrasing so those still go through get_assembly_bom/
+# get_assembly_cost_drivers via the normal LLM path.
+_SIMPLE_ASSEMBLY_STRUCTURE_QUESTION_RE = re.compile(
+    r"\b(sub[- ]?assembl(?:y|ies)|how many (?:unique )?(?:parts|components)|"
+    r"list (?:the )?components|what('?s| is) this assembly made of)\b",
+    re.IGNORECASE,
+)
+_ASSEMBLY_STRUCTURE_QUESTION_EXCLUDE_RE = re.compile(
+    r"\b(cost|price|bom|carbon|dfm|report|compare)\b", re.IGNORECASE
+)
+
+
+def _is_simple_assembly_structure_question(question: str) -> bool:
+    return bool(_SIMPLE_ASSEMBLY_STRUCTURE_QUESTION_RE.search(question)) and not (
+        _ASSEMBLY_STRUCTURE_QUESTION_EXCLUDE_RE.search(question)
+    )
+
+
 # Same incident class as mass/volume/material/bounding-box above
 # (2026-10-05): "What is the cost if I make it by CNC?" has everything
 # estimate_cost() needs (manufacturing_process -- quantity defaults to
@@ -1045,6 +1074,25 @@ class AiOrchestrator:
             # get_bounding_box failed (adapter doesn't implement it, no
             # solid geometry, bridge Add-In not reloaded with this route
             # yet) -- return the real error directly, same reasoning as
+            # get_mass above.
+            error_text = _plain_tool_error_text(tool_result)
+            self._history.append({"role": "assistant", "content": error_text})
+            return error_text
+
+        if _is_simple_assembly_structure_question(question):
+            tool_result = await self._execute_tool_call_deduped(
+                "list_assembly_components", {}, called_signatures
+            )
+            self._remember_structured_result("list_assembly_components", tool_result)
+            self._history.append(
+                {"role": "tool", "tool_name": "list_assembly_components", "content": tool_result}
+            )
+            deterministic = _format_deterministic_answer("list_assembly_components", tool_result)
+            if deterministic is not None:
+                self._history.append({"role": "assistant", "content": deterministic})
+                return deterministic
+            # list_assembly_components failed (not an assembly, no document
+            # open) -- return the real error directly, same reasoning as
             # get_mass above.
             error_text = _plain_tool_error_text(tool_result)
             self._history.append({"role": "assistant", "content": error_text})
