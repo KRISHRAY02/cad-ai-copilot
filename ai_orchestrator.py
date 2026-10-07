@@ -661,7 +661,12 @@ def _is_simple_bounding_box_question(question: str) -> bool:
 # phrasing so those still go through get_assembly_bom/
 # get_assembly_cost_drivers via the normal LLM path.
 _SIMPLE_ASSEMBLY_STRUCTURE_QUESTION_RE = re.compile(
-    r"\b(sub[- ]?assembl(?:y|ies)|how many (?:unique )?(?:parts|components)|"
+    # "as+embl" (not a literal "assembl") deliberately tolerates a doubled/
+    # tripled 's' typo -- found live 2026-10-07: Krish typed "subasssemblies"
+    # (three s's), which a literal "assembl" substring match silently missed,
+    # sending the question through the unreliable LLM path instead of
+    # force-calling the tool.
+    r"\b(sub[- ]?as+embl(?:y|ies)|how many (?:unique )?(?:parts|components)|"
     r"list (?:the )?components|what('?s| is) this assembly made of)\b",
     re.IGNORECASE,
 )
