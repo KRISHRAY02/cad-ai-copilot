@@ -488,6 +488,53 @@ def _format_get_material_answer(tool_result_json: str) -> str | None:
     return answer + "."
 
 
+def _unwrap_list_result(data) -> list | None:
+    """get_features() is declared `-> list[dict]` in mcp_server.py, but
+    MCP's structured-content wire format requires a JSON *object* at the
+    top level, not a bare array -- so the framework auto-wraps a
+    list-returning tool's result as {"result": [...]}. Confirmed live
+    (2026-10-12): a bare `isinstance(data, list)` check on the parsed
+    JSON was always False for this tool's real output, silently falling
+    through to the LLM path (or reporting "not available" in
+    _answer_what_is_this_part) even when the call succeeded. Accepts
+    either shape so this doesn't re-break if that wire-format detail
+    changes.
+    """
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict) and isinstance(data.get("result"), list):
+        return data["result"]
+    return None
+
+
+def _format_get_features_answer(tool_result_json: str) -> str | None:
+    """Turn get_features' JSON straight into a plain-language answer,
+    without asking the LLM to re-express it.
+
+    An empty list is a valid "no features" answer -- not the shape of an
+    error to fall through on -- while anything that isn't a list (bare or
+    MCP's {"result": [...]}-wrapped, see _unwrap_list_result) at all
+    (e.g. an error message string) still falls through to the normal LLM
+    path.
+    """
+    try:
+        parsed = json.loads(tool_result_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    data = _unwrap_list_result(parsed)
+    if data is None:
+        return None
+    if not data:
+        return "The currently open part has no features in its timeline/feature tree."
+    lines = [f"The currently open part has {len(data)} feature(s), in modeling order:"]
+    for f in data:
+        name = f.get("name", "unnamed") if isinstance(f, dict) else str(f)
+        feature_type = f.get("feature_type", "?") if isinstance(f, dict) else "?"
+        suppressed = " (suppressed)" if isinstance(f, dict) and f.get("suppressed") else ""
+        lines.append(f"- {name} ({feature_type}){suppressed}")
+    return "\n".join(lines)
+
+
 def _format_get_volume_answer(tool_result_json: str) -> str | None:
     """Turn get_volume's JSON straight into a plain-language answer,
     without asking the LLM to re-express it.
@@ -557,6 +604,7 @@ _DETERMINISTIC_ANSWER_FORMATTERS = {
     "get_volume": _format_get_volume_answer,
     "get_material": _format_get_material_answer,
     "get_bounding_box": _format_get_bounding_box_answer,
+    "get_features": _format_get_features_answer,
     "estimate_cost": _format_estimate_cost_answer,
 }
 
@@ -678,6 +726,52 @@ _ASSEMBLY_STRUCTURE_QUESTION_EXCLUDE_RE = re.compile(
 def _is_simple_assembly_structure_question(question: str) -> bool:
     return bool(_SIMPLE_ASSEMBLY_STRUCTURE_QUESTION_RE.search(question)) and not (
         _ASSEMBLY_STRUCTURE_QUESTION_EXCLUDE_RE.search(question)
+    )
+
+
+# Same incident class as mass/volume/material above: "what are the
+# features" has a direct tool (get_features()) reading the part's real
+# Timeline/feature tree, needing nothing from the user.
+_SIMPLE_FEATURES_QUESTION_RE = re.compile(r"\bfeatures?\b", re.IGNORECASE)
+_FEATURES_QUESTION_EXCLUDE_RE = re.compile(
+    r"\b(cost|price|carbon|dfm|report|compare|material|am readiness|"
+    r"build orientation|support strategy)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_simple_features_question(question: str) -> bool:
+    return bool(_SIMPLE_FEATURES_QUESTION_RE.search(question)) and not (
+        _FEATURES_QUESTION_EXCLUDE_RE.search(question)
+    )
+
+
+# "What is this part"/"describe this part" must be answered ONLY from
+# get_current_part_info, get_mass, get_material, get_bounding_box, and
+# get_features -- never the LLM's own words -- per the fix for a real bug
+# (2026-10-12): in a Fusion "part"-mode session, asking a plain part
+# question let the model free-associate and it pulled in AM-only tools/
+# wording (e.g. referencing recommend_am_material) even though nothing
+# about 3D printing was asked. Composing the answer in plain Python from
+# exactly these 5 deterministic reads, same pattern as every other
+# forced-call question above, makes that structurally impossible rather
+# than relying on prompting. Excludes assembly/cost/AM phrasing so those
+# genuinely different questions still go through their own paths.
+_WHAT_IS_THIS_PART_QUESTION_RE = re.compile(
+    r"\b(what('?s| is) this part|describe (this|the) part|"
+    r"what('?s| is) this(?!\s+assembly)(?!\s+for))\b",
+    re.IGNORECASE,
+)
+_WHAT_IS_THIS_PART_EXCLUDE_RE = re.compile(
+    r"\b(cost|price|carbon|dfm|report|compare|assembly|bom|print|"
+    r"additive|am readiness|build orientation|support strategy)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_what_is_this_part_question(question: str) -> bool:
+    return bool(_WHAT_IS_THIS_PART_QUESTION_RE.search(question)) and not (
+        _WHAT_IS_THIS_PART_EXCLUDE_RE.search(question)
     )
 
 
@@ -808,6 +902,24 @@ _FUSION_AM_MODE_SUFFIX = (
     "one directly."
 )
 
+# The three AM-specific tools (platform-gated to Fusion in mcp_server.py
+# already -- see _FUSION_PLATFORM_ID there). Previously these stayed in
+# self._tools_schema and were handed to Ollama on EVERY Fusion-session
+# call regardless of fusion_mode -- the _FUSION_PART_MODE_SUFFIX above
+# only ever told the model not to call them, a soft instruction a 7B
+# model doesn't reliably follow. Confirmed live (2026-10-12): asked
+# "generate the BOM" in the default "part" mode, qwen2.5:7b-instruct
+# skipped tool-calling entirely and fabricated an answer that explicitly
+# named `recommend_am_material` as a step to take -- an AM-only tool
+# leaking into a plain part-mode question's answer, even though the
+# system prompt explicitly told it not to use AM tools this session. The
+# real fix is removing these from the tools list the model can see at
+# all in "part" mode (see AiOrchestrator._active_tools() below), not
+# just asking it nicely not to call them.
+_AM_ONLY_TOOL_NAMES = frozenset(
+    {"recommend_am_material", "generate_am_readiness_guide", "run_am_dfm_check"}
+)
+
 
 def _is_fusion_session() -> bool:
     return os.environ.get("CAD_ADAPTER", "solidworks").lower() in (
@@ -851,6 +963,13 @@ class AiOrchestrator:
         self._session: ClientSession | None = None
         self._ollama = AsyncClient()
         self._tools_schema: list[dict] = []
+        # The subset of self._tools_schema actually offered to the LLM for
+        # the CURRENT turn -- equal to self._tools_schema everywhere except
+        # a Fusion session in "part" mode, where the three AM-only tools
+        # are stripped out entirely (see _AM_ONLY_TOOL_NAMES's docstring
+        # for why asking the model nicely not to call them isn't enough).
+        # Recomputed in ask() whenever fusion_mode changes.
+        self._active_tools_schema: list[dict] = []
         self._history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
         # Last `quantity`/`manufacturing_process` used in a *successful*
         # (found=True) cost-related tool call this session, and the
@@ -912,6 +1031,10 @@ class AiOrchestrator:
 
             tools_result = await self._session.list_tools()
             self._tools_schema = [self._to_ollama_tool(t) for t in tools_result.tools]
+            # Default to the full set (non-Fusion sessions, and Fusion
+            # sessions before ask() has run once to set a mode) -- ask()
+            # narrows this for a Fusion "part"-mode session.
+            self._active_tools_schema = self._tools_schema
         except Exception as e:
             raise McpServerUnavailableError(
                 "Could not start the CAD MCP server (mcp_server.py). Check "
@@ -944,7 +1067,7 @@ class AiOrchestrator:
                 response = await self._ollama.chat(
                     model=self._model,
                     messages=self._history,
-                    tools=self._tools_schema,
+                    tools=self._active_tools_schema,
                 )
             except ConnectionError as e:
                 # ollama's client already turns "server unreachable" into a
@@ -991,6 +1114,22 @@ class AiOrchestrator:
                     _FUSION_AM_MODE_SUFFIX
                     if effective_mode == "am"
                     else _FUSION_PART_MODE_SUFFIX
+                )
+                # "part" mode: the model never even sees the AM tools, so
+                # it can't call them or mention them as a step regardless
+                # of how it's prompted -- see _AM_ONLY_TOOL_NAMES's
+                # docstring for the live-diagnosed hallucination this
+                # fixes. "am" mode keeps the full set since its own
+                # suffix above says general-purpose tools are still fair
+                # game if the user asks a plain part/cost question.
+                self._active_tools_schema = (
+                    self._tools_schema
+                    if effective_mode == "am"
+                    else [
+                        t
+                        for t in self._tools_schema
+                        if t["function"]["name"] not in _AM_ONLY_TOOL_NAMES
+                    ]
                 )
 
         self._history.append({"role": "user", "content": question})
@@ -1102,6 +1241,28 @@ class AiOrchestrator:
             error_text = _plain_tool_error_text(tool_result)
             self._history.append({"role": "assistant", "content": error_text})
             return error_text
+
+        if _is_simple_features_question(question):
+            tool_result = await self._execute_tool_call_deduped(
+                "get_features", {}, called_signatures
+            )
+            self._remember_structured_result("get_features", tool_result)
+            self._history.append(
+                {"role": "tool", "tool_name": "get_features", "content": tool_result}
+            )
+            deterministic = _format_deterministic_answer("get_features", tool_result)
+            if deterministic is not None:
+                self._history.append({"role": "assistant", "content": deterministic})
+                return deterministic
+            # get_features failed (no document open, bridge unreachable,
+            # etc.) -- return the real error directly, same reasoning as
+            # get_mass above.
+            error_text = _plain_tool_error_text(tool_result)
+            self._history.append({"role": "assistant", "content": error_text})
+            return error_text
+
+        if _is_what_is_this_part_question(question):
+            return await self._answer_what_is_this_part(called_signatures)
 
         cost_match = _is_simple_cost_question(question)
         if cost_match is not None:
@@ -1535,6 +1696,89 @@ class AiOrchestrator:
         }
         return await self._call_mcp_tool("get_assembly_bom", redirect_arguments)
 
+    async def _answer_what_is_this_part(
+        self, called_signatures: set[tuple[str, str]]
+    ) -> str:
+        """Answer "what is this part"/"describe this part" ONLY from
+        get_current_part_info, get_mass, get_material, get_bounding_box,
+        and get_features -- composed in plain Python, never handed to the
+        LLM to phrase. See _is_what_is_this_part_question's docstring for
+        the live-diagnosed AM-wording leak this exists to prevent.
+
+        Each of the 5 reads is independent -- one failing (not JSON, or a
+        found=False/error shape) reports "not available" for just that
+        field rather than failing the whole answer, since e.g. a part
+        with no assigned material shouldn't block reporting its mass.
+        """
+
+        async def _call(name: str) -> dict | list | None:
+            raw = await self._execute_tool_call_deduped(name, {}, called_signatures)
+            self._history.append({"role": "tool", "tool_name": name, "content": raw})
+            try:
+                return json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                return None
+
+        part_info = await _call("get_current_part_info")
+        mass = await _call("get_mass")
+        material = await _call("get_material")
+        bbox = await _call("get_bounding_box")
+        # get_features() comes back as {"result": [...]} over MCP, not a
+        # bare list -- see _unwrap_list_result's docstring.
+        features = _unwrap_list_result(await _call("get_features"))
+
+        lines = []
+
+        if isinstance(part_info, dict) and part_info.get("name"):
+            lines.append(
+                f"Part: {part_info['name']} "
+                f"({part_info.get('part_type', 'unknown type')}, "
+                f"units {part_info.get('units', 'unknown')})."
+            )
+        else:
+            lines.append("Part identity: not available.")
+
+        if isinstance(mass, dict) and isinstance(mass.get("mass_kg"), (int, float)):
+            lines.append(f"Mass: {mass['mass_kg']:.4g} kg.")
+        else:
+            lines.append("Mass: not available.")
+
+        if isinstance(material, dict) and material.get("name"):
+            material_line = f"Material: {material['name']}"
+            if material.get("density_kg_m3") is not None:
+                material_line += f" (density {material['density_kg_m3']:,.0f} kg/m³)"
+            lines.append(material_line + ".")
+        else:
+            lines.append("Material: not available.")
+
+        if isinstance(bbox, dict) and bbox.get("found"):
+            lines.append(
+                f"Bounding box: {bbox['length_mm']:,.2f} x "
+                f"{bbox['width_mm']:,.2f} x {bbox['height_mm']:,.2f} mm "
+                "(length x width x height)."
+            )
+        else:
+            lines.append("Bounding box: not available.")
+
+        if isinstance(features, list) and features:
+            sample_names = [
+                f.get("name", "?") if isinstance(f, dict) else str(f)
+                for f in features[:5]
+            ]
+            more = ", ..." if len(features) > 5 else ""
+            lines.append(
+                f"Features: {len(features)} feature(s) in the timeline "
+                f"(e.g. {', '.join(sample_names)}{more})."
+            )
+        elif isinstance(features, list):
+            lines.append("Features: none.")
+        else:
+            lines.append("Features: not available.")
+
+        answer = "\n".join(lines)
+        self._history.append({"role": "assistant", "content": answer})
+        return answer
+
     async def _execute_tool_call_deduped(
         self, name: str, arguments: dict, called_signatures: set[tuple[str, str]]
     ) -> str:
@@ -1594,7 +1838,7 @@ class AiOrchestrator:
     def _parse_leaked_tool_call(self, content: str | None) -> tuple[str, dict] | None:
         """If `content` is actually a tool call the model failed to put in
         the structured `tool_calls` field, return (name, arguments);
-        otherwise None. Only matches a name from `self._tools_schema`, so
+        otherwise None. Only matches a name from `self._active_tools_schema`, so
         an ordinary text answer that happens to look JSON-ish is never
         misread as a tool call.
 
@@ -1618,7 +1862,7 @@ class AiOrchestrator:
         arguments = parsed.get("arguments", {})
         if not isinstance(name, str) or not isinstance(arguments, dict):
             return None
-        known_names = {t["function"]["name"] for t in self._tools_schema}
+        known_names = {t["function"]["name"] for t in self._active_tools_schema}
         if name not in known_names:
             return None
         return name, arguments

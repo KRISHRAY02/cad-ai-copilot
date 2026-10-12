@@ -809,12 +809,15 @@ def get_assembly_bom(manufacturing_process: str | None = None, quantity: int = 1
     total mass, total cost for one assembly and for `quantity` assemblies)
     and a list of any components with missing material/pricing data.
 
-    Use this for questions like "what's the total cost of this assembly
-    for a production run of N" or "which parts are missing
-    material/pricing" -- this tool answers all of those directly from one
-    call, rather than needing several get_mass/estimate_cost calls on
-    individual parts. For a plain list of components/quantities with NO
-    cost involved, use list_assembly_components() instead -- it needs no
+    Use this for "generate/show/create the BOM", "bill of materials", or
+    "what's the total cost of this assembly for a production run of N" or
+    "which parts are missing material/pricing" -- this tool answers all
+    of those directly from one call, rather than needing several
+    get_mass/estimate_cost calls on individual parts. A BOM request is
+    NEVER generate_report() -- that produces a single-part PDF, not
+    structured assembly data, and will fail on an assembly outright. For
+    a plain list of components/quantities with NO cost involved, use
+    list_assembly_components() instead -- it needs no
     manufacturing_process. **For a pure mass question with no cost
     involved ("what's the mass of the complete assembly"), use get_mass()
     instead -- it returns the whole open document's total mass without
@@ -1285,6 +1288,13 @@ def generate_report(
     "export a report", "generate a summary/report", "give me a PDF", or
     similar phrasing, instead of trying to answer with several separate
     tool calls.
+
+    Do NOT call this for "generate/show/list the BOM" or "bill of
+    materials" questions, even though they also contain the word
+    "generate" -- a BOM is structured assembly data, not a PDF. Use
+    list_assembly_components() (no cost) or get_assembly_bom() (with
+    cost) instead; this tool's PDF is single-part only and will fail
+    outright on an assembly (there is no one part to report on).
 
     `manufacturing_process` (one of "CNC Machining", "Injection
     Molding", "Sheet Metal") and `quantity` should be whatever the user

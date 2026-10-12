@@ -69,6 +69,23 @@ class FusionBridgeNotReachableError(FusionBridgeConnectionError):
     """Raised when the bridge Add-In's HTTP server can't be reached at all."""
 
 
+class FusionBridgeTimeoutError(FusionBridgeConnectionError):
+    """Raised when the bridge IS reachable (confirmed via a fresh /ping)
+    but a specific call to it didn't finish within its timeout.
+
+    Deliberately distinct from FusionBridgeNotReachableError: that one
+    tells the user to restart the Add-In, which is the wrong instruction
+    here -- the Add-In is fine, the call (e.g. walking a huge occurrence
+    tree) just needs more time or a retry. Conflating these two was the
+    root cause of a real bug (2026-10-12): a slow /assembly_components
+    call on a large assembly got reported as "Add-In not running" even
+    though the Add-In was up and the call was simply still working --
+    confirmed live by catching a deliberately short-timeout call against
+    the actually-running bridge and observing it raised the exact same
+    exception type/message as a genuinely-dead bridge on a closed port.
+    """
+
+
 class NoFusionDocumentOpenError(FusionBridgeConnectionError):
     """Raised when the bridge is reachable but Fusion has no document open."""
 
@@ -94,24 +111,88 @@ class FusionAdapter(CadAdapter):
     def __init__(self, base_url: str = BRIDGE_BASE_URL) -> None:
         self._base_url = base_url
 
-    def _request(self, path: str, timeout: float = _REQUEST_TIMEOUT_SECONDS) -> dict:
+    _NOT_REACHABLE_MESSAGE = (
+        "Could not reach the Fusion 360 bridge Add-In at {base_url}. Make "
+        "sure Fusion 360 is running and the 'fusion_bridge_addin' Add-In is "
+        "started (Utilities > Add-Ins > Scripts and Add-Ins > Add-Ins tab > "
+        "fusion_bridge_addin > Run), then try again."
+    )
+
+    def _quick_ping_alive(self, probe_timeout: float = 1.5) -> bool:
+        """Short-timeout, exception-swallowing /ping probe used ONLY to
+        disambiguate a failed call in `_request()` below: did the Add-In's
+        HTTP server actually go away, or is it still there and this one
+        call was just slow/erroring? Never raises -- callers only care
+        True/False. Doesn't reuse `is_running()` to avoid constructing a
+        second FusionAdapter instance for what's otherwise the same check.
+        """
+        try:
+            with urllib.request.urlopen(
+                f"{self._base_url}/ping", timeout=probe_timeout
+            ) as response:
+                response.read()
+            return True
+        except Exception:
+            return False
+
+    def _request(
+        self,
+        path: str,
+        timeout: float = _REQUEST_TIMEOUT_SECONDS,
+        *,
+        confirm_alive_first: bool = False,
+    ) -> dict:
         """GET `path` from the bridge and return the parsed JSON body.
 
-        Raises FusionBridgeNotReachableError -- with a message pointing
-        Krish at the actual fix -- instead of letting a raw
-        urllib/socket/JSON exception propagate, for any failure that
-        means the bridge simply isn't there to answer: connection
-        refused, DNS/timeout, or a response that isn't valid JSON.
+        Raises one of three distinct exceptions, deliberately not
+        conflated (see the real bug this fixed, 2026-10-12 -- a slow
+        /assembly_components call on a large assembly was reported as
+        "Add-In not running" even though the Add-In was fine and the call
+        just needed more time):
+
+        - FusionBridgeNotReachableError: the Add-In's HTTP server really
+          isn't there right now.
+        - FusionBridgeTimeoutError: the Add-In WAS confirmed reachable, so
+          this call's own timeout/connection error means it's just slow or
+          had a transient hiccup -- message should tell the user to
+          retry, not restart anything.
+        - FusionDataUnavailableError: the bridge answered (so it's
+          definitely up), but the body wasn't parseable JSON -- an actual
+          bug in the Add-In's response, not a reachability problem.
+
+        `confirm_alive_first=True` is for calls given a timeout much
+        longer than the default -- currently get_assembly_components()
+        (60s), open_document() (35s), and get_face_geometry() (240s). The
+        bridge's HTTP server is a plain `http.server.HTTPServer`, not a
+        threaded variant (see fusion_bridge_addin.py), so it only services
+        ONE request at a time. **Confirmed live (2026-10-12) this makes a
+        naive "re-ping after the slow call times out" approach actively
+        wrong**: while the slow call is still occupying the server's one
+        worker thread, a fresh /ping queues up behind it and times out
+        too, making a perfectly-alive Add-In look dead. Pinging instead
+        right BEFORE starting the slow call -- while the server is still
+        free to answer -- and remembering that result sidesteps the race
+        entirely: if the slow call later times out, we already know the
+        Add-In was alive moments ago, so it's unambiguously message 2,
+        not message 1. Calls that keep the default short timeout skip
+        this (no point paying for an extra round-trip on every ordinary
+        read) and fall back to a same-timing re-ping after failure, which
+        is an acceptable approximation for them since they fail fast.
 
         `timeout` defaults to _REQUEST_TIMEOUT_SECONDS (3s), fine for
-        simple property reads. **Confirmed live (2026-08-29) that 3s is
-        too short for /open_document**: the client timed out and raised
-        FusionBridgeNotReachableError while the bridge server was still
-        up and legitimately still working (Get-NetTCPConnection showed it
-        still Listening) -- opening/switching a document is slow enough
-        that callers doing that need to pass a much longer timeout
-        explicitly (see open_document() below).
+        simple property reads. Confirmed live (2026-08-29) that 3s is too
+        short for /open_document, and (2026-10-07) too short for
+        /assembly_components on a ~40-component assembly -- both now pass
+        a much longer timeout explicitly (see open_document() and
+        get_assembly_components() below) so a slow-but-working call has
+        room to finish instead of hitting this path at all.
         """
+        confirmed_alive_before = (
+            self._quick_ping_alive()
+            if confirm_alive_first and path != "/ping"
+            else None
+        )
+
         url = f"{self._base_url}{path}"
         try:
             with urllib.request.urlopen(url, timeout=timeout) as response:
@@ -128,23 +209,38 @@ class FusionAdapter(CadAdapter):
             try:
                 return json.loads(body)
             except json.JSONDecodeError:
-                raise FusionBridgeNotReachableError(
+                # The bridge definitely answered (we have an HTTP status
+                # and a body) -- a non-JSON body is a bug in what it sent
+                # back, not a reachability problem, so this is NOT
+                # "Add-In not running".
+                raise FusionDataUnavailableError(
                     f"Fusion bridge Add-In at {self._base_url} returned "
                     f"HTTP {e.code} with a non-JSON body: {body!r}"
                 ) from e
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+            was_alive = (
+                confirmed_alive_before
+                if confirmed_alive_before is not None
+                else (path != "/ping" and self._quick_ping_alive())
+            )
+            if was_alive:
+                raise FusionBridgeTimeoutError(
+                    f"The call to the Fusion bridge Add-In ({path}) didn't "
+                    f"finish within {timeout:.0f}s, but the Add-In was "
+                    "confirmed running -- this can happen on a large "
+                    "assembly. Try asking again; if it keeps timing out, "
+                    "the assembly may be too large for this operation."
+                ) from e
             raise FusionBridgeNotReachableError(
-                "Could not reach the Fusion 360 bridge Add-In at "
-                f"{self._base_url}. Make sure Fusion 360 is running and the "
-                "'fusion_bridge_addin' Add-In is started (Utilities > "
-                "Add-Ins > Scripts and Add-Ins > Add-Ins tab > "
-                "fusion_bridge_addin > Run), then try again."
+                self._NOT_REACHABLE_MESSAGE.format(base_url=self._base_url)
             ) from e
 
         try:
             return json.loads(body)
         except json.JSONDecodeError as e:
-            raise FusionBridgeNotReachableError(
+            # Same reasoning as the HTTPError branch above: the bridge
+            # definitely answered, so this isn't "not running".
+            raise FusionDataUnavailableError(
                 f"Fusion bridge Add-In at {self._base_url} returned a "
                 f"response that wasn't valid JSON: {e}"
             ) from e
@@ -221,6 +317,7 @@ class FusionAdapter(CadAdapter):
         data = self._request(
             f"/open_document?name={urllib.parse.quote(file_path)}",
             timeout=35.0,  # bridge itself waits up to 30s for Fusion's main thread; leave margin
+            confirm_alive_first=True,
         )
         if "error" in data:
             raise FusionDataUnavailableError(data["error"])
@@ -607,7 +704,7 @@ class FusionAdapter(CadAdapter):
         # itself appears to slow down under repeated heavy API traversal,
         # not this code) -- 240s leaves real margin above the worst
         # observed case rather than the first-call baseline.
-        data = self._request("/geometry/faces", timeout=240.0)
+        data = self._request("/geometry/faces", timeout=240.0, confirm_alive_first=True)
         if "error" in data:
             raise FusionDataUnavailableError(data["error"])
 
@@ -706,8 +803,14 @@ class FusionAdapter(CadAdapter):
         # ~40-component assembly, which fired the 3s timeout and got
         # misreported as "bridge not reachable" even though the bridge
         # was up and the call was just still working. Same reasoning as
-        # /open_document's 35s override above.
-        data = self._request("/assembly_components", timeout=60.0)
+        # /open_document's 35s override above. confirm_alive_first=True
+        # since the bridge's HTTP server handles one request at a time --
+        # see _request()'s docstring for why re-pinging only AFTER this
+        # call times out would itself queue behind the still-in-flight
+        # request and wrongly report "not reachable".
+        data = self._request(
+            "/assembly_components", timeout=60.0, confirm_alive_first=True
+        )
         if "error" in data:
             raise FusionDataUnavailableError(data["error"])
 
