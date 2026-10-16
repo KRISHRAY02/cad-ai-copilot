@@ -20,7 +20,9 @@ datasheet.
 import csv
 from pathlib import Path
 
-_DEFAULT_CSV_PATH = Path(__file__).parent / "am_materials.csv"
+from app_paths import bundled_path
+
+_DEFAULT_CSV_PATH = bundled_path("am_materials.csv")
 
 _REQUIRED_COLUMNS = {
     "process_type",

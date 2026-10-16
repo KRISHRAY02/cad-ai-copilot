@@ -14,11 +14,12 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
 
 import bcrypt
 
-DB_PATH = Path(__file__).parent / "chat_history.db"
+from app_paths import user_data_path
+
+DB_PATH = user_data_path("chat_history.db")
 
 TITLE_MAX_LENGTH = 30
 

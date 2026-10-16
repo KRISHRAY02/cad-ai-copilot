@@ -23,6 +23,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.types import CallToolResult
 from ollama import AsyncClient
 
+from app_paths import user_data_path
 from production_cost import PROCESSES
 
 DEFAULT_MODEL = "qwen2.5:7b-instruct"
@@ -46,7 +47,7 @@ if not _TOOL_CALL_LOGGER.handlers:
     _TOOL_CALL_LOGGER.addHandler(_console_handler)
 
     _file_handler = logging.FileHandler(
-        Path(__file__).parent / "tool_call_log.jsonl", encoding="utf-8"
+        user_data_path("tool_call_log.jsonl"), encoding="utf-8"
     )
     _file_handler.setFormatter(logging.Formatter("%(message)s"))
     _TOOL_CALL_LOGGER.addHandler(_file_handler)
@@ -956,8 +957,22 @@ class AiOrchestrator:
             if "CAD_ADAPTER" in os.environ
             else None
         )
+        # Running from source: launch the MCP server as an ordinary script
+        # under the current Python interpreter ("python mcp_server.py").
+        # Running as a packaged .exe (sys.frozen set by PyInstaller), there
+        # is no "python" on the target machine and mcp_server.py's source
+        # isn't necessarily present either -- instead, re-launch this same
+        # .exe with a --mcp-server flag, which main_cli() (desktop_app.py)
+        # recognizes and uses to run mcp_server's stdio server directly in
+        # that subprocess instead of opening the chat window.
+        if getattr(sys, "frozen", False):
+            command = sys.executable
+            args = ["--mcp-server"]
+        else:
+            command = sys.executable
+            args = [mcp_server_path]
         self._server_params = StdioServerParameters(
-            command=sys.executable, args=[mcp_server_path], env=server_env
+            command=command, args=args, env=server_env
         )
         self._exit_stack = AsyncExitStack()
         self._session: ClientSession | None = None

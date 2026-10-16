@@ -17,6 +17,7 @@ from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
 
+from app_paths import exports_dir
 from cad_adapters.base_adapter import CadAdapter
 from cad_adapters.mock_adapter import MockAdapter
 from cost_model.features import infer_material_type
@@ -979,7 +980,7 @@ def export_bom(
 
     if output_path is None:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = str(Path(tempfile.gettempdir()) / f"bom_{timestamp}.xlsx")
+        output_path = str(exports_dir() / f"bom_{timestamp}.xlsx")
 
     bom_result = adapter.get_assembly_bom(manufacturing_process, quantity)
     try:
@@ -1315,7 +1316,7 @@ def generate_report(
 
     if output_path is None:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = str(Path(tempfile.gettempdir()) / f"manufacturing_report_{timestamp}.pdf")
+        output_path = str(exports_dir() / f"manufacturing_report_{timestamp}.pdf")
 
     try:
         saved_path = generate_manufacturing_report(

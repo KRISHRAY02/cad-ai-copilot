@@ -15,10 +15,11 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from app_paths import bundled_path  # noqa: E402
 from cost_model.features import FEATURE_COLUMNS, encode_categoricals  # noqa: E402
 from production_cost import estimate_production_cost  # noqa: E402
 
-_MODEL_PATH = Path(__file__).parent / "trained_model.joblib"
+_MODEL_PATH = bundled_path("cost_model/trained_model.joblib")
 
 _bundle = None
 

@@ -11,15 +11,19 @@ Run with:  C:\\Python314\\python.exe desktop_app.py
 
 import asyncio
 import datetime
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import flet as ft
+from ollama import AsyncClient
 
 import chat_db
+from app_paths import bundled_path, exports_dir, user_data_dir
 import mcp_server
 from ai_orchestrator import (
+    DEFAULT_MODEL,
     AiOrchestrator,
     McpServerUnavailableError,
     run_ai_orchestrator_with_data,
@@ -165,35 +169,138 @@ EXAMPLE_QUESTIONS = [
 # --------------------------------------------------------------------------
 
 
-async def check_environment() -> str | None:
-    """Return a friendly problem description, or None if everything is up.
+# Bundled read-only files the running app actually needs -- see
+# app_paths.bundled_path's docstring for why these are resolved relative
+# to the bundle (sys._MEIPASS) rather than the current working directory
+# in a packaged .exe. Checked by name here rather than imported from each
+# consumer module so a missing file is reported once, up front, in plain
+# language, instead of surfacing later as a confusing per-tool error.
+_REQUIRED_DATA_FILES = (
+    "materials.csv",
+    "materials_fusion.csv",
+    "am_materials.csv",
+    "standard_hardware.csv",
+    "cost_model/trained_model.joblib",
+)
 
-    Reuses AiOrchestrator.start() (which really launches mcp_server.py and
-    does the MCP handshake) plus a lightweight Ollama ping, so this check
-    exercises the same code paths the chat will actually use instead of
-    guessing.
+
+@dataclass
+class SelfCheckResult:
+    label: str
+    ok: bool
+    detail: str
+
+
+async def run_startup_self_check() -> list[SelfCheckResult]:
+    """Run every startup check and return one result per check, in order.
+
+    Each check is independent (a failure in one doesn't stop the rest from
+    running) so the banner built from this can report everything wrong at
+    once instead of just the first failure -- e.g. "Ollama isn't running"
+    AND "materials.csv is missing" both get surfaced on the same launch,
+    rather than needing two restarts to discover both.
     """
+    results: list[SelfCheckResult] = []
+
+    # 1. Bundled data files present (see app_paths.bundled_path).
+    missing = [name for name in _REQUIRED_DATA_FILES if not bundled_path(name).is_file()]
+    if missing:
+        results.append(SelfCheckResult(
+            "Data files",
+            False,
+            "Missing: " + ", ".join(missing) + ". Reinstall the app, or if "
+            "running from source, run the setup scripts documented in "
+            "PACKAGING_NOTES.md to regenerate them.",
+        ))
+    else:
+        results.append(SelfCheckResult("Data files", True, "All required data files found."))
+
+    # 2. Per-user writable folder (chat history, logs, exports).
+    try:
+        data_dir = user_data_dir()
+        probe = data_dir / ".write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        results.append(SelfCheckResult(
+            "User data folder", True, f"Writable: {data_dir}",
+        ))
+    except OSError as e:
+        results.append(SelfCheckResult(
+            "User data folder",
+            False,
+            f"Can't write to {user_data_dir()}: {e}. Check folder "
+            "permissions, or that the drive isn't full/read-only.",
+        ))
+
+    # 3 & 4. Ollama reachable, and the model the app actually uses is
+    # pulled. Done before starting the MCP server since both are quick,
+    # independent network/process checks.
+    model_names: list[str] = []
+    try:
+        ollama_client = AsyncClient()
+        response = await ollama_client.list()
+        model_names = [m.model for m in response.models]
+        results.append(SelfCheckResult("Ollama", True, "Ollama is reachable."))
+    except Exception:
+        results.append(SelfCheckResult(
+            "Ollama",
+            False,
+            "Ollama isn't reachable. Install it from https://ollama.com, "
+            "then run `ollama serve` and reopen this app.",
+        ))
+
+    if model_names:
+        if any(DEFAULT_MODEL in name for name in model_names):
+            results.append(SelfCheckResult(
+                "AI model", True, f"{DEFAULT_MODEL} is pulled and ready.",
+            ))
+        else:
+            results.append(SelfCheckResult(
+                "AI model",
+                False,
+                f"The {DEFAULT_MODEL} model isn't pulled. Run `ollama pull "
+                f"{DEFAULT_MODEL}` and reopen this app.",
+            ))
+    else:
+        results.append(SelfCheckResult(
+            "AI model", False, "Can't check which models are pulled -- Ollama isn't reachable.",
+        ))
+
+    # 5. MCP server subprocess starts and completes its handshake. Reuses
+    # AiOrchestrator.start() so this exercises the exact same launch path
+    # (including the packaged-.exe "--mcp-server" re-launch, see
+    # AiOrchestrator.__init__) that real chat questions will use.
     orchestrator = AiOrchestrator()
     try:
         await orchestrator.start()
-    except McpServerUnavailableError:
-        return (
-            "The CAD MCP server didn't start. Make sure mcp_server.py runs "
-            "without errors (and, if you're using the SolidWorks adapter, "
-            "that SolidWorks is installed)."
-        )
-
-    try:
-        await orchestrator._ollama.list()
-    except Exception:
-        return (
-            "Ollama isn't reachable. Start it with `ollama serve` and "
-            "reopen this app."
-        )
+        results.append(SelfCheckResult("CAD MCP server", True, "Started successfully."))
+    except McpServerUnavailableError as e:
+        results.append(SelfCheckResult(
+            "CAD MCP server",
+            False,
+            "The CAD MCP server didn't start. If running from source, make "
+            f"sure mcp_server.py runs without errors under this Python "
+            f"interpreter. ({e})",
+        ))
     finally:
-        await orchestrator.stop()
+        try:
+            await orchestrator.stop()
+        except Exception:
+            pass
 
-    return None
+    return results
+
+
+async def check_environment() -> str | None:
+    """Return a friendly, multi-line problem description, or None if every
+    startup check passed. Thin wrapper around run_startup_self_check() for
+    callers that just want a single banner message.
+    """
+    results = await run_startup_self_check()
+    problems = [r.detail for r in results if not r.ok]
+    if not problems:
+        return None
+    return "\n".join(f"• {p}" for p in problems)
 
 
 # --------------------------------------------------------------------------
@@ -2423,7 +2530,7 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
 
         try:
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = str(Path(tempfile.gettempdir()) / f"manufacturing_report_{timestamp}.pdf")
+            output_path = str(exports_dir() / f"manufacturing_report_{timestamp}.pdf")
             # generate_manufacturing_report does blocking COM/PDF work
             # (screenshot capture, cost/carbon/DFM calls) -- run off the
             # UI thread, same reasoning as run_ai_orchestrator below.
@@ -2465,7 +2572,7 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
                 _DEFAULT_BOM_MANUFACTURING_PROCESS, _DEFAULT_BOM_QUANTITY
             )
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = str(Path(tempfile.gettempdir()) / f"bom_{timestamp}.xlsx")
+            output_path = str(exports_dir() / f"bom_{timestamp}.xlsx")
             return write_bom_file(bom_result, output_path, False)
 
         try:
@@ -2762,4 +2869,14 @@ async def main(page: ft.Page) -> None:
 
 
 if __name__ == "__main__":
-    ft.run(main)
+    # Packaged .exe mode: AiOrchestrator re-launches this same executable
+    # with --mcp-server when running frozen (no "python mcp_server.py" on
+    # the target machine -- see ai_orchestrator.AiOrchestrator.__init__).
+    # Must be checked before ft.run() does anything GUI-related, and must
+    # never fall through to the chat window.
+    if "--mcp-server" in sys.argv:
+        import mcp_server
+
+        mcp_server.mcp.run()
+    else:
+        ft.run(main)

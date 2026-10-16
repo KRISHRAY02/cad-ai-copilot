@@ -14,7 +14,9 @@ import csv
 import difflib
 from pathlib import Path
 
-_DEFAULT_CSV_PATH = Path(__file__).parent / "standard_hardware.csv"
+from app_paths import bundled_path
+
+_DEFAULT_CSV_PATH = bundled_path("standard_hardware.csv")
 _REQUIRED_COLUMNS = {"part_name_pattern", "unit_cost"}
 _FUZZY_MATCH_CUTOFF = 0.75
 

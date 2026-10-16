@@ -9,8 +9,10 @@ import csv
 import difflib
 from pathlib import Path
 
-_DEFAULT_CSV_PATH = Path(__file__).parent / "materials.csv"
-_FUSION_CSV_PATH = Path(__file__).parent / "materials_fusion.csv"
+from app_paths import bundled_path
+
+_DEFAULT_CSV_PATH = bundled_path("materials.csv")
+_FUSION_CSV_PATH = bundled_path("materials_fusion.csv")
 
 # Platform identifier -> which CSV backs it. Used by get_material_cost_and_carbon()
 # when it's given a platform instead of a pre-loaded materials dict, and by
