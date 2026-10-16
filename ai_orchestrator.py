@@ -301,10 +301,44 @@ def _format_generate_am_readiness_guide_answer(tool_result_json: str) -> str | N
         f"across {region_count} {area_label} -- of the orientations "
         "compared, so it needs the least support material and prints more "
         "reliably.)",
-        "",
-        f"Support strategy: {strategy_title}.",
-        strategy_explanation[:1].upper() + strategy_explanation[1:],
     ]
+
+    top_orientations = data.get("top_orientations") or []
+    if len(top_orientations) > 1:
+        lines.append("")
+        lines.append("Top orientations compared:")
+        for i, entry in enumerate(top_orientations, start=1):
+            entry_region_count = entry.get("overhang_region_count", "?")
+            entry_label = "area" if entry_region_count == 1 else "areas"
+            lines.append(
+                f"{i}. {_describe_orientation_plain(entry.get('orientation', '?'))} -- "
+                f"{entry.get('total_overhang_area_cm2', 0):.0f} cm^2 across "
+                f"{entry_region_count} {entry_label}"
+            )
+
+    lines.append("")
+    lines.append(f"Support strategy (estimated): {strategy_title}.")
+    lines.append(strategy_explanation[:1].upper() + strategy_explanation[1:])
+
+    warnings = data.get("printability_warnings") or []
+    not_checked = data.get("not_checked") or []
+    checks_run = data.get("checks_run") or []
+    lines.append("")
+    lines.append("Check before printing:")
+    if warnings:
+        for w in warnings:
+            lines.append(
+                f"- [{w.get('severity', 'warning')}] {w.get('check', '?')}: "
+                f"{w.get('detail', '')}"
+            )
+    else:
+        checks_label = ", ".join(checks_run) if checks_run else "none"
+        lines.append(
+            f"No printability issues found by the checks we run ({checks_label})."
+        )
+    if not_checked:
+        for nc in not_checked:
+            lines.append(f"- Not checked -- {nc.get('check', '?')}: {nc.get('reason', '')}")
 
     if data.get("material_questions_pending"):
         lines.append("")
@@ -327,6 +361,9 @@ def _format_generate_am_readiness_guide_answer(tool_result_json: str) -> str | N
         if assumptions:
             lines.append("")
             lines.append(assumptions)
+
+    lines.append("")
+    lines.append(data.get("limits_footer", ""))
 
     return "\n".join(lines)
 

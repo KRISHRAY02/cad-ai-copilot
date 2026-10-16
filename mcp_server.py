@@ -54,15 +54,99 @@ _DEFAULT_MACHINE_TYPE = "CNC_3axis"
 _DEFAULT_SUPPLIER = "Supplier_A"
 
 # Default candidate orientations for generate_am_readiness_guide() when the
-# user doesn't name specific ones -- covers the part sitting as-modeled
-# plus a 90-degree tip about each horizontal axis and a full flip, a small
-# representative set rather than an exhaustive sweep.
+# user doesn't name specific ones -- the 6 axis-aligned build directions
+# (+Z/-Z/+X/-X/+Y/-Y facing up), expressed as "as-modeled" (+Z, no
+# rotation needed) plus the 5 rotations that put each other axis facing
+# up. "as-modeled" and "rotated 180" need no axis to disambiguate (a
+# straight flip gives the same -Z result regardless of which horizontal
+# axis it's phrased about -- see _parse_candidate_orientation()); the
+# remaining four each need a specific axis+sign to reach +X/-X/+Y/-Y.
+# compare_build_orientations() deduplicates by effective build direction,
+# so this list is never larger than 6 distinct results even though it has
+# 6 entries written out explicitly (no two of these happen to coincide,
+# but a caller-supplied candidate_orientations list might still include
+# an accidental duplicate, which the same dedup handles).
 _DEFAULT_AM_CANDIDATE_ORIENTATIONS = [
-    "as-modeled",
-    "rotated 90 about X",
-    "rotated 90 about Y",
-    "rotated 180",
+    "as-modeled",  # +Z facing up
+    "rotated 180",  # -Z facing up
+    "rotated 90 about X",  # +Y facing up
+    "rotated -90 about X",  # -Y facing up
+    "rotated -90 about Y",  # +X facing up
+    "rotated 90 about Y",  # -X facing up
 ]
+
+# How many top-ranked orientations generate_am_readiness_guide() surfaces
+# in its result (and the UI card / report section show), not just the
+# single winner -- lets the user see how close the runner-up(s) were.
+_AM_TOP_ORIENTATIONS_COUNT = 3
+
+# Qualitative severity label for each run_am_dfm_check() check name, used
+# by generate_am_readiness_guide()'s "printability_warnings" section.
+# This is NOT derived from any magnitude in the underlying data (the
+# overhang check is currently a binary flagged/pass) -- it's a fixed
+# per-check-type label so the guide can say *something* about how
+# seriously to take a given warning without inventing a numeric severity
+# score the geometry data doesn't actually support. Any check name not
+# listed here (e.g. a future check) falls back to _DEFAULT_AM_DFM_SEVERITY
+# rather than crashing.
+_AM_DFM_CHECK_SEVERITY = {
+    "overhang": "warning",
+}
+_DEFAULT_AM_DFM_SEVERITY = "warning"
+
+# Fixed, always-shown disclaimer for generate_am_readiness_guide() results
+# -- the guide's overhang/support-strategy analysis is real geometry, but
+# it is not a thermal/stress simulation and does not compute an actual
+# support material volume (nothing in this project measures printable
+# feature size or runs a real slicer), so every result carries this same
+# footer regardless of how confident the orientation/support numbers look.
+AM_GUIDE_LIMITS_FOOTER = (
+    "Support volume is an estimate. Thermal and stress behaviour are not "
+    "analysed. This is guidance, not a print approval."
+)
+
+# Latest generate_am_readiness_guide() result, keyed by the part file path
+# it was computed for -- read by report/generate_report.py to decide
+# whether to include an "Additive manufacturing readiness" section.
+# Deliberately a plain module-level dict (same "single adapter/session"
+# assumption as the `adapter` global above) rather than a cache keyed by
+# session/conversation id -- this app has no multi-session concept at the
+# MCP-server-process level. Never written to or read by anything other
+# than generate_am_readiness_guide() (write) and
+# get_last_am_guide_result_for_current_part() (read) below -- see that
+# function's docstring for how "discard it if the user opens a different
+# part" is implemented (compared at read time, not actively cleared).
+_last_am_guide_result: dict | None = None
+
+
+def get_last_am_guide_result_for_current_part() -> dict | None:
+    """Return the most recent generate_am_readiness_guide() result, but
+    ONLY if it was computed for the part that is currently open.
+
+    "Discarding" a stale result (the task requirement) is implemented by
+    comparing file paths at read time rather than by actively clearing
+    _last_am_guide_result when the user switches parts -- there's no
+    "part changed" event this module gets to hook; this is the one place
+    the open part's identity can be checked at the moment the cache is
+    actually used. If the user opens a different part since the guide
+    last ran, `adapter.get_current_part_info().file_path` no longer
+    matches the stored key and this returns None -- behaviorally
+    identical to the result having been discarded, since it's never
+    returned for the wrong part.
+
+    Returns None if no guide has ever run this session, if the adapter
+    can't report a current part (e.g. an assembly is open, or nothing
+    is open), or if the stored result is for a different part.
+    """
+    if _last_am_guide_result is None:
+        return None
+    try:
+        current_file_path = adapter.get_current_part_info().file_path
+    except Exception:
+        return None
+    if current_file_path != _last_am_guide_result["file_path"]:
+        return None
+    return _last_am_guide_result["result"]
 
 # The exact 4 material-selection questions recommend_am_material() needs --
 # shared by generate_am_readiness_guide()'s "ask the user" response so the
@@ -1110,9 +1194,9 @@ def generate_am_readiness_guide(
 
     Orientation and support strategy are pure geometric analysis and need
     no extra input from the user -- this tool computes them immediately
-    using `candidate_orientations` if the user named specific ones, or a
-    small representative default set otherwise ("as-modeled", "rotated 90
-    about X", "rotated 90 about Y", "rotated 180").
+    using `candidate_orientations` if the user named specific ones, or
+    the 6 axis-aligned build directions otherwise (+Z/-Z/+X/-X/+Y/-Y
+    facing up -- see _DEFAULT_AM_CANDIDATE_ORIENTATIONS).
 
     Material selection CANNOT be inferred from geometry (see
     recommend_am_material's docstring for why) -- it needs
@@ -1139,11 +1223,35 @@ def generate_am_readiness_guide(
                 "overhang_region_count", "reason"} -- the top-ranked entry
                 from compare_build_orientations, with an explicit reason
                 sentence citing the actual numbers,
-            "orientation_comparison": the full ranked list every candidate
-                orientation was compared against, for transparency,
+            "top_orientations": the top 3 ranked entries (fewer if fewer
+                than 3 distinct orientations were compared), each
+                {"orientation", "total_overhang_area_mm2",
+                "total_overhang_area_cm2", "overhang_region_count"} -- so
+                the caller can show the runner-up(s), not just the winner,
+            "orientation_comparison": the full ranked list every distinct
+                candidate orientation was compared against, for
+                transparency,
             "support_strategy": recommend_support_strategy()'s full result
                 for the best orientation (label + reasoning + measured
-                overhang data),
+                overhang data -- all areas, no volume figure),
+            "printability_warnings": real findings from run_am_dfm_check()
+                for the best orientation, for each check whose status was
+                "flagged" -- {"check", "detail", "severity"}. Empty list if
+                every check that actually ran came back "pass" (see
+                "checks_run" below) -- never fabricated.
+            "not_checked": checks run_am_dfm_check() reported as
+                "not_applicable" (not yet implemented, e.g.
+                min_feature_size/trapped_volume as of this version) --
+                {"check", "reason"}, so the guide is honest about what it
+                did NOT evaluate rather than silently omitting it.
+            "checks_run": names of the checks that actually produced a
+                flagged/pass result (i.e. excluding "not_checked" ones) --
+                for a caller to say "no issues found by the checks we run:
+                X, Y" when printability_warnings is empty, instead of a
+                bare "no issues" that implies more was checked than was.
+            "limits_footer": AM_GUIDE_LIMITS_FOOTER, included in every
+                result so a caller never has to remember to attach it
+                separately.
             "material_questions_pending": True if part_function/
                 load_bearing/temperature_exposure/priority weren't all
                 given this call,
@@ -1164,6 +1272,13 @@ def generate_am_readiness_guide(
     **Fusion 360 only** -- see recommend_am_material()'s docstring;
     returns found=False immediately if the currently active CAD platform
     isn't Fusion 360.
+
+    A successful (found=True) result is stored in-process, keyed by the
+    current part's file path, so report/generate_report.py can include an
+    "Additive manufacturing readiness" section reusing this exact result
+    -- see get_last_am_guide_result_for_current_part(). This tool never
+    runs as a side effect of generating a report; the report only reads
+    whatever this tool already computed earlier in the session.
     """
     if adapter.PLATFORM_ID != _FUSION_PLATFORM_ID:
         return {"found": False, "message": _am_tools_unavailable_message()}
@@ -1183,6 +1298,45 @@ def generate_am_readiness_guide(
     best = comparison[0]
     support_strategy = adapter.recommend_support_strategy(best["orientation"])
 
+    top_orientations = [
+        {
+            "orientation": entry["orientation"],
+            "total_overhang_area_mm2": entry["total_overhang_area_mm2"],
+            "total_overhang_area_cm2": round(entry["total_overhang_area_mm2"] / 100, 2),
+            "overhang_region_count": entry["overhang_region_count"],
+        }
+        for entry in comparison[:_AM_TOP_ORIENTATIONS_COUNT]
+    ]
+
+    try:
+        printability_findings = adapter.run_am_dfm_check(best["orientation"])
+    except (ValueError, NotImplementedError) as e:
+        printability_findings = []
+        printability_error = str(e)
+    else:
+        printability_error = None
+
+    printability_warnings = []
+    not_checked = []
+    checks_run = []
+    if printability_error is not None:
+        not_checked.append({"check": "printability", "reason": printability_error})
+    else:
+        for finding in printability_findings:
+            check = finding.get("check", "?")
+            status = finding.get("status")
+            if status == "flagged":
+                printability_warnings.append({
+                    "check": check,
+                    "detail": finding.get("message", ""),
+                    "severity": _AM_DFM_CHECK_SEVERITY.get(check, _DEFAULT_AM_DFM_SEVERITY),
+                })
+                checks_run.append(check)
+            elif status == "pass":
+                checks_run.append(check)
+            elif status == "not_applicable":
+                not_checked.append({"check": check, "reason": finding.get("message", "")})
+
     result = {
         "found": True,
         "best_orientation": {
@@ -1193,11 +1347,16 @@ def generate_am_readiness_guide(
                 f"'{best['orientation']}' has the least total overhang area "
                 f"({best['total_overhang_area_mm2']}mm^2 across "
                 f"{best['overhang_region_count']} region(s)) of the "
-                f"{len(orientations)} orientation(s) compared."
+                f"{len(comparison)} orientation(s) compared."
             ),
         },
+        "top_orientations": top_orientations,
         "orientation_comparison": comparison,
         "support_strategy": support_strategy,
+        "printability_warnings": printability_warnings,
+        "not_checked": not_checked,
+        "checks_run": checks_run,
+        "limits_footer": AM_GUIDE_LIMITS_FOOTER,
     }
 
     have_all_material_answers = (
@@ -1215,6 +1374,14 @@ def generate_am_readiness_guide(
     else:
         result["material_questions_pending"] = True
         result["material_questions_to_ask"] = list(_AM_MATERIAL_QUESTIONS)
+
+    global _last_am_guide_result
+    try:
+        current_file_path = adapter.get_current_part_info().file_path
+    except Exception:
+        current_file_path = None
+    if current_file_path is not None:
+        _last_am_guide_result = {"file_path": current_file_path, "result": result}
 
     return result
 

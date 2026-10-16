@@ -217,6 +217,101 @@ def _dfm_section(styles) -> list:
     return flowables
 
 
+def _am_readiness_section(styles, guide_result: dict) -> list:
+    """"Additive manufacturing readiness" section, built entirely from a
+    previously-computed generate_am_readiness_guide() result (see
+    mcp_server.get_last_am_guide_result_for_current_part()) -- this
+    function never calls the guide itself, per the explicit requirement
+    that a report never triggers AM analysis as a side effect of being
+    generated.
+
+    Reuses the same _table()/SectionHeading styling as every other
+    section so it reads as part of the same report, not a bolted-on
+    extra.
+    """
+    flowables = [Paragraph("Additive Manufacturing Readiness", styles["SectionHeading"])]
+
+    top_orientations = guide_result.get("top_orientations") or []
+    if top_orientations:
+        rows = [["Orientation", "Overhang area", "Overhang regions"]]
+        for entry in top_orientations:
+            rows.append(
+                [
+                    entry.get("orientation", "?"),
+                    f"{entry.get('total_overhang_area_cm2', 0):.1f} cm^2",
+                    str(entry.get("overhang_region_count", "?")),
+                ]
+            )
+        flowables.append(_table(rows, col_widths=[70 * mm, 55 * mm, 45 * mm]))
+
+    support = guide_result.get("support_strategy") or {}
+    if support:
+        flowables.append(Spacer(1, 8))
+        flowables.append(
+            Paragraph(
+                f"Support strategy (estimated): "
+                f"{support.get('recommended_support_strategy', '?').replace('_', ' ')}",
+                styles["Normal"],
+            )
+        )
+        if support.get("reasoning"):
+            flowables.append(Paragraph(support["reasoning"], styles["Note"]))
+
+    if not guide_result.get("material_questions_pending", True):
+        rec = guide_result.get("material_recommendation") or {}
+        recommendations = rec.get("recommendations", []) if isinstance(rec, dict) else []
+        if recommendations:
+            flowables.append(Spacer(1, 8))
+            flowables.append(Paragraph("Recommended materials", styles["Normal"]))
+            rows = [["Material", "Process", "Reason"]]
+            for m in recommendations:
+                rows.append(
+                    [
+                        m.get("material", "?"),
+                        m.get("process_type", "?"),
+                        m.get("reason", ""),
+                    ]
+                )
+            flowables.append(_table(rows, col_widths=[45 * mm, 35 * mm, 90 * mm]))
+            assumptions = rec.get("assumptions") if isinstance(rec, dict) else None
+            if assumptions:
+                flowables.append(Paragraph(assumptions, styles["Note"]))
+
+    warnings = guide_result.get("printability_warnings") or []
+    not_checked = guide_result.get("not_checked") or []
+    checks_run = guide_result.get("checks_run") or []
+    flowables.append(Spacer(1, 8))
+    flowables.append(Paragraph("Check before printing", styles["Normal"]))
+    if warnings:
+        rows = [["Check", "Severity", "Detail"]]
+        for w in warnings:
+            rows.append([w.get("check", "?"), w.get("severity", "warning"), w.get("detail", "")])
+        flowables.append(_table(rows, col_widths=[30 * mm, 25 * mm, 115 * mm]))
+    else:
+        checks_label = ", ".join(checks_run) if checks_run else "none"
+        flowables.append(
+            Paragraph(
+                f"No printability issues found by the checks we run ({checks_label}).",
+                styles["Normal"],
+            )
+        )
+    if not_checked:
+        for nc in not_checked:
+            flowables.append(
+                Paragraph(f"Not checked -- {nc.get('check', '?')}: {nc.get('reason', '')}", styles["Note"])
+            )
+
+    flowables.append(Spacer(1, 6))
+    flowables.append(
+        Paragraph(
+            guide_result.get("limits_footer", mcp_server.AM_GUIDE_LIMITS_FOOTER),
+            styles["Note"],
+        )
+    )
+
+    return flowables
+
+
 def _fmt(value, suffix: str = "") -> str:
     if value is None:
         return "N/A"
@@ -458,6 +553,19 @@ def generate_manufacturing_report(
     story += _cost_section(styles, manufacturing_process, quantity, process_is_default, quantity_is_default)
     story += _carbon_section(styles)
     story += _dfm_section(styles)
+
+    # Additive manufacturing readiness -- included ONLY if (a) Fusion 360
+    # is the active CAD platform and (b) generate_am_readiness_guide()
+    # already produced a result for THIS part earlier in the session (see
+    # mcp_server.get_last_am_guide_result_for_current_part()'s docstring
+    # for how "earlier result for a different part" is excluded). Never
+    # runs the guide itself -- if neither condition holds, the report is
+    # byte-for-byte what it was before this section existed: no
+    # placeholder, no empty heading.
+    if mcp_server.adapter.PLATFORM_ID == mcp_server._FUSION_PLATFORM_ID:
+        guide_result = mcp_server.get_last_am_guide_result_for_current_part()
+        if guide_result is not None:
+            story += _am_readiness_section(styles, guide_result)
 
     doc.build(story)
     return output_path

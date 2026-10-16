@@ -1204,9 +1204,15 @@ class CadAdapter(ABC):
         absolute overhang-area number should not be read as "square mm of
         support material needed".
 
-        Returns a list of dicts, one per candidate, ranked best (least
-        total overhang area) first, ties broken by fewer overhang
-        regions:
+        Candidates that resolve to the same effective build direction as
+        an earlier candidate in the list (e.g. "as-modeled" and a
+        Z-axis-only rotation, which never changes the build-up direction)
+        are skipped -- only the first candidate's label is kept for that
+        direction, so the ranking never shows the same real result twice.
+
+        Returns a list of dicts, one per distinct effective direction,
+        ranked best (least total overhang area) first, ties broken by
+        fewer overhang regions:
             {
                 "orientation": the candidate string as given,
                 "total_overhang_area_mm2": float,
@@ -1233,10 +1239,25 @@ class CadAdapter(ABC):
             )
 
         results = []
+        seen_effective_directions = set()
         for candidate in candidate_orientations:
             effective_up, flagged_indices, regions = _evaluate_overhangs_for_orientation(
                 faces, candidate, critical_angle_deg
             )
+            effective_up_rounded = tuple(round(c, 6) for c in effective_up)
+
+            # Two differently-worded candidates (e.g. the literal string
+            # "as-modeled" and a 360-degree/Z-axis rotation that leaves the
+            # build-up direction unchanged) can resolve to the exact same
+            # effective build direction -- skip the repeat rather than
+            # showing the same real result twice under two labels. Keeps
+            # the FIRST candidate's label (so "as-modeled" wins over an
+            # equivalent "rotated ..." form when both are in the list, see
+            # the default candidate set in mcp_server.py).
+            if effective_up_rounded in seen_effective_directions:
+                continue
+            seen_effective_directions.add(effective_up_rounded)
+
             total_area = sum(faces[i].area_mm2 for i in flagged_indices)
             region_count = len(regions)
 
@@ -1246,9 +1267,7 @@ class CadAdapter(ABC):
                     "total_overhang_area_mm2": round(total_area, 3),
                     "overhang_region_count": region_count,
                     "overhang_face_count": len(flagged_indices),
-                    "effective_build_direction": tuple(
-                        round(c, 6) for c in effective_up
-                    ),
+                    "effective_build_direction": effective_up_rounded,
                 }
             )
 

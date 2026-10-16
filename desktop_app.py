@@ -685,6 +685,7 @@ def _card_container(children: list[ft.Control]) -> ft.Container:
 
 COLOR_WARNING_TEXT = "#B26A00"
 COLOR_WARNING_ICON = "#B26A00"
+COLOR_WARNING_BG = "#FFF4E0"
 
 
 def build_material_warning_icon(material_name) -> ft.Icon:
@@ -1566,6 +1567,56 @@ def build_am_readiness_card(data: dict) -> ft.Control:
         border=ft.Border(bottom=ft.BorderSide(1, COLOR_AI_BORDER)),
     )
 
+    sections = [header, orientation_section]
+
+    # Top 3 (or fewer, if fewer distinct orientations were compared) --
+    # Krish's explicit request so a user can see how close the runner-up(s)
+    # were, not just trust the single winner blindly.
+    top_orientations = data.get("top_orientations") or []
+    if len(top_orientations) > 1:
+        rows = []
+        for i, entry in enumerate(top_orientations, start=1):
+            entry_region_count = entry.get("overhang_region_count", "?")
+            entry_label = "area" if entry_region_count == 1 else "areas"
+            rows.append(
+                ft.Row(
+                    [
+                        ft.Text(f"{i}.", size=12, color=COLOR_TIMESTAMP, width=16),
+                        ft.Text(
+                            _describe_orientation_plain(entry.get("orientation", "?")).capitalize(),
+                            size=12,
+                            color=COLOR_AI_TEXT,
+                            expand=True,
+                        ),
+                        ft.Text(
+                            f"{entry.get('total_overhang_area_cm2', 0):.0f} cm² / "
+                            f"{entry_region_count} {entry_label}",
+                            size=11,
+                            color=COLOR_TIMESTAMP,
+                        ),
+                    ],
+                    spacing=8,
+                )
+            )
+        sections.append(
+            ft.Container(
+                content=ft.Column(
+                    [
+                        ft.Text(
+                            "Top orientations compared",
+                            size=12,
+                            weight=ft.FontWeight.W_600,
+                            color=COLOR_TIMESTAMP,
+                        ),
+                        *rows,
+                    ],
+                    spacing=6,
+                ),
+                padding=pad_symmetric(horizontal=14, vertical=12),
+                border=ft.Border(bottom=ft.BorderSide(1, COLOR_AI_BORDER)),
+            )
+        )
+
     support_section = ft.Container(
         content=ft.Column(
             [
@@ -1573,7 +1624,7 @@ def build_am_readiness_card(data: dict) -> ft.Control:
                     [
                         ft.Icon(ft.Icons.CONSTRUCTION, size=18, color=COLOR_ACCENT),
                         ft.Text(
-                            "Support strategy",
+                            "Support strategy (estimated)",
                             size=12,
                             weight=ft.FontWeight.W_600,
                             color=COLOR_TIMESTAMP,
@@ -1600,8 +1651,65 @@ def build_am_readiness_card(data: dict) -> ft.Control:
         padding=pad_symmetric(horizontal=14, vertical=12),
         border=ft.Border(bottom=ft.BorderSide(1, COLOR_AI_BORDER)),
     )
+    sections.append(support_section)
 
-    sections = [header, orientation_section, support_section]
+    # "Check before printing" -- real run_am_dfm_check() findings for the
+    # best orientation, never fabricated. Amber to signal "read this
+    # before you print", not red/error (these are advisory, not failures).
+    warnings = data.get("printability_warnings") or []
+    not_checked = data.get("not_checked") or []
+    checks_run = data.get("checks_run") or []
+
+    printability_children = [
+        ft.Row(
+            [
+                ft.Icon(ft.Icons.WARNING_AMBER_ROUNDED, size=18, color=COLOR_WARNING_ICON),
+                ft.Text(
+                    "Check before printing",
+                    size=12,
+                    weight=ft.FontWeight.W_600,
+                    color=COLOR_WARNING_TEXT,
+                ),
+            ],
+            spacing=6,
+        ),
+    ]
+    if warnings:
+        for w in warnings:
+            printability_children.append(
+                ft.Text(
+                    f"[{w.get('severity', 'warning')}] {w.get('check', '?').replace('_', ' ').title()}: "
+                    f"{w.get('detail', '')}",
+                    size=12,
+                    color=COLOR_AI_TEXT,
+                )
+            )
+    else:
+        checks_label = ", ".join(c.replace("_", " ") for c in checks_run) if checks_run else "none"
+        printability_children.append(
+            ft.Text(
+                f"No printability issues found by the checks we run ({checks_label}).",
+                size=12,
+                color=COLOR_AI_TEXT,
+            )
+        )
+    if not_checked:
+        for nc in not_checked:
+            printability_children.append(
+                ft.Text(
+                    f"Not checked -- {nc.get('check', '?').replace('_', ' ').title()}: {nc.get('reason', '')}",
+                    size=11,
+                    color=COLOR_TIMESTAMP,
+                )
+            )
+    sections.append(
+        ft.Container(
+            content=ft.Column(printability_children, spacing=6),
+            bgcolor=COLOR_WARNING_BG,
+            padding=pad_symmetric(horizontal=14, vertical=12),
+            border=ft.Border(bottom=ft.BorderSide(1, COLOR_AI_BORDER)),
+        )
+    )
 
     if data.get("material_questions_pending"):
         questions = data.get("material_questions_to_ask", [])
@@ -1630,7 +1738,7 @@ def build_am_readiness_card(data: dict) -> ft.Control:
                 ),
                 bgcolor=COLOR_CHAT_BG,
                 padding=pad_symmetric(horizontal=14, vertical=12),
-                border_radius=CARD_BOTTOM_RADIUS,
+                border=ft.Border(bottom=ft.BorderSide(1, COLOR_AI_BORDER)),
             )
         )
     else:
@@ -1685,9 +1793,27 @@ def build_am_readiness_card(data: dict) -> ft.Control:
                     content=ft.Column(footer_children, spacing=4),
                     bgcolor=COLOR_CHAT_BG,
                     padding=pad_symmetric(horizontal=14, vertical=10),
-                    border_radius=CARD_BOTTOM_RADIUS,
+                    border=ft.Border(bottom=ft.BorderSide(1, COLOR_AI_BORDER)),
                 )
             )
+
+    # Fixed limits disclaimer, always the true last section of the card
+    # regardless of which branch above ran -- Krish's explicit requirement
+    # that every guide result carries this, not just the ones with a
+    # material recommendation.
+    sections.append(
+        ft.Container(
+            content=ft.Text(
+                data.get("limits_footer", mcp_server.AM_GUIDE_LIMITS_FOOTER),
+                size=10,
+                italic=True,
+                color=COLOR_TIMESTAMP,
+            ),
+            bgcolor=COLOR_CHAT_BG,
+            padding=pad_symmetric(horizontal=14, vertical=10),
+            border_radius=CARD_BOTTOM_RADIUS,
+        )
+    )
 
     return _card_container(sections)
 
