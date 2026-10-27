@@ -155,6 +155,11 @@ class ChatMessage:
     # still shows something sensible.
     structured_tool: str | None = None
     structured_data: dict | None = None
+    # This message's chat_db row id -- only needed by the am_material_question
+    # card (see build_bubble), which has to call back with the specific
+    # message to lock/update when its form is submitted. None for every
+    # other message type, which never needs to address itself by id.
+    id: int | None = None
 
 
 EXAMPLE_QUESTIONS = [
@@ -1493,64 +1498,230 @@ def build_what_if_overlay(page: ft.Page, original_data: dict, on_what_if_result)
     return overlay
 
 
-# (value, label) options for the AM-material-recommendation form's radio
-# groups -- value is exactly what recommend_am_material()/
-# _try_parse_am_material_answers expects, label is the plain-language
-# description shown to the user. Kept here (not imported from
-# am_material_advisor/ai_orchestrator) since these are UI-facing strings,
-# same separation as _WHAT_IF_RATE_FIELDS above.
-_AM_FORM_LOAD_BEARING_OPTIONS = [("Yes", "Yes"), ("No", "No")]
-_AM_FORM_TEMPERATURE_OPTIONS = [
-    ("Low", "Low -- room temperature / indoor use"),
-    ("Moderate", "Moderate -- e.g. near a motor, an enclosed outdoor housing in sun"),
-    ("High", "High -- e.g. near an engine/heat source, sustained hot environment"),
+# (value, label[, sublabel]) options for the AM-material-recommendation
+# card's chip groups -- value is exactly what recommend_am_material()/
+# _try_parse_am_material_answers expects (case-insensitive), label/
+# sublabel are the plain-language text shown to the user. Kept here (not
+# imported from am_material_advisor/ai_orchestrator) since these are
+# UI-facing strings, same separation as _WHAT_IF_RATE_FIELDS above.
+_AM_CARD_LOAD_BEARING_OPTIONS = [("Yes", "Yes"), ("No", "No")]
+_AM_CARD_TEMPERATURE_OPTIONS = [
+    ("Low", "Low", "room temperature, indoor use"),
+    ("Moderate", "Moderate", "near a motor, enclosed outdoor housing"),
+    ("High", "High", "near an engine or heat source, sustained hot environment"),
 ]
-_AM_FORM_PRIORITY_OPTIONS = [
-    ("Strength", "Strength"),
-    ("Cost", "Cost"),
-    ("Surface finish", "Surface finish"),
+_AM_CARD_PRIORITY_OPTIONS = [
+    ("Strength", "Strength", ft.Icons.FITNESS_CENTER),
+    ("Cost", "Cost", ft.Icons.PAYMENTS_OUTLINED),
+    ("Surface finish", "Surface finish", ft.Icons.AUTO_AWESOME_OUTLINED),
 ]
-_AM_FORM_PROCESS_OPTIONS = [
-    ("FDM", "FDM / FFF (filament)"),
-    ("SLA", "SLA (resin)"),
-    ("SLS", "SLS (powder, nylon)"),
-    ("MJF", "MJF (powder, nylon)"),
-    ("DMLS", "DMLS (metal powder-bed)"),
-    ("", "Not sure -- consider all processes"),
+_AM_CARD_PROCESS_OPTIONS = [
+    ("FDM", "FDM / FFF"),
+    ("SLA", "SLA"),
+    ("SLS", "SLS"),
+    ("MJF", "MJF"),
+    ("DMLS", "DMLS"),
+    ("", "No preference"),
 ]
+_AM_CARD_PROCESS_LABELS = dict(_AM_CARD_PROCESS_OPTIONS)
+
+AM_MATERIAL_QUESTION_CARD_MAX_WIDTH = 560
 
 
-def build_am_material_form_overlay(page: ft.Page, on_submit) -> ft.Container:
-    """Structured "what material should I 3D-print this in?" form -- lets
-    the user fill in recommend_am_material()'s four required answers (plus
-    the optional manufacturing_process filter) via a text box and radio
-    groups, instead of typing a free-text answer for the LLM to extract.
-
-    Why this exists (2026-10-27, Krish's request, same incident as
-    ai_orchestrator._try_parse_am_material_answers): even with that
-    regex-based parser, the user still has to know and type the exact
-    labeled-field shape it recognizes. A form makes the required shape
-    self-evident and makes a malformed/unparseable answer structurally
-    impossible -- every field is pre-constrained to a valid value, so
-    on_submit's constructed text is guaranteed to match
-    _try_parse_am_material_answers exactly.
-
-    Built as a plain page.overlay entry (Container scrim + centered card),
-    same pattern as build_what_if_overlay/show_platform_selector, for the
-    same documented reason: this project has a history in this Flet
-    environment of unreliable rendering for less battle-tested widgets
-    (ft.AlertDialog, ft.Tabs, ft.Dropdown). A "down arrow" dropdown was the
-    originally requested look, but RadioGroup is used instead -- same
-    fixed-choice selection behavior, already proven reliable elsewhere in
-    this file, without reintroducing a widget this environment has no
-    track record with.
-
-    `on_submit(structured_text: str)` is called with the constructed
-    labeled text block (not a dict) so the caller can just feed it through
-    the exact same send path as a normal typed chat message, reusing
-    _try_parse_am_material_answers' existing parsing/dispatch rather than
-    adding a second code path that calls the MCP tool directly.
+def _build_am_material_structured_text(answers: dict) -> str:
+    """Build the exact labeled text block
+    ai_orchestrator._try_parse_am_material_answers expects, from the chip
+    selections an answered am_material_question card stores. Every value
+    stored in `answers` already comes from the fixed option lists above,
+    so this can never produce a shape the parser fails to recognize --
+    unlike free-text extraction, there is no "did the model get this
+    right" step at all.
     """
+    lines = [
+        f"Part function: {answers.get('part_function', '')}",
+        f"Load bearing: {answers.get('load_bearing', '')}",
+        f"Temperature exposure: {answers.get('temperature_exposure', '')}",
+        f"Priority: {answers.get('priority', '')}",
+    ]
+    if answers.get("manufacturing_process"):
+        lines.append(f"Manufacturing process: {answers['manufacturing_process']}")
+    return "\n".join(lines)
+
+
+def _am_chip(
+    label: str,
+    selected: bool,
+    sublabel: str | None = None,
+    icon=None,
+    on_click=None,
+    interactive: bool = True,
+) -> ft.Container:
+    """One tappable (or, if `interactive` is False, read-only) chip for the
+    am_material_question card. Selected = filled accent + white text;
+    unselected = white with an accent outline; locked/read-only (answered
+    or skipped card) = flat grey, no border, with a small check icon
+    instead of a fill color, so a reopened conversation visibly reads as
+    "this was already decided" rather than "pick again".
+
+    No max_lines/ellipsis anywhere -- the sublabel (temperature chips) is
+    free to wrap onto a second/third line rather than being cut off, per
+    Krish's explicit requirement that nothing in this card ever clips.
+    """
+    if not interactive:
+        bgcolor, border, text_color, sub_color = COLOR_CHAT_BG, ft.Border.all(1, COLOR_AI_BORDER), COLOR_TIMESTAMP, COLOR_TIMESTAMP
+        prefix = ft.Icon(ft.Icons.CHECK_CIRCLE, size=14, color=COLOR_TIMESTAMP) if selected else None
+    elif selected:
+        bgcolor, border, text_color, sub_color = COLOR_ACCENT, None, "#FFFFFF", "#FFFFFF"
+        prefix = None
+    else:
+        bgcolor, border, text_color, sub_color = "#FFFFFF", ft.Border.all(1, COLOR_ACCENT), COLOR_AI_TEXT, COLOR_TIMESTAMP
+        prefix = None
+
+    if icon is not None:
+        prefix = ft.Icon(icon, size=16, color=text_color)
+
+    label_children = [ft.Text(label, size=13, weight=ft.FontWeight.W_600, color=text_color)]
+    if sublabel:
+        label_children.append(ft.Text(sublabel, size=11, color=sub_color))
+
+    row_children = []
+    if prefix is not None:
+        row_children.append(prefix)
+    row_children.append(ft.Column(label_children, spacing=2, tight=True))
+
+    return ft.Container(
+        content=ft.Row(row_children, spacing=8, tight=True, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        bgcolor=bgcolor,
+        border=border,
+        border_radius=12,
+        padding=pad_symmetric(horizontal=14, vertical=11),
+        ink=interactive,
+        on_click=on_click if interactive else None,
+    )
+
+
+def _am_locked_answers_view(answers: dict | None) -> ft.Control:
+    """Read-only chip summary for an answered am_material_question card --
+    shown instead of the interactive form once locked (submitted now, or
+    reloaded from a past conversation). `answers` is None only for the
+    "skipped" status (never answered before the conversation was left).
+    """
+    if not answers:
+        return ft.Container(
+            content=ft.Row(
+                [ft.Icon(ft.Icons.REMOVE_CIRCLE_OUTLINE, size=16, color=COLOR_TIMESTAMP),
+                 ft.Text("Skipped -- this question was not answered.", size=12, color=COLOR_TIMESTAMP)],
+                spacing=6,
+            ),
+        )
+
+    chips = [
+        _am_chip(f"Load-bearing: {answers.get('load_bearing', '?')}", True, interactive=False),
+        _am_chip(f"Temperature: {answers.get('temperature_exposure', '?')}", True, interactive=False),
+        _am_chip(f"Priority: {answers.get('priority', '?')}", True, interactive=False),
+        _am_chip(
+            f"Process: {_AM_CARD_PROCESS_LABELS.get(answers.get('manufacturing_process', ''), 'No preference') or 'No preference'}",
+            True, interactive=False,
+        ),
+    ]
+    return ft.Column(
+        [
+            ft.Text(answers.get("part_function", ""), size=13, color=COLOR_AI_TEXT),
+            ft.Row(chips, wrap=True, spacing=8, run_spacing=8),
+        ],
+        spacing=10,
+    )
+
+
+def build_am_material_question_card(
+    data: dict,
+    live: bool,
+    on_submit=None,
+    card_width: int = AM_MATERIAL_QUESTION_CARD_MAX_WIDTH,
+    page: ft.Page | None = None,
+) -> ft.Container:
+    """Inline chat-list card asking recommend_am_material()'s four required
+    questions (plus the optional manufacturing_process filter), replacing
+    the page.overlay popup this previously used (build_am_material_form_overlay,
+    removed 2026-10-28 per Krish's request) -- the card now scrolls with
+    the conversation and persists in chat_db like a normal message instead
+    of floating above it.
+
+    `data` is this message's structured_data: {"status": "pending" |
+    "answered" | "skipped", "answers": dict | None}. `live` is True only
+    for a card just posted in THIS running session that hasn't been
+    answered yet -- the single case where the interactive form (rather
+    than a locked read-only view) is shown. A reloaded past conversation
+    always passes live=False, so a never-answered card from history reads
+    as "Skipped" rather than inviting the user to answer a stale question
+    out of order (per Krish's explicit requirement).
+
+    `on_submit(answers: dict)` is called once, after the card has already
+    locked itself (so a second click is structurally impossible -- no
+    button exists anymore once this fires) -- see desktop_app.py's
+    handle_am_material_submit, which persists the answer and runs the
+    real recommend_am_material tool call.
+    """
+    status = data.get("status", "pending")
+    answers = data.get("answers")
+    interactive = live and status == "pending"
+
+    header = ft.Row(
+        [
+            ft.Container(
+                content=ft.Icon(ft.Icons.INVENTORY_2_OUTLINED, size=18, color="#FFFFFF"),
+                bgcolor=COLOR_ACCENT,
+                border_radius=100,
+                padding=8,
+                width=34,
+                height=34,
+                alignment=ft.Alignment(0, 0),
+            ),
+            ft.Column(
+                [
+                    ft.Text(
+                        "What material should this be printed in?",
+                        size=16,
+                        weight=ft.FontWeight.BOLD,
+                        color=COLOR_AI_TEXT,
+                    ),
+                    ft.Text(
+                        "Material depends on how the part is used, not its geometry. "
+                        "Your answers keep the recommendation grounded in real "
+                        "requirements.",
+                        size=12,
+                        color=COLOR_TIMESTAMP,
+                    ),
+                ],
+                spacing=2,
+                tight=True,
+                expand=True,
+            ),
+        ],
+        spacing=12,
+        vertical_alignment=ft.CrossAxisAlignment.START,
+    )
+
+    # Fade-in is handled by the shared wrapper Container build_bubble/
+    # add_bubble_animated already applies to every bubble (opacity 0 -> 1,
+    # ANIM_DURATION_MS) -- this card doesn't need its own separate opacity
+    # animation on top of that.
+    card_container = ft.Container(
+        bgcolor=COLOR_AI_BUBBLE,
+        border=ft.Border.all(1, COLOR_AI_BORDER),
+        border_radius=16,
+        padding=pad_all(20),
+        width=card_width,
+        shadow=ft.BoxShadow(spread_radius=0, blur_radius=6, color="#14000000", offset=ft.Offset(0, 2)),
+    )
+
+    if not interactive:
+        card_container.content = ft.Column(
+            [header, _am_locked_answers_view(answers)], spacing=16, tight=True
+        )
+        return card_container
+
+    # -- interactive branch below: only reached for a live, still-pending card --
     part_function_field = ft.TextField(
         label="What does this part do?",
         hint_text='e.g. "mounting bracket for a camera", "gasket", "enclosure lid"',
@@ -1559,136 +1730,213 @@ def build_am_material_form_overlay(page: ft.Page, on_submit) -> ft.Container:
         max_lines=4,
         content_padding=pad_symmetric(horizontal=12, vertical=8),
     )
-    load_bearing_group = ft.RadioGroup(
-        content=ft.Column(
-            [ft.Radio(value=v, label=l) for v, l in _AM_FORM_LOAD_BEARING_OPTIONS],
-            spacing=4,
-        ),
-        value=_AM_FORM_LOAD_BEARING_OPTIONS[0][0],
-    )
-    temperature_group = ft.RadioGroup(
-        content=ft.Column(
-            [ft.Radio(value=v, label=l) for v, l in _AM_FORM_TEMPERATURE_OPTIONS],
-            spacing=4,
-        ),
-        value=_AM_FORM_TEMPERATURE_OPTIONS[0][0],
-    )
-    priority_group = ft.RadioGroup(
-        content=ft.Column(
-            [ft.Radio(value=v, label=l) for v, l in _AM_FORM_PRIORITY_OPTIONS],
-            spacing=4,
-        ),
-        value=_AM_FORM_PRIORITY_OPTIONS[0][0],
-    )
-    process_group = ft.RadioGroup(
-        content=ft.Column(
-            [ft.Radio(value=v, label=l) for v, l in _AM_FORM_PROCESS_OPTIONS],
-            spacing=4,
-        ),
-        value=_AM_FORM_PROCESS_OPTIONS[-1][0],
-    )
-    error_text = ft.Text("", size=12, color=COLOR_ERROR_TEXT)
+    selection = {
+        "load_bearing": None,
+        "temperature_exposure": None,
+        "priority": None,
+        "manufacturing_process": "",  # optional -- "No preference" pre-selected
+    }
+    submitted = {"done": False}
 
-    def on_close(e: ft.ControlEvent) -> None:
-        if overlay in page.overlay:
-            page.overlay.remove(overlay)
-        page.update()
+    load_bearing_row = ft.Row(wrap=True, spacing=8, run_spacing=8)
+    temperature_row = ft.Row(wrap=True, spacing=8, run_spacing=8)
+    priority_row = ft.Row(wrap=True, spacing=8, run_spacing=8)
+    process_row = ft.Row(wrap=True, spacing=8, run_spacing=8)
 
-    async def on_get_recommendation(e: ft.ControlEvent) -> None:
-        part_function = (part_function_field.value or "").strip()
-        if not part_function:
-            error_text.value = "Describe what this part does first."
-            page.update()
-            return
-
-        lines = [
-            f"Part function: {part_function}",
-            f"Load bearing: {load_bearing_group.value}",
-            f"Temperature exposure: {temperature_group.value}",
-            f"Priority: {priority_group.value}",
-        ]
-        if process_group.value:
-            lines.append(f"Manufacturing process: {process_group.value}")
-        structured_text = "\n".join(lines)
-
-        if overlay in page.overlay:
-            page.overlay.remove(overlay)
-        page.update()
-
-        await on_submit(structured_text)
-
+    submit_text = ft.Text("Get recommendation", size=14, weight=ft.FontWeight.W_600, color="#FFFFFF")
     submit_btn = ft.Container(
-        content=ft.Text(
-            "Get recommendation", size=13, weight=ft.FontWeight.W_600, color="#FFFFFF"
-        ),
-        bgcolor=COLOR_ACCENT,
-        border_radius=8,
-        padding=pad_symmetric(horizontal=16, vertical=10),
+        content=submit_text,
+        height=44,
+        border_radius=10,
         alignment=ft.Alignment(0, 0),
-        ink=True,
-        on_click=on_get_recommendation,
-    )
-    cancel_btn = ft.Container(
-        content=ft.Text("Cancel", size=13, weight=ft.FontWeight.W_600, color=COLOR_TIMESTAMP),
-        border=ft.Border.all(1, COLOR_SIDEBAR_DIVIDER),
-        border_radius=8,
-        padding=pad_symmetric(horizontal=16, vertical=10),
-        alignment=ft.Alignment(0, 0),
-        ink=True,
-        on_click=on_close,
+        expand=True,
     )
 
-    popup_card = ft.Container(
+    def update_submit_state() -> None:
+        ready = (
+            selection["load_bearing"] is not None
+            and selection["temperature_exposure"] is not None
+            and selection["priority"] is not None
+        )
+        if ready:
+            submit_btn.bgcolor = COLOR_ACCENT
+            submit_btn.ink = True
+            submit_btn.on_click = on_submit_click
+        else:
+            submit_btn.bgcolor = COLOR_SIDEBAR_DIVIDER
+            submit_btn.ink = False
+            submit_btn.on_click = None
+
+    def refresh_load_bearing() -> None:
+        load_bearing_row.controls = [
+            _am_chip(label, selection["load_bearing"] == value, on_click=lambda e, v=value: select("load_bearing", v))
+            for value, label in _AM_CARD_LOAD_BEARING_OPTIONS
+        ]
+
+    def refresh_temperature() -> None:
+        temperature_row.controls = [
+            _am_chip(
+                label, selection["temperature_exposure"] == value, sublabel,
+                on_click=lambda e, v=value: select("temperature_exposure", v),
+            )
+            for value, label, sublabel in _AM_CARD_TEMPERATURE_OPTIONS
+        ]
+
+    def refresh_priority() -> None:
+        priority_row.controls = [
+            _am_chip(
+                label, selection["priority"] == value, icon=icon,
+                on_click=lambda e, v=value: select("priority", v),
+            )
+            for value, label, icon in _AM_CARD_PRIORITY_OPTIONS
+        ]
+
+    def refresh_process() -> None:
+        process_row.controls = [
+            _am_chip(
+                label, selection["manufacturing_process"] == value,
+                on_click=lambda e, v=value: select("manufacturing_process", v),
+            )
+            for value, label in _AM_CARD_PROCESS_OPTIONS
+        ]
+
+    def select(key: str, value) -> None:
+        selection[key] = value
+        {
+            "load_bearing": refresh_load_bearing,
+            "temperature_exposure": refresh_temperature,
+            "priority": refresh_priority,
+            "manufacturing_process": refresh_process,
+        }[key]()
+        update_submit_state()
+        if page is not None:
+            page.update()
+
+    def on_part_function_change(e: ft.ControlEvent) -> None:
+        update_submit_state()
+        if page is not None:
+            page.update()
+
+    part_function_field.on_change = on_part_function_change
+
+    async def on_submit_click(e: ft.ControlEvent) -> None:
+        if submitted["done"]:
+            return
+        if not (
+            selection["load_bearing"]
+            and selection["temperature_exposure"]
+            and selection["priority"]
+        ):
+            return
+        submitted["done"] = True
+
+        answers = {
+            "part_function": (part_function_field.value or "").strip(),
+            "load_bearing": selection["load_bearing"],
+            "temperature_exposure": selection["temperature_exposure"],
+            "priority": selection["priority"],
+            "manufacturing_process": selection["manufacturing_process"],
+        }
+
+        # Lock the card in place -- swap this same Container's content to
+        # the read-only view, so a second click is structurally impossible
+        # (no button exists in the tree anymore) rather than merely
+        # discouraged by the `submitted` guard above.
+        card_container.content = ft.Column(
+            [header, _am_locked_answers_view(answers)], spacing=16, tight=True
+        )
+        if page is not None:
+            page.update()
+
+        if on_submit is not None:
+            await on_submit(answers)
+
+    refresh_load_bearing()
+    refresh_temperature()
+    refresh_priority()
+    refresh_process()
+    update_submit_state()
+
+    def section(title: str, control: ft.Control) -> ft.Column:
+        return ft.Column(
+            [ft.Text(title, size=12, weight=ft.FontWeight.W_600, color=COLOR_AI_TEXT), control],
+            spacing=8,
+        )
+
+    card_container.content = ft.Column(
+        [
+            header,
+            part_function_field,
+            section("Load-bearing?", load_bearing_row),
+            section("Temperature exposure", temperature_row),
+            section("What matters most?", priority_row),
+            section("Manufacturing process (optional)", process_row),
+            submit_btn,
+        ],
+        spacing=16,
+        tight=True,
+    )
+    return card_container
+
+
+def build_am_material_recommendation_card(data: dict) -> ft.Control:
+    """recommend_am_material()'s result as a card -- one short row per
+    material (name, process, one-line reason) instead of the plain-text
+    fallback repeating the same boilerplate clause for every material in
+    one run-on, potentially clipped paragraph. Pure formatting change: the
+    ranking/data come from `data` exactly as recommend_am_material()
+    returned them -- nothing here re-sorts or re-filters.
+    """
+    header = _card_header("AM Material Recommendation")
+
+    meta_parts = [
+        f"Load-bearing: {'Yes' if data.get('load_bearing') else 'No'}",
+        f"Temperature: {str(data.get('temperature_exposure', '?')).capitalize()}",
+        f"Priority: {str(data.get('priority', '?')).replace('_', ' ').capitalize()}",
+    ]
+    if data.get("manufacturing_process"):
+        meta_parts.append(f"Process: {data['manufacturing_process']}")
+    meta = ft.Container(
         content=ft.Column(
             [
-                ft.Text(
-                    "What material should this be printed in?",
-                    size=18,
-                    weight=ft.FontWeight.BOLD,
-                    color=COLOR_AI_TEXT,
-                ),
-                ft.Text(
-                    "Material choice depends on how the part is used, not its "
-                    "geometry -- answer these so the recommendation is grounded "
-                    "in your real requirements, not a guess.",
-                    size=12,
-                    color=COLOR_TIMESTAMP,
-                ),
-                part_function_field,
-                ft.Text("Load-bearing?", size=12, weight=ft.FontWeight.W_600, color=COLOR_AI_TEXT),
-                load_bearing_group,
-                ft.Text(
-                    "Temperature exposure", size=12, weight=ft.FontWeight.W_600, color=COLOR_AI_TEXT
-                ),
-                temperature_group,
-                ft.Text(
-                    "What matters most?", size=12, weight=ft.FontWeight.W_600, color=COLOR_AI_TEXT
-                ),
-                priority_group,
-                ft.Text(
-                    "Manufacturing process (optional)",
-                    size=12,
-                    weight=ft.FontWeight.W_600,
-                    color=COLOR_AI_TEXT,
-                ),
-                process_group,
-                error_text,
-                ft.Row([submit_btn, cancel_btn], spacing=10),
+                ft.Text(data.get("part_function", ""), size=12, color=COLOR_AI_TEXT),
+                ft.Text(" | ".join(meta_parts), size=11, color=COLOR_TIMESTAMP),
             ],
-            spacing=10,
-            tight=True,
-            scroll=ft.ScrollMode.AUTO,
+            spacing=2,
         ),
-        bgcolor=COLOR_AI_BUBBLE,
-        border_radius=16,
-        padding=pad_all(24),
-        width=460,
-        height=640,
-        shadow=ft.BoxShadow(spread_radius=0, blur_radius=24, color="#40000000", offset=ft.Offset(0, 8)),
+        bgcolor=COLOR_CHAT_BG,
+        padding=pad_symmetric(horizontal=14, vertical=10),
+        border=ft.Border(bottom=ft.BorderSide(1, COLOR_AI_BORDER)),
     )
 
-    overlay = ft.Container(content=popup_card, alignment=ft.Alignment(0, 0), expand=True, bgcolor="#B3000000")
-    return overlay
+    rows = []
+    for i, rec in enumerate(data.get("recommendations", []), start=1):
+        rows.append(
+            ft.Container(
+                content=ft.Column(
+                    [
+                        ft.Text(
+                            f"{i}. {rec['material']}  ({rec['process_type']})",
+                            size=13, weight=ft.FontWeight.BOLD, color=COLOR_AI_TEXT,
+                        ),
+                        ft.Text(rec["reason"], size=12, color=COLOR_TIMESTAMP),
+                    ],
+                    spacing=2,
+                ),
+                bgcolor="#FFFFFF",
+                padding=pad_symmetric(horizontal=14, vertical=10),
+                border=ft.Border(bottom=ft.BorderSide(1, COLOR_AI_BORDER)),
+            )
+        )
+
+    footer = ft.Container(
+        content=ft.Text(data.get("assumptions", ""), size=10, italic=True, color=COLOR_TIMESTAMP),
+        bgcolor=COLOR_CHAT_BG,
+        padding=pad_symmetric(horizontal=14, vertical=10),
+        border_radius=CARD_BOTTOM_RADIUS,
+    )
+
+    return _card_container([header, meta, *rows, footer])
 
 
 _SUPPORT_STRATEGY_CHIP_COLORS = {
@@ -2030,11 +2278,22 @@ STRUCTURED_CARD_BUILDERS = {
     "estimate_cost": build_cost_breakdown_card,
     "list_assembly_components": build_component_listing_view,
     "generate_am_readiness_guide": build_am_readiness_card,
+    "recommend_am_material": build_am_material_recommendation_card,
+    # am_material_question's structured_data has no "found" key (it isn't
+    # a tool result at all, just this card's own pending/answered/skipped
+    # state) -- build_bubble's found-gated lookup below is bypassed for
+    # this one tool name specifically, see the comment there.
+    "am_material_question": build_am_material_question_card,
 }
 
 
 def build_bubble(
-    message: ChatMessage, page_width_hint: int, on_what_if_result=None
+    message: ChatMessage,
+    page_width_hint: int,
+    on_what_if_result=None,
+    on_am_material_submit=None,
+    live: bool = False,
+    page: ft.Page | None = None,
 ) -> ft.Container:
     is_user = message.role == "user"
     is_error = message.role == "error"
@@ -2055,10 +2314,20 @@ def build_bubble(
         # only ever restates what the card already shows).
         # estimate_cost's card is the only one that needs on_what_if_result
         # (its "What if..." button posts a new scenario back into this same
-        # chat -- see post_what_if_result) -- every other builder still
-        # takes just the structured data.
+        # chat -- see post_what_if_result); am_material_question needs
+        # live/on_am_material_submit/a pixel width cap instead -- every
+        # other builder still takes just the structured data.
         if message.structured_tool == "estimate_cost":
             bubble = card_builder(message.structured_data, on_what_if_result)
+        elif message.structured_tool == "am_material_question":
+            message_id = message.id
+
+            async def _submit(answers: dict) -> None:
+                if on_am_material_submit is not None:
+                    await on_am_material_submit(message_id, answers)
+
+            card_width = min(AM_MATERIAL_QUESTION_CARD_MAX_WIDTH, int(page_width_hint * 0.92))
+            bubble = card_builder(message.structured_data, live, _submit, card_width, page)
         else:
             bubble = card_builder(message.structured_data)
         bubble_max_width_ratio = 0.92
@@ -2535,8 +2804,15 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
 
     message_input.on_change = update_send_button_state
 
-    async def add_bubble_animated(message: ChatMessage) -> None:
-        row = build_bubble(message, bubble_width_hint(), on_what_if_result=post_what_if_result)
+    async def add_bubble_animated(message: ChatMessage, live: bool = False) -> None:
+        row = build_bubble(
+            message,
+            bubble_width_hint(),
+            on_what_if_result=post_what_if_result,
+            on_am_material_submit=handle_am_material_submit,
+            live=live,
+            page=page,
+        )
         chat_list.controls.append(row)
         page.update()
         await asyncio.sleep(0.02)
@@ -2749,10 +3025,13 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
             row = build_bubble(
                 ChatMessage(
                     m.role, m.content, chat_db.relative_time(m.created_at),
-                    m.structured_tool, m.structured_data,
+                    m.structured_tool, m.structured_data, id=m.id,
                 ),
                 bubble_width_hint(),
                 on_what_if_result=post_what_if_result,
+                # live=False (default) -- a reloaded am_material_question
+                # card always shows its locked view (answered chips, or
+                # "Skipped" if it never was), never the interactive form.
             )
             animated = row.data
             animated.opacity = 1
@@ -2807,6 +3086,111 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
         finally:
             state["is_sending"] = False
 
+    async def _post_am_material_question(user_text: str) -> None:
+        """Posts the user's question, then an am_material_question card as
+        the assistant's reply -- an inline chat-list message (scrolls with
+        the conversation, saved to chat_db) instead of the page.overlay
+        popup this replaced. See build_am_material_question_card's
+        docstring for the card itself; this just handles getting it into
+        the chat and persisted.
+        """
+        if state["is_sending"]:
+            return
+        state["is_sending"] = True
+        message_input.disabled = True
+        send_button.disabled = True
+        page.update()
+
+        try:
+            is_first_message = state["conversation_id"] is None
+            if is_first_message:
+                state["conversation_id"] = chat_db.create_conversation(state["user_id"])
+                chat_db.set_conversation_title(state["conversation_id"], chat_db.make_title(user_text))
+
+            conversation_id = state["conversation_id"]
+            chat_db.add_message(conversation_id, "user", user_text)
+            empty_state.visible = False
+            await add_bubble_animated(ChatMessage("user", user_text, timestamp_now()))
+
+            message_input.value = ""
+            page.update()
+
+            card_data = {"status": "pending", "answers": None}
+            card_content = "What material should this be printed in?"
+            message_id = chat_db.add_message(
+                conversation_id, "ai", card_content, "am_material_question", card_data
+            )
+            await add_bubble_animated(
+                ChatMessage(
+                    "ai", card_content, timestamp_now(),
+                    "am_material_question", card_data, id=message_id,
+                ),
+                live=True,
+            )
+            render_sidebar()
+        finally:
+            message_input.disabled = False
+            state["is_sending"] = False
+            page.update()
+
+    async def handle_am_material_submit(message_id: int, answers: dict) -> None:
+        """Called once an am_material_question card is submitted (see
+        build_am_material_question_card's on_submit) -- the card has
+        already locked itself visually by this point; this persists that
+        answer, runs the real recommend_am_material tool call with it (the
+        exact same structured-text path a typed answer would have taken,
+        so _try_parse_am_material_answers/the ranking logic are untouched),
+        and posts the result as the next assistant message. Mirrors
+        _send_and_await_reply's loading-row/to_thread/conversation-switch-
+        guard pattern.
+        """
+        if state["is_sending"]:
+            return
+        conversation_id = state["conversation_id"]
+        if conversation_id is None:
+            return
+
+        state["is_sending"] = True
+        message_input.disabled = True
+        send_button.disabled = True
+        page.update()
+
+        chat_db.update_message_structured_data(
+            message_id, "am_material_question", {"status": "answered", "answers": answers}
+        )
+
+        structured_text = _build_am_material_structured_text(answers)
+
+        loading_row = build_loading_row()
+        chat_list.controls.append(loading_row)
+        page.update()
+
+        structured_tool: str | None = None
+        structured_data: dict | None = None
+        try:
+            answer, structured_tool, structured_data = await asyncio.to_thread(
+                run_ai_orchestrator_with_data, structured_text, fusion_mode_radio_group.value
+            )
+            role = "ai"
+        except Exception as exc:  # last-resort UI-side guard; orchestrator never raises
+            answer = f"Unexpected error: {exc}"
+            role = "error"
+
+        chat_db.add_message(conversation_id, role, answer, structured_tool, structured_data)
+
+        if state["conversation_id"] == conversation_id:
+            if loading_row in chat_list.controls:
+                chat_list.controls.remove(loading_row)
+            await add_bubble_animated(
+                ChatMessage(role, answer, timestamp_now(), structured_tool, structured_data)
+            )
+
+        message_input.disabled = False
+        state["is_sending"] = False
+        page.update()
+        render_sidebar()
+        await message_input.focus()
+
     async def send_message(e: ft.ControlEvent) -> None:
         text = message_input.value.strip() if message_input.value else ""
         if not text or state["is_sending"]:
@@ -2814,21 +3198,13 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
 
         # Fusion-only, same gate recommend_am_material() itself enforces
         # (mcp_server.py) -- on a SolidWorks session this would only ever
-        # return found=False, so don't interrupt the user with a form the
+        # return found=False, so don't interrupt the user with a card the
         # backend can't honor; let it fall through to the normal chat path,
         # which already surfaces that "AM tools unavailable" message.
         if state.get("platform") == PLATFORM_FUSION and looks_like_am_material_recommendation_request(
             text
         ):
-            message_input.value = ""
-            page.update()
-
-            async def _on_form_submit(structured_text: str) -> None:
-                await _send_text(structured_text)
-
-            overlay = build_am_material_form_overlay(page, _on_form_submit)
-            page.overlay.append(overlay)
-            page.update()
+            await _post_am_material_question(text)
             return
 
         await _send_text(text)

@@ -218,9 +218,16 @@ def add_message(
     content: str,
     structured_tool: str | None = None,
     structured_data: dict | None = None,
-) -> None:
+) -> int:
+    """Returns the inserted row's id -- needed by the am_material_question
+    card (desktop_app.py), which has to address this specific message
+    again later via update_message_structured_data() once its form is
+    answered. Every other existing caller already ignored the return
+    value (add_message was previously -> None), so this is purely
+    additive.
+    """
     with _connect() as conn:
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO messages "
             "(conversation_id, role, content, created_at, structured_tool, structured_data) "
             "VALUES (?, ?, ?, ?, ?, ?)",
@@ -232,6 +239,24 @@ def add_message(
                 structured_tool,
                 json.dumps(structured_data) if structured_data is not None else None,
             ),
+        )
+        return cur.lastrowid
+
+
+def update_message_structured_data(
+    message_id: int, structured_tool: str, structured_data: dict
+) -> None:
+    """Update an existing message's structured_tool/structured_data in
+    place -- used by desktop_app.py's am_material_question card to record
+    that a card was answered (status "pending" -> "answered", answers
+    filled in) without creating a new message row, so a reopened
+    conversation finds the same card already locked rather than seeing a
+    duplicate.
+    """
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE messages SET structured_tool = ?, structured_data = ? WHERE id = ?",
+            (structured_tool, json.dumps(structured_data), message_id),
         )
 
 
