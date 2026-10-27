@@ -26,6 +26,7 @@ from ai_orchestrator import (
     DEFAULT_MODEL,
     AiOrchestrator,
     McpServerUnavailableError,
+    looks_like_am_material_recommendation_request,
     run_ai_orchestrator_with_data,
     _describe_orientation_plain,
     _SUPPORT_STRATEGY_PLAIN_LANGUAGE,
@@ -1492,6 +1493,204 @@ def build_what_if_overlay(page: ft.Page, original_data: dict, on_what_if_result)
     return overlay
 
 
+# (value, label) options for the AM-material-recommendation form's radio
+# groups -- value is exactly what recommend_am_material()/
+# _try_parse_am_material_answers expects, label is the plain-language
+# description shown to the user. Kept here (not imported from
+# am_material_advisor/ai_orchestrator) since these are UI-facing strings,
+# same separation as _WHAT_IF_RATE_FIELDS above.
+_AM_FORM_LOAD_BEARING_OPTIONS = [("Yes", "Yes"), ("No", "No")]
+_AM_FORM_TEMPERATURE_OPTIONS = [
+    ("Low", "Low -- room temperature / indoor use"),
+    ("Moderate", "Moderate -- e.g. near a motor, an enclosed outdoor housing in sun"),
+    ("High", "High -- e.g. near an engine/heat source, sustained hot environment"),
+]
+_AM_FORM_PRIORITY_OPTIONS = [
+    ("Strength", "Strength"),
+    ("Cost", "Cost"),
+    ("Surface finish", "Surface finish"),
+]
+_AM_FORM_PROCESS_OPTIONS = [
+    ("FDM", "FDM / FFF (filament)"),
+    ("SLA", "SLA (resin)"),
+    ("SLS", "SLS (powder, nylon)"),
+    ("MJF", "MJF (powder, nylon)"),
+    ("DMLS", "DMLS (metal powder-bed)"),
+    ("", "Not sure -- consider all processes"),
+]
+
+
+def build_am_material_form_overlay(page: ft.Page, on_submit) -> ft.Container:
+    """Structured "what material should I 3D-print this in?" form -- lets
+    the user fill in recommend_am_material()'s four required answers (plus
+    the optional manufacturing_process filter) via a text box and radio
+    groups, instead of typing a free-text answer for the LLM to extract.
+
+    Why this exists (2026-10-27, Krish's request, same incident as
+    ai_orchestrator._try_parse_am_material_answers): even with that
+    regex-based parser, the user still has to know and type the exact
+    labeled-field shape it recognizes. A form makes the required shape
+    self-evident and makes a malformed/unparseable answer structurally
+    impossible -- every field is pre-constrained to a valid value, so
+    on_submit's constructed text is guaranteed to match
+    _try_parse_am_material_answers exactly.
+
+    Built as a plain page.overlay entry (Container scrim + centered card),
+    same pattern as build_what_if_overlay/show_platform_selector, for the
+    same documented reason: this project has a history in this Flet
+    environment of unreliable rendering for less battle-tested widgets
+    (ft.AlertDialog, ft.Tabs, ft.Dropdown). A "down arrow" dropdown was the
+    originally requested look, but RadioGroup is used instead -- same
+    fixed-choice selection behavior, already proven reliable elsewhere in
+    this file, without reintroducing a widget this environment has no
+    track record with.
+
+    `on_submit(structured_text: str)` is called with the constructed
+    labeled text block (not a dict) so the caller can just feed it through
+    the exact same send path as a normal typed chat message, reusing
+    _try_parse_am_material_answers' existing parsing/dispatch rather than
+    adding a second code path that calls the MCP tool directly.
+    """
+    part_function_field = ft.TextField(
+        label="What does this part do?",
+        hint_text='e.g. "mounting bracket for a camera", "gasket", "enclosure lid"',
+        multiline=True,
+        min_lines=2,
+        max_lines=4,
+        content_padding=pad_symmetric(horizontal=12, vertical=8),
+    )
+    load_bearing_group = ft.RadioGroup(
+        content=ft.Column(
+            [ft.Radio(value=v, label=l) for v, l in _AM_FORM_LOAD_BEARING_OPTIONS],
+            spacing=4,
+        ),
+        value=_AM_FORM_LOAD_BEARING_OPTIONS[0][0],
+    )
+    temperature_group = ft.RadioGroup(
+        content=ft.Column(
+            [ft.Radio(value=v, label=l) for v, l in _AM_FORM_TEMPERATURE_OPTIONS],
+            spacing=4,
+        ),
+        value=_AM_FORM_TEMPERATURE_OPTIONS[0][0],
+    )
+    priority_group = ft.RadioGroup(
+        content=ft.Column(
+            [ft.Radio(value=v, label=l) for v, l in _AM_FORM_PRIORITY_OPTIONS],
+            spacing=4,
+        ),
+        value=_AM_FORM_PRIORITY_OPTIONS[0][0],
+    )
+    process_group = ft.RadioGroup(
+        content=ft.Column(
+            [ft.Radio(value=v, label=l) for v, l in _AM_FORM_PROCESS_OPTIONS],
+            spacing=4,
+        ),
+        value=_AM_FORM_PROCESS_OPTIONS[-1][0],
+    )
+    error_text = ft.Text("", size=12, color=COLOR_ERROR_TEXT)
+
+    def on_close(e: ft.ControlEvent) -> None:
+        if overlay in page.overlay:
+            page.overlay.remove(overlay)
+        page.update()
+
+    async def on_get_recommendation(e: ft.ControlEvent) -> None:
+        part_function = (part_function_field.value or "").strip()
+        if not part_function:
+            error_text.value = "Describe what this part does first."
+            page.update()
+            return
+
+        lines = [
+            f"Part function: {part_function}",
+            f"Load bearing: {load_bearing_group.value}",
+            f"Temperature exposure: {temperature_group.value}",
+            f"Priority: {priority_group.value}",
+        ]
+        if process_group.value:
+            lines.append(f"Manufacturing process: {process_group.value}")
+        structured_text = "\n".join(lines)
+
+        if overlay in page.overlay:
+            page.overlay.remove(overlay)
+        page.update()
+
+        await on_submit(structured_text)
+
+    submit_btn = ft.Container(
+        content=ft.Text(
+            "Get recommendation", size=13, weight=ft.FontWeight.W_600, color="#FFFFFF"
+        ),
+        bgcolor=COLOR_ACCENT,
+        border_radius=8,
+        padding=pad_symmetric(horizontal=16, vertical=10),
+        alignment=ft.Alignment(0, 0),
+        ink=True,
+        on_click=on_get_recommendation,
+    )
+    cancel_btn = ft.Container(
+        content=ft.Text("Cancel", size=13, weight=ft.FontWeight.W_600, color=COLOR_TIMESTAMP),
+        border=ft.Border.all(1, COLOR_SIDEBAR_DIVIDER),
+        border_radius=8,
+        padding=pad_symmetric(horizontal=16, vertical=10),
+        alignment=ft.Alignment(0, 0),
+        ink=True,
+        on_click=on_close,
+    )
+
+    popup_card = ft.Container(
+        content=ft.Column(
+            [
+                ft.Text(
+                    "What material should this be printed in?",
+                    size=18,
+                    weight=ft.FontWeight.BOLD,
+                    color=COLOR_AI_TEXT,
+                ),
+                ft.Text(
+                    "Material choice depends on how the part is used, not its "
+                    "geometry -- answer these so the recommendation is grounded "
+                    "in your real requirements, not a guess.",
+                    size=12,
+                    color=COLOR_TIMESTAMP,
+                ),
+                part_function_field,
+                ft.Text("Load-bearing?", size=12, weight=ft.FontWeight.W_600, color=COLOR_AI_TEXT),
+                load_bearing_group,
+                ft.Text(
+                    "Temperature exposure", size=12, weight=ft.FontWeight.W_600, color=COLOR_AI_TEXT
+                ),
+                temperature_group,
+                ft.Text(
+                    "What matters most?", size=12, weight=ft.FontWeight.W_600, color=COLOR_AI_TEXT
+                ),
+                priority_group,
+                ft.Text(
+                    "Manufacturing process (optional)",
+                    size=12,
+                    weight=ft.FontWeight.W_600,
+                    color=COLOR_AI_TEXT,
+                ),
+                process_group,
+                error_text,
+                ft.Row([submit_btn, cancel_btn], spacing=10),
+            ],
+            spacing=10,
+            tight=True,
+            scroll=ft.ScrollMode.AUTO,
+        ),
+        bgcolor=COLOR_AI_BUBBLE,
+        border_radius=16,
+        padding=pad_all(24),
+        width=460,
+        height=640,
+        shadow=ft.BoxShadow(spread_radius=0, blur_radius=24, color="#40000000", offset=ft.Offset(0, 8)),
+    )
+
+    overlay = ft.Container(content=popup_card, alignment=ft.Alignment(0, 0), expand=True, bgcolor="#B3000000")
+    return overlay
+
+
 _SUPPORT_STRATEGY_CHIP_COLORS = {
     "minimal_or_no_support": (COLOR_CHIP_MAKE_BG, COLOR_CHIP_MAKE_TEXT),
     "tree_branch_supports": (COLOR_CHIP_BUY_BG, COLOR_CHIP_BUY_TEXT),
@@ -2575,8 +2774,7 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
 
     new_chat_button.on_click = start_new_chat
 
-    async def send_message(e: ft.ControlEvent) -> None:
-        text = message_input.value.strip() if message_input.value else ""
+    async def _send_text(text: str) -> None:
         if not text or state["is_sending"]:
             return
 
@@ -2608,6 +2806,32 @@ async def show_chat_interface(page: ft.Page, user_id: int, username: str, on_log
             await _send_and_await_reply(conversation_id, text)
         finally:
             state["is_sending"] = False
+
+    async def send_message(e: ft.ControlEvent) -> None:
+        text = message_input.value.strip() if message_input.value else ""
+        if not text or state["is_sending"]:
+            return
+
+        # Fusion-only, same gate recommend_am_material() itself enforces
+        # (mcp_server.py) -- on a SolidWorks session this would only ever
+        # return found=False, so don't interrupt the user with a form the
+        # backend can't honor; let it fall through to the normal chat path,
+        # which already surfaces that "AM tools unavailable" message.
+        if state.get("platform") == PLATFORM_FUSION and looks_like_am_material_recommendation_request(
+            text
+        ):
+            message_input.value = ""
+            page.update()
+
+            async def _on_form_submit(structured_text: str) -> None:
+                await _send_text(structured_text)
+
+            overlay = build_am_material_form_overlay(page, _on_form_submit)
+            page.overlay.append(overlay)
+            page.update()
+            return
+
+        await _send_text(text)
 
     async def _send_and_await_reply(conversation_id: int, text: str) -> None:
         loading_row = build_loading_row()

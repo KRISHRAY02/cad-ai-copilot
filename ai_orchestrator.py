@@ -1023,6 +1023,42 @@ def _try_parse_am_material_answers(question: str) -> dict | None:
     return result
 
 
+# Used by desktop_app.py (2026-10-27, Krish's request) to decide whether
+# to show a structured form -- text box for part_function, radio buttons
+# for load_bearing/temperature_exposure/priority/manufacturing_process --
+# instead of sending an open-ended "what material should I use" question
+# straight to the LLM. Reuses the same recommend/suggest/best/which
+# wording _MATERIAL_QUESTION_EXCLUDE_RE already treats as "this is an
+# AM-recommendation question, not a plain get_material() lookup".
+_AM_MATERIAL_RECOMMENDATION_RE = re.compile(
+    r"\b(recommend|suggest|best material|which material|what material should|"
+    r"choose (a |the )?material)\b",
+    re.IGNORECASE,
+)
+
+
+def looks_like_am_material_recommendation_request(question: str) -> bool:
+    """True if `question` is an open-ended "what material should I use"
+    style question that recommend_am_material() answers, AND it hasn't
+    already been answered in the structured shape
+    _try_parse_am_material_answers understands (in which case the normal
+    forced-dispatch path in ask() already handles it with no form needed).
+
+    desktop_app.py calls this before sending a chat message: if True, it
+    opens the structured form instead of sending the raw text to Ollama --
+    see that form's docstring for why trusting a 7B model to extract
+    load_bearing/temperature_exposure/priority from free text isn't
+    reliable (this is the same incident _try_parse_am_material_answers
+    fixes for the conversational path; the form sidesteps needing any
+    extraction at all).
+    """
+    if _try_parse_am_material_answers(question) is not None:
+        return False
+    return bool(_SIMPLE_MATERIAL_QUESTION_RE.search(question)) and bool(
+        _AM_MATERIAL_RECOMMENDATION_RE.search(question)
+    )
+
+
 _ASSEMBLY_REDIRECT_MARKER = "get_assembly_bom() or get_assembly_cost_drivers() instead"
 
 
