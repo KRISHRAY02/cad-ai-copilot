@@ -51,6 +51,20 @@ TEMPERATURE_EXPOSURE_MIN_SERVICE_TEMP_C = {
 
 VALID_PRIORITIES = {"strength", "cost", "surface_finish"}
 
+# am_materials.csv's process_type values, plus common aliases a user might
+# type instead of the canonical name -- "FFF" and "FDM/FFF" both mean the
+# same process as "FDM" (Fused Deposition Modeling / Fused Filament
+# Fabrication are the same thing, hobbyist vs. industry terminology).
+_PROCESS_TYPE_ALIASES = {
+    "fdm": "FDM",
+    "fff": "FDM",
+    "fdm/fff": "FDM",
+    "sla": "SLA",
+    "sls": "SLS",
+    "mjf": "MJF",
+    "dmls": "DMLS",
+}
+
 # How many ranked candidates to return -- a shortlist to discuss with the
 # user, not an exhaustive dump of every material that qualified.
 _TOP_N_RECOMMENDATIONS = 3
@@ -130,16 +144,22 @@ def recommend_am_material(
     load_bearing: bool,
     temperature_exposure: str,
     priority: str,
+    manufacturing_process: str | None = None,
 ) -> dict:
     """Rule-based AM material shortlist. See recommend_am_material()'s MCP
     tool wrapper in mcp_server.py for the full contract, valid input
     values, and why the caller must have already asked the user for these
     answers rather than guessing them.
 
-    Pipeline: filter am_materials.csv rows to those meeting the
-    temperature_exposure requirement (TEMPERATURE_EXPOSURE_MIN_SERVICE_TEMP_C),
-    then (if load_bearing) further filter to load_bearing_suitable rows
-    only, then rank what's left by `priority` and return the top
+    Pipeline: optionally filter am_materials.csv rows to a single
+    `manufacturing_process` (see _PROCESS_TYPE_ALIASES for accepted
+    spellings) FIRST -- otherwise a high `priority="strength"` ranking can
+    surface a metal powder-bed material (DMLS) even when the user already
+    said which process they're using (e.g. FDM), which isn't a real option
+    for them. Then filters to rows meeting the temperature_exposure
+    requirement (TEMPERATURE_EXPOSURE_MIN_SERVICE_TEMP_C), then (if
+    load_bearing) further filters to load_bearing_suitable rows only, then
+    ranks what's left by `priority` and returns the top
     _TOP_N_RECOMMENDATIONS with a one-line, data-grounded reason each.
 
     `part_function` is carried through in the response for context/
@@ -148,10 +168,25 @@ def recommend_am_material(
     candidate list (never pretends to use data that doesn't exist).
 
     Returns found=False with an explanatory message (never guesses) if
-    `temperature_exposure`/`priority` aren't recognized values, or if no
-    material in am_materials.csv meets the combined temperature/
-    load-bearing requirement.
+    `temperature_exposure`/`priority`/`manufacturing_process` (when given)
+    aren't recognized values, or if no material in am_materials.csv meets
+    the combined process/temperature/load-bearing requirement.
     """
+    manufacturing_process_normalized = None
+    if manufacturing_process is not None and manufacturing_process.strip():
+        key = manufacturing_process.strip().lower()
+        manufacturing_process_normalized = _PROCESS_TYPE_ALIASES.get(key)
+        if manufacturing_process_normalized is None:
+            return {
+                "found": False,
+                "message": (
+                    f"manufacturing_process {manufacturing_process!r} isn't "
+                    "recognized. Ask the user which of "
+                    f"{sorted(set(_PROCESS_TYPE_ALIASES.values()))} they're "
+                    "printing with, then call recommend_am_material again."
+                ),
+            }
+
     temperature_exposure_normalized = temperature_exposure.strip().lower()
     if temperature_exposure_normalized not in TEMPERATURE_EXPOSURE_MIN_SERVICE_TEMP_C:
         return {
@@ -181,8 +216,14 @@ def recommend_am_material(
     except (FileNotFoundError, ValueError) as e:
         return {"found": False, "message": str(e)}
 
+    candidates = materials
+    if manufacturing_process_normalized is not None:
+        candidates = [
+            m for m in candidates if m["process_type"] == manufacturing_process_normalized
+        ]
+
     min_temp = TEMPERATURE_EXPOSURE_MIN_SERVICE_TEMP_C[temperature_exposure_normalized]
-    candidates = [m for m in materials if m["max_service_temp_c"] >= min_temp]
+    candidates = [m for m in candidates if m["max_service_temp_c"] >= min_temp]
 
     if load_bearing:
         candidates = [m for m in candidates if m["load_bearing_suitable"]]
@@ -191,8 +232,13 @@ def recommend_am_material(
         return {
             "found": False,
             "message": (
-                "No material in am_materials.csv meets both the "
-                f"'{temperature_exposure_normalized}' temperature requirement "
+                "No material in am_materials.csv meets"
+                + (
+                    f" the '{manufacturing_process_normalized}' process requirement,"
+                    if manufacturing_process_normalized is not None
+                    else ""
+                )
+                + f" the '{temperature_exposure_normalized}' temperature requirement "
                 f"(>= {min_temp:.0f} deg C service temp)"
                 + (" and load-bearing suitability" if load_bearing else "")
                 + " -- consider relaxing one of these requirements with the "
@@ -237,6 +283,7 @@ def recommend_am_material(
         "load_bearing": load_bearing,
         "temperature_exposure": temperature_exposure_normalized,
         "priority": priority_normalized,
+        "manufacturing_process": manufacturing_process_normalized,
         "recommendations": recommendations,
         "assumptions": (
             "Ranked from am_materials.csv's qualitative strength/cost/"

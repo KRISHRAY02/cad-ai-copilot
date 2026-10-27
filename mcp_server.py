@@ -1093,6 +1093,7 @@ def recommend_am_material(
     load_bearing: bool,
     temperature_exposure: str,
     priority: str,
+    manufacturing_process: str | None = None,
 ) -> dict:
     """Recommend additive-manufacturing (3D printing) material(s) for the
     part, based on how it will be USED -- not on the CAD model's geometry
@@ -1130,6 +1131,17 @@ def recommend_am_material(
 
     `priority` MUST be one of "strength", "cost", or "surface_finish".
 
+    `manufacturing_process` is OPTIONAL but should be passed whenever the
+    user has said (or you already know from earlier in the conversation)
+    which AM process/printer they're using -- one of "FDM" (aliases
+    "FFF"/"FDM/FFF"), "SLA", "SLS", "MJF", or "DMLS". When given, only
+    materials for that process are considered; when omitted, the
+    recommendation is ranked across EVERY process in am_materials.csv,
+    which can surface a metal powder-bed material (DMLS) even for a user
+    who only has an FDM printer -- so ask "which process/printer are you
+    using?" if it's not already clear, same as the four required
+    questions above.
+
     `part_function` is free text (e.g. "mounting bracket for a camera",
     "gasket", "enclosure lid") -- carried through in the response for
     context, but does not change which materials are filtered in/out
@@ -1158,7 +1170,9 @@ def recommend_am_material(
 
     from am_material_advisor import recommend_am_material as _recommend_am_material
 
-    return _recommend_am_material(part_function, load_bearing, temperature_exposure, priority)
+    return _recommend_am_material(
+        part_function, load_bearing, temperature_exposure, priority, manufacturing_process
+    )
 
 
 @mcp.tool()

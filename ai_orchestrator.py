@@ -631,6 +631,41 @@ def _format_estimate_cost_answer(tool_result_json: str) -> str | None:
     return "\n".join(lines)
 
 
+def _format_recommend_am_material_answer(tool_result_json: str) -> str | None:
+    """Turn recommend_am_material()'s JSON straight into a plain-language
+    answer, without asking the LLM to re-express it -- same rationale as
+    the other deterministic formatters above, and the only path this tool
+    is ever called through now (see _try_parse_am_material_answers).
+    """
+    try:
+        data = json.loads(tool_result_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict) or not data.get("found"):
+        return None
+    recommendations = data.get("recommendations") or []
+    if not recommendations:
+        return None
+
+    process = data.get("manufacturing_process")
+    lines = [
+        f"AM material recommendation for: {data.get('part_function', '?')} "
+        f"(load-bearing: {'yes' if data.get('load_bearing') else 'no'}, "
+        f"temperature exposure: {data.get('temperature_exposure', '?')}, "
+        f"priority: {data.get('priority', '?')}"
+        + (f", process: {process}" if process else "")
+        + "):",
+        "",
+    ]
+    for i, rec in enumerate(recommendations, start=1):
+        lines.append(
+            f"{i}. {rec['material']} -- {rec['process_type']}. {rec['reason']}"
+        )
+    lines.append("")
+    lines.append(data.get("assumptions", ""))
+    return "\n".join(lines)
+
+
 # directly rather than routing back through the LLM. See
 # _format_list_assembly_components_answer's docstring for why this exists.
 _DETERMINISTIC_ANSWER_FORMATTERS = {
@@ -644,6 +679,7 @@ _DETERMINISTIC_ANSWER_FORMATTERS = {
     "get_bounding_box": _format_get_bounding_box_answer,
     "get_features": _format_get_features_answer,
     "estimate_cost": _format_estimate_cost_answer,
+    "recommend_am_material": _format_recommend_am_material_answer,
 }
 
 # Matches plain mass/weight questions ("What's the mass of this part?",
@@ -852,6 +888,139 @@ def _is_simple_cost_question(question: str) -> tuple[str, int] | None:
     quantity_match = _COST_QUANTITY_RE.search(question)
     quantity = int(next(g for g in quantity_match.groups() if g)) if quantity_match else 1
     return process, quantity
+
+
+# Incident 2026-10-27: Krish answered recommend_am_material()'s own four
+# questions (see mcp_server.py's docstring) in a structured "Part function:
+# / Load bearing: / Temperature exposure: / Priority: " block -- exactly
+# the format the tool's docstring invites -- and qwen2.5:7b-instruct still
+# called the tool with every argument set to null, burned all
+# MAX_TOOL_CALL_ROUNDS retrying, and gave up with "I wasn't able to reach a
+# final answer". Same failure class as the cost/mass/material questions
+# above (a 7B model unreliably mapping free text into structured tool
+# arguments) -- parse this one specific, unambiguous answer shape in
+# Python and call the tool directly rather than trusting the model's
+# extraction.
+_AM_FIELD_LABEL_RE = re.compile(
+    r"(?im)^[ \t]*(part function|load[- ]?bearing|temperature exposure|priority|"
+    r"manufacturing process)"
+    r"[ \t]*:[ \t]*(.+?)"
+    r"(?=\n[ \t]*(?:part function|load[- ]?bearing|temperature exposure|priority|"
+    r"manufacturing process|other constraints)[ \t]*:|\Z)",
+    re.DOTALL,
+)
+# Same aliases am_material_advisor._PROCESS_TYPE_ALIASES accepts -- kept as
+# a separate copy rather than importing am_material_advisor here, since
+# this module stays MCP-server-agnostic (it only ever talks to the server
+# over the MCP tool-call protocol, never imports its backing modules
+# directly).
+_AM_PROCESS_TYPE_ALIASES = {
+    "fdm": "FDM",
+    "fff": "FDM",
+    "fdm/fff": "FDM",
+    "sla": "SLA",
+    "sls": "SLS",
+    "mjf": "MJF",
+    "dmls": "DMLS",
+}
+_AM_TEMP_CELSIUS_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*°?\s*c(?:elsius)?\b", re.IGNORECASE)
+# Same cutoffs am_material_advisor.TEMPERATURE_EXPOSURE_MIN_SERVICE_TEMP_C
+# uses (40/65/110) -- reused here as classification buckets for a stated
+# numeric temperature, bisected at the midpoints between tiers.
+_AM_TEMP_LOW_MAX_C = 40.0
+_AM_TEMP_MODERATE_MAX_C = 90.0
+_AM_PRIORITY_KEYWORDS = ("surface finish", "strength", "cost")
+_AM_PRIORITY_LABELS = {
+    "surface finish": "surface_finish",
+    "strength": "strength",
+    "cost": "cost",
+}
+
+
+def _try_parse_am_material_answers(question: str) -> dict | None:
+    """If `question` answers recommend_am_material()'s four questions in
+    the labeled "Part function: ... / Load bearing: ... / Temperature
+    exposure: ... / Priority: ..." shape (case-insensitive, any order),
+    return the fully-typed argument dict ready to call the tool with.
+    Returns None (caller falls through to the normal LLM path) if any of
+    the four fields is missing or its value can't be mapped to a valid
+    argument -- never a partial/guessed dict.
+    """
+    fields: dict[str, str] = {}
+    for match in _AM_FIELD_LABEL_RE.finditer(question):
+        label = re.sub(r"[-\s]+", " ", match.group(1).strip().lower())
+        fields[label] = match.group(2).strip()
+
+    if not {"part function", "load bearing", "temperature exposure", "priority"}.issubset(
+        fields
+    ):
+        return None
+
+    part_function = fields["part function"]
+    if not part_function:
+        return None
+
+    load_text = fields["load bearing"].lower()
+    if re.search(r"\byes\b", load_text):
+        load_bearing = True
+    elif re.search(r"\bno\b", load_text):
+        load_bearing = False
+    else:
+        return None
+
+    temp_text = fields["temperature exposure"].lower()
+    if re.search(r"\blow\b", temp_text):
+        temperature_exposure = "low"
+    elif re.search(r"\bmoderate\b", temp_text):
+        temperature_exposure = "moderate"
+    elif re.search(r"\bhigh\b", temp_text):
+        temperature_exposure = "high"
+    else:
+        temp_match = _AM_TEMP_CELSIUS_RE.search(temp_text)
+        if temp_match:
+            temp_c = float(temp_match.group(1))
+            if temp_c <= _AM_TEMP_LOW_MAX_C:
+                temperature_exposure = "low"
+            elif temp_c <= _AM_TEMP_MODERATE_MAX_C:
+                temperature_exposure = "moderate"
+            else:
+                temperature_exposure = "high"
+        elif "ambient" in temp_text or "room temp" in temp_text:
+            temperature_exposure = "low"
+        else:
+            return None
+
+    priority_text = fields["priority"].lower()
+    priority_matches = [
+        (priority_text.find(kw), _AM_PRIORITY_LABELS[kw])
+        for kw in _AM_PRIORITY_KEYWORDS
+        if kw in priority_text
+    ]
+    if not priority_matches:
+        return None
+    priority_matches.sort(key=lambda pair: pair[0])
+    priority = priority_matches[0][1]
+
+    result = {
+        "part_function": part_function,
+        "load_bearing": load_bearing,
+        "temperature_exposure": temperature_exposure,
+        "priority": priority,
+    }
+
+    # Optional -- only included if the user's message actually names a
+    # recognized process. An unrecognized value (free-text aliases this
+    # dict doesn't know) is deliberately left out rather than guessed, so
+    # the real tool call just ranks across every process instead of
+    # failing outright over a field the model would otherwise mangle.
+    process_field = fields.get("manufacturing process", "")
+    if process_field:
+        for alias, canonical in _AM_PROCESS_TYPE_ALIASES.items():
+            if re.search(rf"\b{re.escape(alias)}\b", process_field.lower()):
+                result["manufacturing_process"] = canonical
+                break
+
+    return result
 
 
 _ASSEMBLY_REDIRECT_MARKER = "get_assembly_bom() or get_assembly_cost_drivers() instead"
@@ -1197,6 +1366,34 @@ class AiOrchestrator:
         # MAX_TOOL_CALL_ROUNDS budget on repeats of a call whose result it
         # already has.
         called_signatures: set[tuple[str, str]] = set()
+
+        am_material_answers = _try_parse_am_material_answers(question)
+        if am_material_answers is not None:
+            tool_result = await self._execute_tool_call_deduped(
+                "recommend_am_material", am_material_answers, called_signatures
+            )
+            self._remember_structured_result("recommend_am_material", tool_result)
+            self._history.append(
+                {
+                    "role": "tool",
+                    "tool_name": "recommend_am_material",
+                    "content": tool_result,
+                }
+            )
+            deterministic = _format_deterministic_answer(
+                "recommend_am_material", tool_result
+            )
+            if deterministic is not None:
+                self._history.append({"role": "assistant", "content": deterministic})
+                return deterministic
+            # recommend_am_material failed (not a Fusion session, no
+            # am_materials.csv row meets the stated requirements, etc.) --
+            # return the real error directly rather than letting the model
+            # retry with more hallucinated arguments, same reasoning as
+            # get_mass above.
+            error_text = _plain_tool_error_text(tool_result)
+            self._history.append({"role": "assistant", "content": error_text})
+            return error_text
 
         if _is_simple_mass_question(question):
             tool_result = await self._execute_tool_call_deduped(
